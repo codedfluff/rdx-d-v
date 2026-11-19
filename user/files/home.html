@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head><title>RDX Browser</title></head>
+<body>
+<h1>Welcome to the RDX Browser</h1>
+<p>This browser was written from scratch for RDX: it fetches pages over
+HTTP and <b>HTTPS</b> with RDX's own TCP/IP stack and its own TLS
+(no libraries), and lays out the HTML itself, styled by the page's
+<b>CSS</b>: flexbox, grid, floats, tables, positioning, colours and
+sizes. It shows <b>pictures</b> (PNG, JPEG, GIF), fills in and sends
+<b>forms</b>, and runs the page's <b>JavaScript</b>.</p>
+
+<p style="background-color:#e8f4ea; padding:6px 10px">
+<b>Note on https:</b> connections are encrypted, and each site's
+certificate is checked against the authorities in <code>/roots.pem</code>,
+so the browser knows it is talking to the real site. The status bar names
+the authority that vouches for it. If a site cannot prove who it is, the
+browser stops and says why.</p>
+
+<h2>Sites to try</h2>
+<p>Most sites work over <code>https</code>, for example
+<code>https://en.wikipedia.org/wiki/Operating_system</code> or
+<code>https://news.ycombinator.com/</code>. These are made to be light:</p>
+<ul>
+  <li><a href="http://info.cern.ch/">info.cern.ch</a> - the very first web site (1991)</li>
+  <li><a href="http://frogfind.com/">FrogFind</a> - a search engine made for old browsers</li>
+  <li><a href="http://68k.news/">68k.news</a> - news headlines, simplified</li>
+  <li><a href="http://example.com/">example.com</a> - the classic example page</li>
+  <li><a href="http://neverssl.com/">neverssl.com</a> - plain http on purpose</li>
+</ul>
+
+<h2>How to use it</h2>
+<ol>
+  <li>Click the address bar (or press <b>Ctrl+L</b>), type an address, press <b>Enter</b>.</li>
+  <li>Click a <a href="help.html">link</a> to follow it. <b>&lt;</b> (or Backspace) goes back, <b>R</b> reloads.</li>
+  <li>Scroll with the arrow keys, Page Up/Down, Space, Home and End, or click the scroll bar.</li>
+</ol>
+
+<h2>Local pages</h2>
+<p>Files on RDX open too: type a path such as <code>/home.html</code>. Write
+your own page with <code>edit mypage.html</code> and open it here.</p>
+<hr>
+<p>From a terminal, <code>browser --dump http://example.com/</code> prints a
+page as text.</p>
+</body>
+</html>

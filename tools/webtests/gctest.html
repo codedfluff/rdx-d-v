@@ -1,0 +1,17 @@
+<p id="p">gc test</p>
+<script>
+var keep = { list: [] }, ticks = 0, clicks = 0;
+document.getElementById("p").addEventListener("click", function () { clicks++; });
+var t = setInterval(function () {
+  var junk = [];
+  for (var i = 0; i < 6000; i++) junk.push({ i: i, s: "item " + i, a: [i, i + 1] });
+  keep.list.push(junk[ticks]);
+  ticks++;
+  if (ticks == 25) {
+    clearInterval(t);
+    document.getElementById("p").click();
+    var ok = keep.list.length == 25 && keep.list[24].s == "item 24" && clicks == 1;
+    console.log("GC TEST " + (ok ? "OK" : "FAILED") + " ticks=" + ticks + " kept=" + keep.list.length + " clicks=" + clicks);
+  }
+}, 10);
+</script>

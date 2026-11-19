@@ -1,0 +1,9 @@
+# startup.rc - the shell runs the commands in this file every time RDX boots.
+#
+# Edit a copy with:  edit startup.rc   (your version is saved to the RDX disk
+# and used instead of this one). Lines starting with # are comments.
+#
+# Variables set here are passed to every program:   set NAME=value
+# PATH lists the folders searched for programs, separated by colons, e.g.
+#   set PATH=/:/tools
+set EDITOR=edit

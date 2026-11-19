@@ -1,0 +1,113 @@
+# worm.rx - steer the worm with the arrow keys, eat the food, don't crash.
+# Run it with: rx worm        (q quits)
+
+let KEY_UP = 128
+let KEY_DOWN = 129
+let KEY_LEFT = 130
+let KEY_RIGHT = 131
+
+let screen = size()
+let width = min(screen[0] - 2, 60)
+let height = min(screen[1] - 4, 22)
+
+fn put(x, y, ch) {
+    goto(x + 1, y + 2)
+    write(ch)
+}
+
+fn draw_border() {
+    color(0x6C7380)
+    for x in 0..width + 2 {
+        goto(x, 1)
+        write("#")
+        goto(x, height + 2)
+        write("#")
+    }
+    for y in 0..height {
+        goto(0, y + 2)
+        write("#")
+        goto(width + 1, y + 2)
+        write("#")
+    }
+    color()
+}
+
+fn on_worm(xs, ys, x, y) {
+    for i in 0..len(xs) {
+        if xs[i] == x && ys[i] == y { return true }
+    }
+    return false
+}
+
+clear()
+draw_border()
+
+# The worm is two lists of coordinates; the head is the last item.
+let xs = [width / 2 - 2, width / 2 - 1, width / 2]
+let ys = [height / 2, height / 2, height / 2]
+let dx = 1
+let dy = 0
+let score = 0
+let food_x = rand(width)
+let food_y = rand(height)
+let alive = true
+
+color(0x5AF78E)
+for i in 0..len(xs) { put(xs[i], ys[i], "o") }
+
+while alive {
+    goto(0, 0)
+    color(0x9AEDFE)
+    write("WORM   score: ", score, "   arrows steer, q quits   ")
+    color(0xFF6AC1)
+    put(food_x, food_y, "*")
+
+    sleep(max(40, 110 - score * 3))
+
+    # Use the most recent key press; ignore reversing into yourself.
+    let k = poll()
+    while k != nil {
+        if k == KEY_UP && dy == 0 { dx = 0; dy = -1 }
+        if k == KEY_DOWN && dy == 0 { dx = 0; dy = 1 }
+        if k == KEY_LEFT && dx == 0 { dx = -1; dy = 0 }
+        if k == KEY_RIGHT && dx == 0 { dx = 1; dy = 0 }
+        if k == ord("q") { alive = false }
+        k = poll()
+    }
+
+    let head_x = xs[-1] + dx
+    let head_y = ys[-1] + dy
+    if head_x < 0 || head_x >= width || head_y < 0 || head_y >= height { alive = false }
+    if alive && on_worm(xs, ys, head_x, head_y) { alive = false }
+
+    if alive {
+        push(xs, head_x)
+        push(ys, head_y)
+        color(0x5AF78E)
+        put(head_x, head_y, "o")
+        if head_x == food_x && head_y == food_y {
+            score += 1
+            food_x = rand(width)
+            food_y = rand(height)
+            while on_worm(xs, ys, food_x, food_y) {
+                food_x = rand(width)
+                food_y = rand(height)
+            }
+        } else {
+            # Not eating: the tail moves up. Rebuild the lists without item 0.
+            put(xs[0], ys[0], " ")
+            let new_xs = []
+            let new_ys = []
+            for i in 1..len(xs) {
+                push(new_xs, xs[i])
+                push(new_ys, ys[i])
+            }
+            xs = new_xs
+            ys = new_ys
+        }
+    }
+}
+
+color()
+goto(0, height + 3)
+print("Game over. Final score:", score)

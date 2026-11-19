@@ -1,0 +1,21 @@
+<html><head><title>Layout test</title><style>
+body { font-family: sans-serif }
+.row { display: flex; gap: 10px }
+.row > div { flex: 1; border: 1px solid #888; padding: 4px }
+.grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px }
+.left { float: left; width: 150px; background: #eef }
+.box { position: relative; height: 40px; border: 1px solid black }
+.corner { position: absolute; right: 0; top: 0 }
+nav ul { display: flex; list-style: none; padding: 0; justify-content: space-between }
+</style></head><body>
+<h1>Layout test</h1>
+<nav><ul><li><a href="/a">Home</a></li><li><a href="/b">News</a></li><li><a href="/c">About</a></li></ul></nav>
+<div class="row"><div>FLEX-ONE first column</div><div>FLEX-TWO second column</div><div>FLEX-THREE third</div></div>
+<div class="grid"><div>GRID-A</div><div>GRID-B</div><div>GRID-C</div><div>GRID-D</div></div>
+<div class="left">FLOAT-LEFT box</div><p>Text that flows beside the floated box on its right side.</p>
+<div style="clear:both"></div>
+<table border=1><tr><th>Name</th><th>Value</th></tr><tr><td>alpha</td><td>TABLE-ONE</td></tr><tr><td>beta</td><td colspan=1>TABLE-TWO</td></tr></table>
+<div class="box">in the box<span class="corner">CORNER</span></div>
+<form action="/search"><input name="q" value="hello"> <input type="checkbox" name="c" checked> <select name="s"><option>one<option selected>two</select> <input type="submit" value="Go"></form>
+<p>Some <b>bold</b>, <i>italic</i> and <span style="font-size:24px">large</span> text.</p>
+</body></html>

@@ -1,0 +1,44 @@
+# demo.rx - a tour of the RX language. Run it with: rx demo
+
+fn fib(n) {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn join(items, sep) {
+    let out = ""
+    for i in 0..len(items) {
+        if i > 0 { out += sep }
+        out += str(items[i])
+    }
+    return out
+}
+
+print("Fibonacci:", join(range(12), " "), "->")
+let fibs = []
+for i in 0..12 { push(fibs, fib(i)) }
+print("          ", join(fibs, " "))
+
+# Lists hold anything, and can be sorted with a few lines of code.
+let words = ["kernel", "ring", "page", "task", "heap", "boot"]
+for i in 0..len(words) {
+    for j in 0..len(words) - 1 - i {
+        if words[j] > words[j + 1] {
+            let tmp = words[j]
+            words[j] = words[j + 1]
+            words[j + 1] = tmp
+        }
+    }
+}
+print("Sorted:   ", join(words, ", "))
+
+# Strings can be picked apart character by character.
+let text = "RDX runs RX"
+let reversed = ""
+for ch in text { reversed = ch + reversed }
+print("Reversed: ", reversed)
+
+let start = time()
+let total = 0
+for i in 0..200000 { total += i % 7 }
+print("Counted to 200000 in", time() - start, "ms, checksum", total)

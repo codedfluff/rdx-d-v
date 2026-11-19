@@ -1,0 +1,80 @@
+<html><head><title>JS test</title>
+<script>
+var results = [];
+function ok(name, cond) { results.push((cond ? "PASS " : "FAIL ") + name); }
+</script>
+</head><body>
+<h1 id="title">Scripts</h1>
+<ul id="list"><li class="item">one</li><li class="item special">two</li></ul>
+<p id="out">not yet</p>
+<div id="hidden-by-js">THIS SHOULD BE HIDDEN</div>
+<noscript>NOSCRIPT CONTENT</noscript>
+<form id="f"><input id="name" name="who" value="ada"><button id="go">Go</button></form>
+<script>
+// language
+ok("arithmetic", 1 + 2 * 3 === 7 && 7 % 3 === 1 && 2 ** 10 === 1024);
+ok("strings", "abc".toUpperCase() === "ABC" && "a,b,c".split(",").length === 3 && "  x ".trim() === "x");
+ok("template", `sum ${1 + 1} done` === "sum 2 done");
+ok("numbers", (0.1 + 0.2).toFixed(2) === "0.30" && String(1/3).slice(0, 6) === "0.3333" && parseInt("ff", 16) === 255);
+ok("number text", String(123.456) === "123.456" && String(1e21) === "1e+21" && String(-0.000001) === "-0.000001");
+ok("closures", (function () { var n = 0; return function () { return ++n; }; })()() === 1);
+let counters = []; for (let i = 0; i < 3; i++) counters.push(() => i);
+ok("let per iteration", counters.map(f => f()).join() === "0,1,2");
+ok("arrows and spread", Math.max(...[3, 9, 4]) === 9 && [..."hi"].length === 2);
+const {a, b: [c, d = 5], ...rest} = {a: 1, b: [2], x: 7, y: 8};
+ok("destructuring", a === 1 && c === 2 && d === 5 && rest.x === 7 && Object.keys(rest).length === 2);
+class Animal { constructor(name) { this.name = name; } speak() { return this.name + " makes a sound"; } get upper() { return this.name.toUpperCase(); } static create(n) { return new this(n); } }
+class Dog extends Animal { speak() { return super.speak() + ": woof"; } }
+ok("classes", new Dog("Rex").speak() === "Rex makes a sound: woof" && Dog.create("Bo").upper === "BO" && new Dog("x") instanceof Animal);
+ok("exceptions", (function () { try { null.x; } catch (e) { return e instanceof TypeError; } })());
+ok("finally", (function () { var log = ""; try { log += "t"; throw 1; } catch (e) { log += "c"; } finally { log += "f"; } return log; })() === "tcf");
+ok("regex", /(\d+)-(\d+)/.exec("call 555-1234 now")[2] === "1234" && "a1b22c333".replace(/\d+/g, "#") === "a#b#c#");
+ok("regex groups", "2024-03-05".match(/(?<y>\d{4})-(?<m>\d\d)/).groups.m === "03" && /^[a-z]+@[a-z]+\.com$/i.test("Me@Site.COM"));
+ok("json", JSON.stringify({a: [1, "x", null], b: true}) === '{"a":[1,"x",null],"b":true}' && JSON.parse('{"k":[1,2,{"z":3}]}').k[2].z === 3);
+ok("array methods", [3, 1, 2].sort().join("") === "123" && [1, 2, 3, 4].filter(x => x % 2).map(x => x * 10).reduce((s, x) => s + x, 0) === 40);
+ok("split", "a1b2c".split(/\d/).join() === "a,b,c" && "abc".split("").length === 3 && "abc".split(/(?:)/).join("-") === "a-b-c" && "a, b".split(/(,)\s*/).length === 3);
+ok("map and set", new Map([["a", 1]]).get("a") === 1 && new Set([1, 1, 2]).size === 2);
+ok("optional chaining", ({}).missing?.deep === undefined && (null ?? "dflt") === "dflt");
+ok("labels", (function () { var n = 0; outer: for (var i = 0; i < 5; i++) { for (var j = 0; j < 5; j++) { if (j == 2) continue outer; if (i == 3) break outer; n++; } } return n; })() === 6);
+ok("getters/setters", (function () { var o = { _v: 1, get v() { return this._v * 2; }, set v(x) { this._v = x; } }; o.v = 5; return o.v === 10; })());
+ok("date", new Date(0).toISOString() === "1970-01-01T00:00:00.000Z" && new Date(2024, 1, 29).getDate() === 29);
+ok("typeof", typeof undeclaredThing === "undefined" && typeof function(){} === "function" && typeof null === "object");
+// DOM
+var title = document.getElementById("title");
+ok("getElementById", title && title.textContent === "Scripts" && title.tagName === "H1");
+ok("querySelectorAll", document.querySelectorAll("#list .item").length === 2 && document.querySelector("li.special").textContent === "two");
+var li = document.createElement("li");
+li.textContent = "three (added by a script)";
+li.className = "item";
+document.getElementById("list").appendChild(li);
+ok("createElement/appendChild", document.querySelectorAll(".item").length === 3);
+document.getElementById("out").innerHTML = "Written by <b>JavaScript</b>, " + results.length + " checks so far";
+ok("innerHTML", document.getElementById("out").querySelector("b").textContent === "JavaScript");
+document.getElementById("hidden-by-js").style.display = "none";
+ok("style", document.getElementById("hidden-by-js").style.display === "none");
+title.classList.add("big");
+ok("classList", title.classList.contains("big") && title.className === "big");
+ok("dataset", (function () { title.dataset.fooBar = "1"; return title.getAttribute("data-foo-bar") === "1"; })());
+ok("input value", document.getElementById("name").value === "ada");
+var clicked = 0;
+document.getElementById("go").addEventListener("click", function (e) { clicked++; e.preventDefault(); });
+document.getElementById("go").click();
+ok("events", clicked === 1);
+var order = [];
+setTimeout(function () { order.push("timeout"); document.title = "JS test (timer ran)"; }, 10);
+Promise.resolve().then(function () { order.push("promise"); });
+order.push("sync");
+document.addEventListener("DOMContentLoaded", function () {
+  results.push("PASS DOMContentLoaded");
+  setTimeout(function () {
+    ok("event loop order", order.join() === "sync,promise,timeout");
+    var p = document.createElement("pre");
+    p.id = "results";
+    p.textContent = results.join("\n");
+    document.body.appendChild(p);
+    var fails = results.filter(function (r) { return r.indexOf("FAIL") === 0; });
+    console.log("JS TEST " + (fails.length ? "FAILED: " + fails.join("; ") : "OK") + " (" + results.length + " checks)");
+  }, 50);
+});
+</script>
+</body></html>

@@ -1,0 +1,36 @@
+<html><head><title>Script demo</title>
+<style>
+body { font-family: sans-serif; }
+.card { border: 1px solid #ccd; padding: 10px; margin: 8px 0; background: #f6f8fc; }
+#count { font-size: 32px; color: #1a5fd6; }
+.done { text-decoration: line-through; color: #888; }
+button { padding: 4px 12px; }
+</style></head><body>
+<h1>Scripts in RDX</h1>
+<div class="card">Clicks: <span id="count">0</span> <button id="plus">Click me</button> <button id="reset">Reset</button></div>
+<div class="card">Type here: <input id="typing" placeholder="your name"> <span id="hello">Hello, nobody!</span></div>
+<div class="card">Ticking: <span id="clock">0</span> seconds since the page opened</div>
+<div class="card">To do: <input id="task" placeholder="a task"> <button id="add">Add</button>
+<ul id="todo"><li>Write a browser</li></ul></div>
+<script>
+var n = 0;
+document.getElementById("plus").onclick = function () { n++; document.getElementById("count").textContent = n; };
+document.getElementById("reset").addEventListener("click", () => { n = 0; document.getElementById("count").textContent = "0"; });
+document.getElementById("typing").addEventListener("input", function (e) {
+  document.getElementById("hello").textContent = "Hello, " + (e.target.value || "nobody") + "!";
+});
+var start = Date.now();
+setInterval(function () { document.getElementById("clock").textContent = Math.floor((Date.now() - start) / 1000); }, 1000);
+document.getElementById("add").addEventListener("click", function () {
+  var t = document.getElementById("task");
+  if (!t.value) return;
+  var li = document.createElement("li");
+  li.textContent = t.value;
+  li.addEventListener("click", function () { li.classList.toggle("done"); });
+  document.getElementById("todo").appendChild(li);
+  t.value = "";
+});
+document.addEventListener("click", function (e) { document.getElementById("clock").parentNode.firstChild.textContent = "Last click: " + e.target.tagName + " " + (e.target.textContent || "").slice(0, 20) + " / Ticking: "; });
+document.querySelector("#todo li").addEventListener("click", function () { this.classList.toggle("done"); });
+</script>
+</body></html>

@@ -1,0 +1,10 @@
+let name = input("whats ur name: ")
+print("hi, " + name)
+let total = 0
+for i in 1..6 {
+    let roll = rand(6) + 1
+    print("roll", i, "->", roll)
+    total += roll
+}
+print("total:", total)
+if total >17 { print("fuck you") } else { print("ez bot") }

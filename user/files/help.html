@@ -1,0 +1,27 @@
+<html>
+<head><title>Browser help</title></head>
+<body>
+<h1>What the browser understands</h1>
+<dl>
+  <dt><b>Pages</b></dt>
+  <dd>HTML and plain text, over http:// or from local files. Redirects are followed.</dd>
+  <dt><b>Text</b></dt>
+  <dd>Headings, paragraphs, line breaks, bold, code, preformatted text, quotes, rules.</dd>
+  <dt><b>Layout</b></dt>
+  <dd>The page's CSS: flexbox, grid, floats, tables with real columns, positioned boxes.</dd>
+  <dt><b>Pictures and forms</b></dt>
+  <dd>PNG, JPEG and GIF pictures; text fields, checkboxes, menus and buttons. Tab moves between fields.</dd>
+  <dt><b>Scripts</b></dt>
+  <dd>JavaScript runs: the page's scripts can change it, react to clicks and typing, use timers, fetch data. Not supported: modules, generators. A script that runs too long is stopped. Turn scripts off with: set BROWSER_NOJS=1</dd>
+  <dt><b>Security</b></dt>
+  <dd>https with TLS 1.3; every site's certificate is checked before anything is sent.</dd>
+  <dt><b>Characters</b></dt>
+  <dd>&amp;entities; and UTF-8. Letters the font lacks are simplified: caf&eacute; shows as cafe.</dd>
+</dl>
+<pre>
+  Not (yet): JavaScript modules,
+  fonts other than the built-in one.
+</pre>
+<p><a href="home.html">Back to the start page</a></p>
+</body>
+</html>

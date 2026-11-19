@@ -1,0 +1,7 @@
+<html><head><title>Form result</title></head><body>
+<h2>Thank you</h2>
+<p id="r">(no script)</p>
+<script>
+var q = new URLSearchParams(location.search);
+document.getElementById("r").textContent = "You sent: name=" + q.get("who") + ", news=" + (q.get("news") || "no") + ", colour=" + q.get("colour");
+</script></body></html>
