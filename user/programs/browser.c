@@ -1173,7 +1173,7 @@ static void print_page_text(void) {
         if (prev_end >= 0) {
             /* Words a space apart (in any font size) are one space apart in
                the text; only wide gaps (table columns) keep their position. */
-            int gap = it->x - prev_end, cell = it->kind == IT_TEXT && it->size ? it->size / 2 : 8;
+            int gap = it->x - prev_end, cell = it->kind == IT_TEXT && it->size ? it->size / 128 : 8;
             int space = gap > 0 ? 1 : 0;
             if (gap <= 2 * cell || col < used + space) col = used + space;
         }

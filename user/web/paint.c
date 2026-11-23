@@ -121,7 +121,7 @@ static void draw_control(canvas *v, Item *it, int x, int y) {
     char label[32] = "[";
     strcpy(label + 1, n->tag);
     strcpy(label + strlen(label), "]");
-    if (it->w > 48) font_draw(v, x + 6, y + 18, label, (int)strlen(label), FACE_SANS, 0, 0, 13, 0x8A8F9C);
+    if (it->w > 48) font_draw(v, x + 6, y + 18, label, (int)strlen(label), FACE_SANS, 0, 0, 13 * 64, 0x8A8F9C);
 }
 
 /* ---------------------------------------------------------------- see-through colours and round corners */
@@ -947,8 +947,8 @@ static void paint_page(canvas *v, int scroll, int left) {
         case IT_MARKER: {
             unsigned color = (it->color & 0xFFFFFF) | (255 - color_alpha(it->color)) << 24;
             font_draw(v, x, y + it->base, pool + it->text, it->len, it->face, it->bold, it->italic, it->size, color);
-            int thick = it->size >= 24 ? 2 : 1;
-            if (it->underline) paint_fill(v, x, y + it->base + (it->size + 8) / 10, it->w, thick, it->color);
+            int thick = it->size >= 24 * 64 ? 2 : 1;
+            if (it->underline) paint_fill(v, x, y + it->base + (it->size / 64 + 8) / 10, it->w, thick, it->color);
             if (it->strike) paint_fill(v, x, y + it->base - it->base * 3 / 10, it->w, thick, it->color);
             break;
         }
@@ -1020,7 +1020,7 @@ static int item_at(int px, int py) {
         Item *it = &items[i];
         if (it->kind == IT_BORDER || it->kind == IT_MARKER) continue;
         if (it->clipped && (px < it->clip[0] || px >= it->clip[2] || py < it->clip[1] || py >= it->clip[3])) continue;
-        int slack = it->kind == IT_TEXT ? it->size / 8 + 1 : 0; /* half a space: the gaps between words */
+        int slack = it->kind == IT_TEXT ? it->size / 512 + 1 : 0; /* half a space: the gaps between words */
         if (px >= it->x - slack && px < it->x + it->w + slack && py >= it->y - slack && py < it->y + it->h + slack) {
             if (it->kind == IT_RECT && !it->node) continue;
             return i;

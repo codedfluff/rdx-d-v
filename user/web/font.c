@@ -6,7 +6,7 @@
    scaled to any size and drawn anti-aliased. Drawn glyphs are kept in a
    cache. Without the files, text falls back to the 8x16 bitmap font. */
 
-enum { FACE_SANS, FACE_SERIF, FACE_MONO, FACE_COUNT };
+enum { FACE_SANS, FACE_SERIF, FACE_MONO, FACE_WIDE, FACE_COUNT }; /* (wide: DejaVu Sans, for Verdana) */
 
 typedef struct {
     unsigned char *d;
@@ -20,13 +20,13 @@ typedef struct {
     unsigned short ascii_glyph[128], ascii_adv[128];
 } Font;
 
-#define FONT_FALLBACK (FACE_COUNT * 4) /* DejaVu Sans: symbols and letters the others lack */
+#define FONT_FALLBACK (FACE_WIDE * 4) /* DejaVu Sans: symbols and letters the others lack */
 #define WEB_FONTS 48
-#define FONT_WEB0 (FACE_COUNT * 4 + 1) /* fonts that pages bring (@font-face), after the built-in ones */
-static Font font_table[FACE_COUNT * 4 + 1 + WEB_FONTS];
+#define FONT_WEB0 (FACE_COUNT * 4) /* fonts that pages bring (@font-face), after the built-in ones */
+static Font font_table[FACE_COUNT * 4 + WEB_FONTS];
 
 /* Fonts pages declare (@font-face): a face value of FACE_WEB and up names
-   one: FACE_WEB + slot * 3 + the built-in face to use until it is loaded. */
+   one: FACE_WEB + slot * 4 + the built-in face to use until it is loaded. */
 #define FACE_WEB 16
 static int font_parse(Font *f);
 static void wf_copy(char *dst, const char *src, size_t max) { /* (at most max - 1 characters, always ended) */
@@ -198,11 +198,11 @@ static int web_font_install(int i, unsigned char *data, size_t len) {
     w->state = 1;
     return 1;
 }
-static const char *const FONT_FILES[FACE_COUNT * 4 + 1] = {
+static const char *const FONT_FILES[FACE_COUNT * 4] = {
     "/liberationsans-regular.ttf", "/liberationsans-bold.ttf", "/liberationsans-italic.ttf", "/liberationsans-bolditalic.ttf",
     "/liberationserif-regular.ttf", "/liberationserif-bold.ttf", "/liberationserif-italic.ttf", "/liberationserif-bolditalic.ttf",
     "/liberationmono-regular.ttf", "/liberationmono-bold.ttf", "/liberationmono-italic.ttf", "/liberationmono-bolditalic.ttf",
-    "/dejavusans.ttf"};
+    "/dejavusans.ttf", "/dejavusans-bold.ttf", "", ""};
 
 static unsigned ft_u8(const Font *f, unsigned at) { return at < f->len ? f->d[at] : 0; }
 static unsigned ft_u16(const Font *f, unsigned at) { return at + 2 <= f->len ? (unsigned)f->d[at] << 8 | f->d[at + 1] : 0; }
@@ -315,9 +315,9 @@ static Font *font_load(int i) {
 /* The font for a face and style: loaded the first time; NULL without one. */
 static Font *font_get(int face, int bold, int italic) {
     if (face >= FACE_WEB) { /* a page's font, or until it comes, a built-in one */
-        Font *w = web_font_pick((face - FACE_WEB) / 3, bold, italic);
+        Font *w = web_font_pick((face - FACE_WEB) / 4, bold, italic);
         if (w) return w;
-        face = (face - FACE_WEB) % 3;
+        face = (face - FACE_WEB) % 4;
     }
     int i = (face < 0 || face >= FACE_COUNT ? FACE_SANS : face) * 4 + (bold ? 1 : 0) + (italic ? 2 : 0);
     Font *f = &font_table[i];
@@ -336,7 +336,8 @@ static Font *font_get(int face, int bold, int italic) {
     return NULL;
 }
 
-static int font_cell(int size) { return size >= 30 ? 16 : size >= 22 ? 12 : 8; }
+/* (sizes here are in 1/64 px) */
+static int font_cell(int size) { return size >= 30 * 64 ? 16 : size >= 22 * 64 ? 12 : 8; }
 
 /* Next character of UTF-8 text. */
 static unsigned font_next_char(const char *s, int len, int *i) {
@@ -393,9 +394,10 @@ static void font_metrics(int face, int bold, int italic, int size, int *ascent, 
         *gap = 4;
         return;
     }
-    *ascent = (f->ascent * size + f->units / 2) / f->units;
-    *descent = (f->descent * size + f->units / 2) / f->units;
-    *gap = f->gap > 0 ? (f->gap * size + f->units / 2) / f->units : 0;
+    long long u = (long long)f->units * 64;
+    *ascent = (int)(((long long)f->ascent * size + u / 2) / u);
+    *descent = (int)(((long long)f->descent * size + u / 2) / u);
+    *gap = f->gap > 0 ? (int)(((long long)f->gap * size + u / 2) / u) : 0;
 }
 
 /* The width of text in pixels, in 1/64 px. */
@@ -413,7 +415,7 @@ static long long font_width64(int face, int bold, int italic, int size, const ch
     for (int i = 0; i < len;) {
         unsigned adv, g, code = font_next_char(s, len, &i);
         const Font *used = font_char(f, code, &g, &adv);
-        w64 += (long long)adv * size * 64 / used->units;
+        w64 += (long long)adv * size / used->units;
     }
     return w64;
 }
@@ -698,7 +700,7 @@ static GlyphSlot *font_render(int font_index, const Font *f, unsigned g, int siz
     if (!glyph_store) return NULL;
     GlyphSlot made = {key, g, 0, 0, 0, 0, -1};
     unsigned char *bits = NULL;
-    float scale = (float)size / (float)f->units;
+    float scale = (float)size / 64.0f / (float)f->units;
     float m[6] = {scale, 0, 0, -scale, (float)phase / 4.0f, 0};
     font_seg_count = 0;
     font_outline(f, g, m, 0);
@@ -802,13 +804,13 @@ static void font_blend(canvas *c, int x, int y, const GlyphSlot *s, unsigned col
 static void font_draw(canvas *c, int x, int baseline, const char *s, int len, int face, int bold, int italic, int size,
                       unsigned color) {
     Font *f = font_get(face, bold, italic);
-    if (!f || size < 1) {
+    if (!f || size < 64) {
         int cell = font_cell(size), ascent = cell * 2 * 13 / 16;
         draw_glyphs(c, x, baseline - ascent, s, len, cell, color & 0xFFFFFF, (bold ? GLYPH_BOLD : 0) | (italic ? GLYPH_ITALIC : 0));
         return;
     }
-    if (size > 400) size = 400;
-    if (baseline + size < 0 || baseline - size * 2 > c->height) return;
+    if (size > 400 * 64) size = 400 * 64;
+    if (baseline + size / 64 < 0 || baseline - size / 32 > c->height) return;
     long long pen = 0; /* 1/64 px */
     for (int i = 0; i < len;) {
         unsigned adv, g, code = font_next_char(s, len, &i);
@@ -820,10 +822,10 @@ static void font_draw(canvas *c, int x, int baseline, const char *s, int len, in
             phase = 0;
         }
         if (whole > c->width) break;
-        if (code != ' ' && g && whole > -size * 2) {
+        if (code != ' ' && g && whole > -size / 32) {
             GlyphSlot *slot = font_render((int)(used - font_table), used, g, size, phase);
             if (slot) font_blend(c, whole + slot->left, baseline + slot->top, slot, color);
         }
-        pen += (long long)adv * size * 64 / used->units;
+        pen += (long long)adv * size / used->units;
     }
 }

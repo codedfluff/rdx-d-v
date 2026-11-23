@@ -338,6 +338,8 @@ static int align_word(const char *v, int self) {
 /* Which of our faces stands for a font-family list: the first family we
    know (or a generic one); a list of only unknown (web) fonts gets sans. */
 static int face_of_family(const char *n) {
+    if (strstr(n, "verdana") || !strcmp(n, "geneva") || strstr(n, "dejavu sans") || strstr(n, "bitstream vera sans"))
+        return strstr(n, "mono") ? FACE_MONO : FACE_WIDE; /* (wider than Arial) */
     if (strstr(n, "mono") || strstr(n, "courier") || strstr(n, "consol") || strstr(n, "menlo") || strstr(n, "monaco") ||
         strstr(n, "code") || !strcmp(n, "fixed") || strstr(n, "typewriter"))
         return FACE_MONO;
@@ -377,9 +379,9 @@ static int face_for_family(const char *v, int current) {
             }
         }
         int face = face_of_family(name);
-        if (face >= 0) return web >= 0 ? FACE_WEB + web * 3 + face : face;
+        if (face >= 0) return web >= 0 ? FACE_WEB + web * 4 + face : face;
     }
-    return web >= 0 ? FACE_WEB + web * 3 + FACE_SANS : FACE_SANS;
+    return web >= 0 ? FACE_WEB + web * 4 + FACE_SANS : FACE_SANS;
 }
 
 /* @font-face { font-family; src; font-weight; font-style; unicode-range }
@@ -578,6 +580,36 @@ static void svg_note(const char *name, const char *v) {
     svg_props_len += nl + vl;
 }
 
+static int parent_size64; /* the parent's font size in 1/64 px, while one element is styled */
+
+/* font-size in 1/64 px (keeps 13.33px and the like exact). */
+static int font_size64(const char *v, int parent) {
+    static const struct {
+        const char *name;
+        int px;
+    } sizes[] = {{"xxx-large", 48}, {"xx-large", 32}, {"x-large", 24}, {"xx-small", 9},
+                 {"x-small", 10},   {"small", 13},    {"medium", 16},  {"large", 18}};
+    while (is_space(*v)) v++;
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
+        if (strncasecmp(v, sizes[i].name, strlen(sizes[i].name)) == 0) return sizes[i].px * 64;
+    if (strncasecmp(v, "larger", 6) == 0) return parent * 6 / 5;
+    if (strncasecmp(v, "smaller", 7) == 0) return parent * 5 / 6;
+    int used;
+    long long n = number100(v, &used); /* (* 100) */
+    if (used) {
+        const char *u = v + used;
+        long long r = -1;
+        if (!strncasecmp(u, "px", 2)) r = n * 64 / 100;
+        else if (*u == '%') r = n * parent / 10000;
+        else if (!strncasecmp(u, "rem", 3)) r = n * 16 * 64 / 100;
+        else if (!strncasecmp(u, "em", 2)) r = n * parent / 100;
+        else if (!strncasecmp(u, "pt", 2)) r = n * 64 * 4 / 300;
+        if (r > 0) return (int)(r > 1000 * 64 ? 1000 * 64 : r);
+        if (r == 0) return parent;
+    }
+    return font_size(v, (parent + 32) / 64) * 64; /* (calc(), vw and the rest: in whole px) */
+}
+
 static void apply(Style *s, Borders *b, const char *name, const char *v, int parent_size) {
     unsigned color;
     int ok;
@@ -732,7 +764,8 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
             int used, n = number100(v, &used);
             s->bold = used ? n >= 60000 : (word_is(v, "bold") || word_is(v, "bolder"));
         } else if (!strcmp(name, "font-size")) {
-            s->size = font_size(v, parent_size);
+            s->size64 = font_size64(v, s->size64 ? parent_size64 : parent_size * 64);
+            s->size = (s->size64 + 32) / 64;
         } else if (!strcmp(name, "font-family")) {
             s->face = (unsigned char)face_for_family(v, s->face);
         } else if (!strcmp(name, "font-style")) {
@@ -741,6 +774,7 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
             if (word_is(v, "inherit") || word_is(v, "unset")) return; /* (as inherited already) */
             if (word_is(v, "initial")) {
                 s->size = 16;
+                s->size64 = 16 * 64;
                 s->bold = s->italic = 0;
                 s->line_height = 0;
                 s->face = FACE_SERIF;
@@ -780,7 +814,8 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
                            !strncasecmp(parts[i], "medium", 6) || !strncasecmp(parts[i], "x-", 2) || !strncasecmp(parts[i], "xx-", 3)) {
                     char *slash = strchr(parts[i], '/');
                     if (slash) *slash = 0;
-                    s->size = font_size(parts[i], parent_size);
+                    s->size64 = font_size64(parts[i], parent_size64 ? parent_size64 : parent_size * 64);
+                    s->size = (s->size64 + 32) / 64;
                 }
             }
         } else if (!strcmp(name, "float")) {
@@ -2003,6 +2038,7 @@ static char *default_css;
     do {                               \
         (s)->color = (p)->color;       \
         (s)->size = (p)->size;         \
+        (s)->size64 = (p)->size64;     \
         (s)->bold = (p)->bold;         \
         (s)->italic = (p)->italic;     \
         (s)->underline = (p)->underline; \
@@ -2126,6 +2162,7 @@ static void compute_style(Node *e) {
         memset(&root, 0, sizeof(root));
         root.color = 0x000000;
         root.size = 16;
+        root.size64 = 16 * 64;
         root.face = FACE_SERIF; /* (as browsers: Times New Roman unless a page says otherwise) */
         root.alpha = 255;
         p = &root;
@@ -2242,6 +2279,7 @@ static void compute_style(Node *e) {
     e->in_svg = is(e->tag, "svg") || (e->parent && e->parent->in_svg && !is(e->parent->tag, "foreignobject"));
     svg_collecting = e->in_svg;
     svg_props_len = 0;
+    parent_size64 = p->size64 ? p->size64 : p->size * 64;
     for (int i = 0; i < first_page; i++) apply_all(s, &b, rules[matched[i]]->decls, 0, p->size);
     presentational(e, s, &b, p);
     for (int i = first_page; i < n; i++) apply_all(s, &b, rules[matched[i]]->decls, 0, p->size);
@@ -2249,6 +2287,7 @@ static void compute_style(Node *e) {
     for (int i = first_page; i < n; i++) apply_all(s, &b, rules[matched[i]]->decls, 1, p->size);
     if (has_inline) apply_all(s, &b, inline_style, 1, p->size);
     svg_collecting = 0;
+    if (!s->size64 || (s->size64 + 32) / 64 != s->size) s->size64 = s->size * 64; /* (set some other way: whole px) */
     s->alpha = (unsigned char)(p->alpha * s->opacity / 255);
     if (s->display == D_INLINE && is(e->tag, "button")) s->display = D_INLINE_BLOCK;
     if (s->valign == VA_INHERIT) {

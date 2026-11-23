@@ -13,7 +13,7 @@ enum { IT_RECT, IT_BORDER, IT_TEXT, IT_IMAGE, IT_CONTROL, IT_MARKER };
 
 typedef struct {
     unsigned char kind, face, bold, italic, underline, strike;
-    short size, base;  /* text: font size, and the baseline's distance from y */
+    short size, base;  /* text: font size (1/64 px), and the baseline's distance from y */
     int x, y, w, h;
     unsigned color;
     Node *node;        /* the element it belongs to */
@@ -55,7 +55,7 @@ static int pool_add(const char *text, int len, int upper) {
 
 /* ---------------------------------------------------------------- text measures */
 
-#define FONT_OF(s) (s)->face, (s)->bold, (s)->italic, (s)->size
+#define FONT_OF(s) (s)->face, (s)->bold, (s)->italic, (s)->size64
 
 /* The width of text in an element's font (upper-cased if it says so). */
 static int text_w(const Style *s, const char *t, int len) {
@@ -79,7 +79,7 @@ static int line_metrics(const Style *s, int *above) {
     font_metrics(FONT_OF(s), &a, &d, &g);
     int content = a + d, lh;
     if (s->line_height > 0) lh = s->line_height;
-    else if (s->line_height < 0) lh = (int)(((long long)-s->line_height * s->size + 50) / 100);
+    else if (s->line_height < 0) lh = (int)(((long long)-s->line_height * s->size64 + 3200) / 6400);
     else lh = content + g;
     if (above) *above = a + (lh - content) / 2;
     return lh;
@@ -121,6 +121,13 @@ static int is_inline_level(Node *n) {
     int d = n->style.display;
     if (d == D_NONE) return 0;
     if (n->style.floating || out_of_flow(n)) return 0;
+    if (d == D_INLINE && n->type == NODE_ELEMENT) { /* a block inside an inline (<a><div>): laid out as a block, as browsers break the line around it */
+        for (Node *c = n->first; c; c = c->next)
+            if (c->type == NODE_ELEMENT && !c->style.floating && !out_of_flow(c) &&
+                (c->style.display == D_BLOCK || c->style.display == D_LIST_ITEM || c->style.display == D_FLEX ||
+                 c->style.display == D_GRID || c->style.display == D_TABLE))
+                return 0;
+    }
     return d == D_INLINE || d == D_INLINE_BLOCK || d == D_INLINE_FLEX || d == D_INLINE_GRID || d == D_TABLE_CELL;
 }
 
@@ -736,7 +743,7 @@ static void emit_word(Atom *a, int x, int baseline) {
     item->w = a->w;
     item->h = content;
     item->base = (short)fa;
-    item->size = (short)s->size;
+    item->size = (short)(s->size64 > 32000 ? 32000 : s->size64);
     item->face = s->face;
     item->color = s->color;
     item->bold = s->bold;
@@ -957,7 +964,7 @@ static void list_marker(Node *li, int x, int y) {
     items[it].w = w;
     items[it].h = fa + fd;
     items[it].base = (short)fa;
-    items[it].size = (short)li->style.size;
+    items[it].size = (short)(li->style.size64 > 32000 ? 32000 : li->style.size64);
     items[it].face = li->style.face;
     items[it].color = li->style.color;
     items[it].text = pool_add(marker, len, 0);

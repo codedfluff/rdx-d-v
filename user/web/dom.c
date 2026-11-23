@@ -94,7 +94,8 @@ typedef struct {
 typedef struct {
     /* inherited */
     unsigned color;
-    int size;                       /* font size in px */
+    int size;                       /* font size in px (rounded) */
+    int size64;                     /* font size in 1/64 px, for drawing and measuring text */
     unsigned char bold, italic, underline, strike, pre, nowrap, align, list_none, upper, hidden;
     unsigned char cursor_pointer;
     unsigned char face;             /* FACE_SANS, FACE_SERIF or FACE_MONO */
