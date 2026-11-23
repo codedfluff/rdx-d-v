@@ -120,6 +120,8 @@ static void control_label(Node *n, char *out, int max) {
 }
 
 /* The content size of a replaced element (before padding and border). */
+static void svg_natural_size(Node *svg, int *w, int *h);
+
 static void natural_size(Node *n, int *w, int *h) {
     char type[16] = "text", v[32];
     *w = 0;
@@ -180,7 +182,16 @@ static void natural_size(Node *n, int *w, int *h) {
         *h = 16;
         return;
     }
-    *w = 300; /* video, canvas, iframe, svg: the default object size */
+    if (is(n->tag, "svg")) {
+        if (n->img_state == 1) {
+            *w = n->img_w;
+            *h = n->img_h;
+        } else {
+            svg_natural_size(n, w, h);
+        }
+        return;
+    }
+    *w = 300; /* video, canvas, iframe: the default object size */
     *h = 150;
 }
 
@@ -276,6 +287,13 @@ static void intrinsic(Node *n, int *mn, int *mx) {
         int gaps = 0, items = 0;
         for (Node *c = n->first; c; c = c->next) {
             if (c->type == NODE_ELEMENT && (c->style.display == D_NONE || out_of_flow(c))) continue;
+            if (c->type == NODE_ELEMENT && c->style.display == D_TABLE_CAPTION &&
+                (n->style.display == D_TABLE || n->style.display == D_INLINE_BLOCK)) {
+                int cmn, cmx;
+                intrinsic(c, &cmn, &cmx); /* a caption wraps to the table's width */
+                if (cmn > *mn) *mn = cmn;
+                continue;
+            }
             if (c->type == NODE_ELEMENT && is(c->tag, "br")) {
                 if (run_mx > *mx) *mx = run_mx;
                 run_mx = 0;
@@ -1077,13 +1095,6 @@ static int layout_table(Node *table, int left, int top, int width) {
     char v[16];
     int spacing = attr(table, "cellspacing", v, sizeof(v)) ? atoi(v) : 2;
     int y = top;
-    /* Captions first. */
-    for (Node *c = table->first; c; c = c->next) {
-        if (c->type == NODE_ELEMENT && c->style.display == D_TABLE_CAPTION) {
-            layout_box(c, left, y, width);
-            y += c->h;
-        }
-    }
     int nrows = table_rows(table, rows, 2048);
     int cols = 0;
     for (int r = 0; r < nrows; r++) {
@@ -1094,8 +1105,17 @@ static int layout_table(Node *table, int left, int top, int width) {
         if (count > cols) cols = count;
     }
     if (cols == 0) {
+        /* No rows: its content is one anonymous cell (a figure styled as a
+           table, with a picture and its caption, say): laid out as a block. */
         free(rows);
-        return y - top;
+        return layout_flow(table, left, top, width);
+    }
+    /* Captions above (or, with caption-side: bottom, below). */
+    for (Node *c = table->first; c; c = c->next) {
+        if (c->type == NODE_ELEMENT && c->style.display == D_TABLE_CAPTION && !c->style.caption_bottom) {
+            layout_box(c, left, y, width);
+            y += c->h;
+        }
     }
     if (cols > MAX_COLS) cols = MAX_COLS;
     int mins[MAX_COLS], maxs[MAX_COLS], fixed[MAX_COLS];
@@ -1215,6 +1235,12 @@ static int layout_table(Node *table, int left, int top, int width) {
         row->items_to = item_count;
         y += row_h + spacing;
     }
+    for (Node *c = table->first; c; c = c->next) {
+        if (c->type == NODE_ELEMENT && c->style.display == D_TABLE_CAPTION && c->style.caption_bottom) {
+            layout_box(c, left, y, width);
+            y += c->h;
+        }
+    }
     free(rows);
     return y - top;
 }
@@ -1230,7 +1256,7 @@ static void layout_box(Node *n, int x, int y, int width) {
     n->items_from = item_count;
     n->bg_item = -1;
     /* Background and border, sized once the height is known. */
-    if (s->has_background && !s->hidden) {
+    if (s->has_background && !s->hidden && !s->masked) {
         int it = new_item(IT_RECT);
         if (it >= 0) {
             items[it].color = s->background;

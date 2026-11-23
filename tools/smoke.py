@@ -137,6 +137,86 @@ def serve(server):
 
 WEB_PORT = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), WebHandler))
 
+FORUM_CONNECTIONS = set()  # the client ports /forum/ka was asked for on
+
+
+class ForumHandler(http.server.BaseHTTPRequestHandler):
+    """A pretend forum: HTTP/1.1 with kept-open connections and chunked
+    replies, a login that sets cookies on a redirect, a meta refresh, a 307."""
+    protocol_version = "HTTP/1.1"
+
+    def cookies(self):
+        jar = {}
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                jar[k] = v
+        return jar
+
+    def reply(self, status, body=b"", headers=(), chunked=False):
+        self.send_response(status)
+        for k, v in headers:
+            self.send_header(k, v)
+        if chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for i in range(0, len(body), 7):
+                piece = body[i:i + 7]
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(piece), piece))
+            self.wfile.write(b"0\r\n\r\n")
+        else:
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    @staticmethod
+    def page(title, body, script=""):
+        return f"<html><head><title>{title}</title></head><body>{body}<script>{script}</script></body></html>".encode()
+
+    def do_GET(self):
+        jar = self.cookies()
+        if self.path == "/forum/":
+            who = "Welcome back, alice" if jar.get("sid") == "s3cret" else "Hello guest"
+            body = self.page(who, f"<p>{who} (prefs={jar.get('prefs', 'none')})</p>",
+                             "document.title = document.title + ' | js sees: ' + document.cookie;")
+            self.reply(200, body, chunked=True)
+        elif self.path == "/forum/start":  # logs in from a script, then goes on through a meta refresh
+            self.reply(200, self.page("start", "", "fetch('/forum/login', {method: 'POST', body: 'user=alice&pw=pw', "
+                                      "headers: {'Content-Type': 'application/x-www-form-urlencoded'}})"
+                                      ".then(function (r) { location.href = '/forum/meta'; });"))
+        elif self.path == "/forum/meta":
+            self.reply(200, b"<html><head><meta http-equiv='refresh' content='0; url=/forum/'><title>moving</title></head>"
+                            b"<body>moving on</body></html>")
+        elif self.path == "/forum/ka":
+            FORUM_CONNECTIONS.add(self.client_address[1])
+            self.reply(200, b"ok")
+        elif self.path == "/forum/t307":
+            self.reply(200, self.page("t307", "", "fetch('/forum/r307', {method: 'POST', body: 'x=1'})"
+                                      ".then(function (r) { return r.text(); }).then(function (t) { document.title = t; });"
+                                      "for (var i = 0; i < 3; i++) { var x = new XMLHttpRequest(); x.open('GET', '/forum/ka'); x.send(); }"))
+        else:
+            self.reply(404, b"not here")
+
+    def do_POST(self):
+        data = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+        if self.path == "/forum/login":
+            headers = [("Location", "/forum/")]
+            if data.startswith("user=alice") and self.headers.get("Origin") == f"http://10.0.2.2:{FORUM_PORT}":
+                headers += [("Set-Cookie", "sid=s3cret; Path=/forum; HttpOnly"), ("Set-Cookie", "prefs=dark; Max-Age=3600; Path=/")]
+            self.reply(303, b"", headers)
+        elif self.path == "/forum/r307":
+            self.reply(307, b"", [("Location", "/forum/echo")])
+        elif self.path == "/forum/echo":
+            self.reply(200, f"{self.command} {data}".encode())
+        else:
+            self.reply(404, b"not here")
+
+    def log_message(self, *args):
+        pass
+
+
+FORUM_PORT = serve(http.server.ThreadingHTTPServer(("127.0.0.1", 0), ForumHandler))
+
 # The same pages over https: with an RSA certificate from the test
 # authority, with an EC one through an intermediate, and with a self-signed
 # one that RDX must refuse.
@@ -189,6 +269,7 @@ def start_qemu(machine="q35", extra=(), sata_disk=True):
     cursor = len(log)
     proc = subprocess.Popen([
         qemu, "-machine", machine, "-m", "256M",
+    ] + sum([["-accel", a] for a in os.environ.get("RDX_ACCEL", "whpx,tcg").split(",")], []) + [
         "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
         "-drive", f"format=raw,file=fat:rw:{ESP}",
     ] + (["-drive", f"format=raw,file={DISK}"] if sata_disk else []) + [
@@ -684,13 +765,18 @@ try:
     check("layout: tables, positioned boxes and form controls",
           re.search(r"alpha +TABLE-ONE", page) is not None and re.search(r"in the box +CORNER", page) is not None
           and "[hello]" in page and "[x]" in page and "[two]" in page and "[Go]" in page)
-    check("JavaScript: the language and the DOM (34 checks in the page)",
-          run("set BROWSER_CONSOLE=1", "rdx> ") and run("browser --dump jstest.html", "JS TEST OK (34 checks)", 30)
+    check("JavaScript: the language, the DOM and CSS variables (42 checks in the page)",
+          run("set BROWSER_CONSOLE=1", "rdx> ") and run("browser --dump jstest.html", "JS TEST OK (42 checks)", 30)
           and wait_for("rdx> ", 10))
     page = log[log.rindex("browser --dump jstest.html"):]
     check("scripts change the page: added list items, innerHTML, hidden elements, no <noscript>",
           "three (added by a script)" in page and "Written by JavaScript" in page and "THIS SHOULD BE HIDDEN" not in page
           and "NOSCRIPT CONTENT" not in page and "PASS event loop order" in page)
+    check("frames and workers: an <iframe> runs its own page, postMessage both ways, a Worker from a blob: address",
+          run("browser --dump frametest.html", "--- frame", 40) and wait_for("rdx> ", 10)
+          and "FRAME REPLIED: hi parent 3" in log[log.rindex("browser --dump frametest.html"):]
+          and "WORKER SAID 42 function" in log[log.rindex("browser --dump frametest.html"):]
+          and "CHILD GOT: hello child" in log[log.rindex("browser --dump frametest.html"):])
     check("a page reads its address's query (local file, ?query, URLSearchParams)",
           run("browser --dump formresult.html?who=Ada", "You sent: name=Ada, news=no, colour=null", 20) and wait_for("rdx> ", 10))
     check("the garbage collector frees memory and keeps what is still used",
@@ -975,6 +1061,20 @@ try:
     check("relative links are made absolute against the redirected address",
           f"1. http://10.0.2.2:{WEB_PORT}/dir/other.html" in page_text
           and f"2. http://10.0.2.2:{WEB_PORT}/top.html" in page_text)
+    forum = f"http://10.0.2.2:{FORUM_PORT}/forum"
+    mark = len(log)
+    check("a forum login: a POST sets cookies on its redirect, a meta refresh follows, HttpOnly is hidden from scripts",
+          run(f"browser --dump {forum}/start", "Connection:", 40) and wait_for("rdx> ", 10)
+          and "Title: Welcome back, alice | js sees: prefs=dark" in log[mark:] and "(prefs=dark)" in log[mark:])
+    mark = len(log)
+    check("cookies with an expiry date outlast the browser, session ones do not",
+          run(f"browser --dump {forum}/", "Connection:", 30) and wait_for("rdx> ", 10)
+          and "Title: Hello guest | js sees: prefs=dark" in log[mark:]
+          and run("cat browser.cookies", "prefs\tdark") and wait_for("rdx> ", 10) and "s3cret" not in log[mark:])
+    mark = len(log)
+    check("a 307 redirect repeats the POST; requests to one server share a kept-open connection",
+          run(f"browser --dump {forum}/t307", "Connection:", 30) and wait_for("rdx> ", 10)
+          and "Title: POST x=1" in log[mark:] and len(FORUM_CONNECTIONS) == 1)
     if HTTPS_PORT:
         mark_tls = len(log)
         check("https: the browser fetches a page over TLS 1.3 (redirect included)",

@@ -1,0 +1,28 @@
+<html><head><title>Frames</title></head>
+<body style="font-family:sans-serif">
+<h1>Parent page</h1>
+<p id="status">parent text before the frame</p>
+<p id="reply">no reply yet</p>
+<p id="worker">no worker reply yet</p>
+<iframe id="child" src="framechild.html" width="400" height="120" style="border:2px solid #444"></iframe>
+<p>parent text after the frame</p>
+<script>
+var frame = document.getElementById("child");
+window.addEventListener("message", function (e) {
+  if (e.source !== frame.contentWindow) return;
+  document.getElementById("reply").textContent = "FRAME REPLIED: " + e.data.text + " " + e.data.n + " from " + e.origin;
+  console.log("parent got " + JSON.stringify(e.data));
+});
+frame.addEventListener("load", function () {
+  document.getElementById("status").textContent = "the frame said it loaded";
+  frame.contentWindow.postMessage({ ask: "hello child", list: [1, 2, 3], when: new Date(0), big: 12n, bytes: new Uint8Array([7, 8]) }, "*");
+});
+var code = "onmessage = function (e) { postMessage({ sum: e.data.a + e.data.b, inWorker: typeof document === 'undefined' && typeof self.importScripts }); };";
+var w = new Worker(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
+w.onmessage = function (e) {
+  document.getElementById("worker").textContent = "WORKER SAID " + e.data.sum + " " + e.data.inWorker;
+  console.log("worker said " + JSON.stringify(e.data));
+};
+w.postMessage({ a: 20, b: 22 });
+</script>
+</body></html>

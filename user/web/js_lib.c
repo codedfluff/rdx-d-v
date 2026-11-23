@@ -73,11 +73,42 @@ NATIVE(noop) {
 }
 
 /* For console.log: a readable rendering of any value. */
+static JsStr *symbol_description(JsStr *key, int *has);
+
+/* A TypeError from a built-in, saying where in the page's code it was called. */
+static int throw_type_here(const char *message, const char *detail) {
+    char where[48] = "";
+    if (native_call_line > 0) {
+        char t[16];
+        strcpy(where, ", line ");
+        number_to_text(native_call_line, t);
+        strncat_safe(where, t, 12);
+        strncat_safe(where, ", character ", 14);
+        number_to_text(native_call_pos, t);
+        strncat_safe(where, t, 12);
+    }
+    return throw_type(message, detail, where);
+}
+
 static int format_value(Value v, Buf *b, int depth) {
+    if (v.t == V_SYM) {
+        int has;
+        JsStr *d = symbol_description(v.u.s, &has);
+        buf_c(b, "Symbol(");
+        if (has) buf_add(b, d->s, d->len);
+        buf_ch(b, ')');
+        return C_NORMAL;
+    }
     if (v.t == V_STR) {
         buf_ch(b, '"');
         buf_add(b, v.u.s->s, v.u.s->len);
         buf_ch(b, '"');
+        return C_NORMAL;
+    }
+    if (v.t == V_BIG) {
+        JsStr *s = big_text(v.u.s, 10);
+        buf_add(b, s->s, s->len);
+        buf_ch(b, 'n');
         return C_NORMAL;
     }
     if (v.t != V_OBJ) {
@@ -159,6 +190,16 @@ static JsObj *to_object_or_null(Value v) {
         o->this_val = v;
         return o;
     }
+    if (v.t == V_SYM) {
+        JsObj *o = obj_new_raw(CL_OBJECT, SymbolProto);
+        o->this_val = v;
+        return o;
+    }
+    if (v.t == V_BIG) {
+        JsObj *o = obj_new_raw(CL_OBJECT, BigIntProto);
+        o->this_val = v;
+        return o;
+    }
     return NULL;
 }
 
@@ -177,14 +218,18 @@ NATIVE(object_keys) {
     JsObj *o = to_object_or_null(v);
     if (!o) return throw_type("Cannot convert undefined or null to object", NULL, NULL);
     JsObj *keys = new_array(0);
-    if ((self->magic & 0xFFFF) == 4) { /* getOwnPropertySymbols: there are none */
+    if ((self->magic & 0xFFFF) == 4) { /* getOwnPropertySymbols */
+        for (int i = 0; i < o->nprops; i++) {
+            if (is_symbol_key(o->props[i].key)) arr_push(keys, v_sym(o->props[i].key));
+        }
         *ret = v_obj(keys);
         return C_NORMAL;
     }
+    if ((self->magic & 0xFFFF) == 3) function_own_props(o);
     enumerable_keys(o, keys, 1);
     if ((self->magic & 0xFFFF) == 3) {
         for (int i = 0; i < o->nprops; i++) {
-            if (o->props[i].flags & P_HIDDEN) arr_push(keys, v_str(o->props[i].key));
+            if ((o->props[i].flags & P_HIDDEN) && !is_symbol_key(o->props[i].key)) arr_push(keys, v_str(o->props[i].key));
         }
     }
     int mode = self->magic & 0xFFFF;
@@ -263,7 +308,7 @@ static int define_from_descriptor(JsObj *o, JsStr *key, Value desc) {
 NATIVE(object_define_property) {
     UNUSED;
     Value o = ARG(0);
-    if (o.t != V_OBJ) return throw_type("Object.defineProperty called on non-object", NULL, NULL);
+    if (o.t != V_OBJ) return throw_type_here("Object.defineProperty called on non-object", o.t == V_UNDEF ? " (undefined)" : NULL);
     JsStr *key;
     TRY(to_key(ARG(1), &key));
     TRY(define_from_descriptor(o.u.o, key, ARG(2)));
@@ -287,6 +332,8 @@ NATIVE(object_define_properties) {
     return C_NORMAL;
 }
 
+static int dom_accessor_prepare(JsObj *o, JsStr *key); /* (js_dom.c) */
+
 NATIVE(object_get_own_property_descriptor) {
     UNUSED;
     Value o = ARG(0);
@@ -294,8 +341,22 @@ NATIVE(object_get_own_property_descriptor) {
     if (o.t != V_OBJ) return C_NORMAL;
     JsStr *key;
     TRY(to_key(ARG(1), &key));
+    function_own_props(o.u.o);
     Prop *p = own_prop(o.u.o, key);
+    if (!p && dom_accessor_prepare(o.u.o, key)) p = own_prop(o.u.o, key);
     if (!p) {
+        int arrayish = o.u.o->cls == CL_ARRAY || o.u.o->cls == CL_ARGUMENTS;
+        if ((arrayish || (o.u.o->cls == CL_STRING && o.u.o->this_val.t == V_STR)) && key == S_length) {
+            /* (a built-in length, not stored as a property) */
+            JsObj *d = new_object();
+            int len = arrayish ? o.u.o->alen : o.u.o->this_val.u.s->len;
+            prop_set_raw(d, S_value, v_num(len), 0);
+            prop_set_raw(d, S_writable, v_bool(arrayish && !o.u.o->fn_kind), 0);
+            prop_set_raw(d, S_enumerable, v_bool(0), 0);
+            prop_set_raw(d, S_configurable, v_bool(0), 0);
+            *ret = v_obj(d);
+            return C_NORMAL;
+        }
         if ((o.u.o->cls == CL_ARRAY) && key->index >= 0 && key->index < o.u.o->alen) {
             JsObj *d = new_object();
             prop_set_raw(d, S_value, o.u.o->arr[key->index], 0);
@@ -303,6 +364,16 @@ NATIVE(object_get_own_property_descriptor) {
             prop_set_raw(d, S_enumerable, v_bool(1), 0);
             prop_set_raw(d, S_configurable, v_bool(1), 0);
             *ret = v_obj(d);
+        }
+        if (ret->t == V_UNDEF && js_trace_throws) {
+            Value ctor = v_undef(), name = v_undef();
+            Prop *cp = own_prop(o.u.o, S_constructor);
+            if (cp && cp->v.t == V_OBJ) ctor = cp->v;
+            if (ctor.t == V_OBJ) {
+                Prop *np = own_prop(ctor.u.o, S_name);
+                if (np) name = np->v;
+            }
+            printf("[descriptor] none for %s on %s (class %d)\n", key->s, name.t == V_STR ? name.u.s->s : "?", o.u.o->cls);
         }
         return C_NORMAL;
     }
@@ -388,6 +459,7 @@ NATIVE(object_has_own) {
     int has = 0;
     if (o.t == V_OBJ) {
         JsObj *obj = o.u.o;
+        function_own_props(obj);
         has = own_prop(obj, key) != NULL;
         if (!has && (obj->cls == CL_ARRAY || obj->cls == CL_ARGUMENTS)) has = key == S_length || (key->index >= 0 && key->index < obj->alen);
         if (!has && obj->cls == CL_FUNCTION && (key == S_prototype || key == S_name || key == S_length) && obj->fn) has = 1;
@@ -427,7 +499,19 @@ NATIVE(object_to_string) {
     else if (this_v.t == V_STR) tag = "String";
     else if (this_v.t == V_NUM) tag = "Number";
     else if (this_v.t == V_BOOL) tag = "Boolean";
+    else if (this_v.t == V_SYM) tag = "Symbol";
+    else if (this_v.t == V_BIG) tag = "BigInt";
     else {
+        Value own; /* Symbol.toStringTag names it, if set */
+        TRY(get_value(this_v, intern_c("@@toStringTag"), &own));
+        if (own.t == V_STR && own.u.s->len < 60) {
+            Buf b = {0};
+            buf_c(&b, "[object ");
+            buf_add(&b, own.u.s->s, own.u.s->len);
+            buf_ch(&b, ']');
+            *ret = v_str(buf_done(&b));
+            return C_NORMAL;
+        }
         switch (this_v.u.o->cls) {
         case CL_ARRAY: tag = "Array"; break;
         case CL_FUNCTION: tag = "Function"; break;
@@ -458,13 +542,37 @@ NATIVE(object_value_of) {
 
 NATIVE(function_call) {
     UNUSED;
-    if (!is_callable(this_v)) return throw_type("Function.prototype.call called on a non-function", NULL, NULL);
+    if (!is_callable(this_v)) {
+        char where[48] = "";
+        if (native_call_line > 0) {
+            char t[16];
+            strcpy(where, ", line ");
+            number_to_text(native_call_line, t);
+            strncat_safe(where, t, 12);
+            strncat_safe(where, ", character ", 14);
+            number_to_text(native_call_pos, t);
+            strncat_safe(where, t, 12);
+        }
+        return throw_type("Function.prototype.call called on a non-function", this_v.t == V_UNDEF ? " (undefined)" : NULL, where);
+    }
     return call_function(this_v.u.o, ARG(0), argc > 1 ? args + 1 : NULL, argc > 1 ? argc - 1 : 0, ret);
 }
 
 NATIVE(function_apply) {
     UNUSED;
-    if (!is_callable(this_v)) return throw_type("Function.prototype.apply called on a non-function", NULL, NULL);
+    if (!is_callable(this_v)) {
+        char where[48] = "";
+        if (native_call_line > 0) {
+            char t[16];
+            strcpy(where, ", line ");
+            number_to_text(native_call_line, t);
+            strncat_safe(where, t, 12);
+            strncat_safe(where, ", character ", 14);
+            number_to_text(native_call_pos, t);
+            strncat_safe(where, t, 12);
+        }
+        return throw_type("Function.prototype.apply called on a non-function", this_v.t == V_UNDEF ? " (undefined)" : NULL, where);
+    }
     Value list = ARG(1);
     if (is_nullish(list)) return call_function(this_v.u.o, ARG(0), NULL, 0, ret);
     JsObj *items;
@@ -504,9 +612,31 @@ NATIVE(function_to_string) {
     return C_NORMAL;
 }
 
+static int global_eval(JsObj *self, Value this_v, Value *args, int argc, Value *ret);
+
+/* new Function("a", "b", "return a + b"): the text made into a function
+   expression and evaluated at the top level, as the standard says. */
 NATIVE(function_ctor) {
     UNUSED;
-    return throw_error(SyntaxErrorProto, "new Function() is not supported");
+    Buf b = {0};
+    buf_c(&b, "(function anonymous(");
+    for (int i = 0; i + 1 < argc; i++) {
+        JsStr *p;
+        TRY(to_string(args[i], &p));
+        if (i) buf_ch(&b, ',');
+        buf_add(&b, p->s, p->len);
+    }
+    buf_c(&b, "\n) {\n");
+    if (argc) {
+        JsStr *body;
+        TRY(to_string(args[argc - 1], &body));
+        buf_add(&b, body->s, body->len);
+    }
+    buf_c(&b, "\n})");
+    Value src = v_str(buf_done(&b));
+    TRY(global_eval(self, this_v, &src, 1, ret));
+    if (!is_callable(*ret)) return throw_error(SyntaxErrorProto, "Function(): the text is not a function body");
+    return C_NORMAL;
 }
 
 /* ================================================================ Array */
@@ -587,9 +717,37 @@ NATIVE(array_of) {
     return C_NORMAL;
 }
 
+/* push / pop on an object that is not an array: through its length */
+static int generic_push_pop(Value o, Value *args, int argc, int pop, Value *ret) {
+    if (o.t != V_OBJ) return throw_type("Array.prototype method called on a non-object", NULL, NULL);
+    Value lv;
+    TRY(get_value(o, S_length, &lv));
+    double len;
+    TRY(to_number(lv, &len));
+    if (is_nan(len) || len < 0) len = 0;
+    len = js_trunc(len);
+    if (pop) {
+        if (len == 0) {
+            TRY(put_value(o, S_length, v_num(0)));
+            *ret = v_undef();
+            return C_NORMAL;
+        }
+        TRY(get_index(o, v_num(len - 1), ret));
+        JsStr *k;
+        TRY(to_key(v_num(len - 1), &k));
+        prop_delete(o.u.o, k);
+        return put_value(o, S_length, v_num(len - 1));
+    }
+    for (int i = 0; i < argc; i++) TRY(put_index(o, v_num(len + i), args[i]));
+    TRY(put_value(o, S_length, v_num(len + argc)));
+    *ret = v_num(len + argc);
+    return C_NORMAL;
+}
+
 NATIVE(array_push) {
     UNUSED;
-    if (this_v.t != V_OBJ || this_v.u.o->cls != CL_ARRAY) return throw_type("push called on a non-array", NULL, NULL);
+    if (this_v.t == V_OBJ && this_v.u.o->cls != CL_ARRAY) return generic_push_pop(this_v, args, argc, 0, ret);
+    if (this_v.t != V_OBJ) return throw_type("push called on a non-array", NULL, NULL);
     JsObj *a = this_v.u.o;
     for (int i = 0; i < argc; i++) arr_push(a, args[i]);
     *ret = v_num(a->alen);
@@ -598,7 +756,8 @@ NATIVE(array_push) {
 
 NATIVE(array_pop) {
     UNUSED;
-    if (this_v.t != V_OBJ || this_v.u.o->cls != CL_ARRAY) return throw_type("pop called on a non-array", NULL, NULL);
+    if (this_v.t == V_OBJ && this_v.u.o->cls != CL_ARRAY) return generic_push_pop(this_v, args, argc, 1, ret);
+    if (this_v.t != V_OBJ) return throw_type("pop called on a non-array", NULL, NULL);
     JsObj *a = this_v.u.o;
     *ret = a->alen ? a->arr[--a->alen] : v_undef();
     return C_NORMAL;
@@ -884,8 +1043,13 @@ NATIVE(array_sort) {
     }
     int n = a->alen;
     memcpy(copy, a->arr, sizeof(Value) * (size_t)n);
+    memset(tmp, 0, sizeof(Value) * (size_t)(n + 1));
+    gc_extra_add(copy, sizeof(Value) * (size_t)(n + 1));
+    gc_extra_add(tmp, sizeof(Value) * (size_t)(n + 1));
     int r = merge_sort(copy, tmp, n, ARG(0));
     if (r == C_NORMAL && a->alen >= n) memcpy(a->arr, copy, sizeof(Value) * (size_t)n);
+    gc_extra_remove(tmp);
+    gc_extra_remove(copy);
     free(tmp);
     free(copy);
     *ret = this_v;
@@ -966,7 +1130,26 @@ NATIVE(values_iterator) {
         return C_NORMAL;
     }
     JsObj *items;
-    TRY(iterate_to_array(this_v, &items));
+    if (this_v.t == V_STR || (this_v.t == V_OBJ && this_v.u.o->cls == CL_STRING && this_v.u.o->this_val.t == V_STR)) {
+        TRY(iterate_to_array(this_v.t == V_STR ? this_v : this_v.u.o->this_val, &items)); /* (a string: by character) */
+        *ret = v_obj(make_iterator(items));
+        return C_NORMAL;
+    }
+    /* anything else through its length and indexes (as Array.prototype.values
+       does): asking iterate_to_array would come straight back here */
+    if (this_v.t != V_OBJ) return throw_type("Array iterator called on a non-object", NULL, NULL);
+    Value lv;
+    TRY(get_value(this_v, S_length, &lv));
+    double len;
+    TRY(to_number(lv, &len));
+    if (is_nan(len) || len < 0) len = 0;
+    if (len > 50000000) len = 50000000;
+    items = new_array(0);
+    for (int i = 0; i < (int)len; i++) {
+        Value item;
+        TRY(get_index(this_v, v_num(i), &item));
+        arr_push(items, item);
+    }
     *ret = v_obj(make_iterator(items));
     return C_NORMAL;
 }
@@ -1018,9 +1201,21 @@ static int this_string(Value this_v, JsStr **out) {
     return to_string(this_v, out);
 }
 
+static JsStr *symbol_description(JsStr *key, int *has);
+
 NATIVE(string_ctor) {
     UNUSED;
     JsStr *s = S_empty;
+    if (argc && args[0].t == V_SYM && !native_new_target) { /* String(symbol) is allowed: "Symbol(description)" */
+        int has;
+        JsStr *d = symbol_description(args[0].u.s, &has);
+        Buf b = {0};
+        buf_c(&b, "Symbol(");
+        if (has) buf_add(&b, d->s, d->len);
+        buf_ch(&b, ')');
+        *ret = v_str(buf_done(&b));
+        return C_NORMAL;
+    }
     if (argc) TRY(to_string(args[0], &s));
     if (native_new_target) {
         JsObj *o = obj_new_raw(CL_STRING, StringProto);
@@ -1832,6 +2027,55 @@ static int match_atom(RNode *n, int i, Cont *k) {
 
 /* Find a match at or after `start` (sticky: only at start). Fills caps
    (group 0 is the whole match). 1 if found. */
+/* The last successful match, for the old RegExp.$1 ... $9, lastMatch,
+   leftContext, rightContext, input. The text is copied (once per string:
+   a replace() going through one string matches it many times). */
+static char *legacy_text;
+static const char *legacy_from;
+static int legacy_len, legacy_caps[20], legacy_groups;
+
+static void legacy_record(Regex *re, const char *s, int len, const int *caps) {
+    if (s != legacy_from || len != legacy_len || !legacy_text) {
+        char *copy = malloc((size_t)len + 1);
+        if (!copy) return;
+        memcpy(copy, s, (size_t)len);
+        copy[len] = 0;
+        free(legacy_text);
+        legacy_text = copy;
+        legacy_from = s;
+        legacy_len = len;
+    }
+    legacy_groups = re->groups < 9 ? re->groups : 9;
+    for (int i = 0; i < 20; i++) legacy_caps[i] = i < 2 * (legacy_groups + 1) ? caps[i] : -1;
+}
+
+/* RegExp.$1-$9 (magic 1-9), lastMatch (0), leftContext (10), rightContext (11), input (12), lastParen (13) */
+NATIVE(regexp_legacy) {
+    UNUSED;
+    int which = self->magic & 0xFFFF;
+    *ret = v_str(S_empty);
+    if (!legacy_text) return C_NORMAL;
+    int from = 0, to = 0;
+    if (which <= 9) {
+        if (which > legacy_groups) return C_NORMAL;
+        from = legacy_caps[2 * which];
+        to = legacy_caps[2 * which + 1];
+    } else if (which == 10) {
+        to = legacy_caps[0];
+    } else if (which == 11) {
+        from = legacy_caps[1];
+        to = legacy_len;
+    } else if (which == 12) {
+        to = legacy_len;
+    } else if (legacy_groups > 0) {
+        from = legacy_caps[2 * legacy_groups];
+        to = legacy_caps[2 * legacy_groups + 1];
+    }
+    if (from < 0 || to < from || to > legacy_len) return C_NORMAL;
+    *ret = v_str(str_new(legacy_text + from, to - from));
+    return C_NORMAL;
+}
+
 static int regex_exec(Regex *re, const char *s, int len, int start, int *caps) {
     char here;
     M.s = (const unsigned char *)s;
@@ -1845,6 +2089,7 @@ static int regex_exec(Regex *re, const char *s, int len, int start, int *caps) {
         if (match_atom(re->root, i, NULL)) {
             caps[0] = i;
             caps[1] = M.end;
+            if (len > 0) legacy_record(re, s, len, caps);
             return 1;
         }
         if (re->sticky || M.budget < 0) break;
@@ -2044,12 +2289,13 @@ NATIVE(string_replace) {
                     cb[g] = caps[2 * g] < 0 ? v_undef() : v_str(str_new(s->s + caps[2 * g], caps[2 * g + 1] - caps[2 * g]));
                 cb[re->groups + 1] = v_num(caps[0]);
                 cb[re->groups + 2] = v_str(s);
+                if (cb != small) gc_extra_add(cb, sizeof(Value) * (size_t)n);
                 int cap0 = caps[0], cap1 = caps[1];
                 Value r;
                 JsStr *rs;
                 int code = call_function(rep.u.o, v_undef(), cb, n, &r);
                 if (code == C_NORMAL) code = to_string(r, &rs);
-                if (cb != small) free(cb);
+                free_args(cb, small);
                 if (code != C_NORMAL) {
                     free(b.p);
                     if (caps != caps_small) free(caps);
@@ -2220,7 +2466,16 @@ NATIVE(string_match) {
 NATIVE(number_ctor) {
     UNUSED;
     double d = 0;
-    if (argc) TRY(to_number(args[0], &d));
+    Value a = ARG(0);
+    if (a.t == V_OBJ) TRY(to_primitive(a, 'n', &a));
+    if (a.t == V_BIG) {
+        Big b;
+        big_load(a.u.s, &b);
+        d = big_to_double(&b);
+        big_free(&b);
+    } else if (argc) {
+        TRY(to_number(a, &d));
+    }
     if (native_new_target) {
         JsObj *o = obj_new_raw(CL_NUMBER, NumberProto);
         o->this_val = v_num(d);
@@ -2782,7 +3037,7 @@ static int json_write(JsonOut *J, Value holder, JsStr *key, Value v, int *skip) 
     }
     if (v.t == V_OBJ && (v.u.o->cls == CL_NUMBER || v.u.o->cls == CL_STRING || v.u.o->cls == CL_BOOLEAN)) v = v.u.o->this_val;
     switch (v.t) {
-    case V_UNDEF: *skip = 1; return C_NORMAL;
+    case V_UNDEF: case V_SYM: *skip = 1; return C_NORMAL;
     case V_NULL: buf_c(&J->out, "null"); return C_NORMAL;
     case V_BOOL: buf_c(&J->out, v.u.b ? "true" : "false"); return C_NORMAL;
     case V_NUM: {
@@ -2795,6 +3050,7 @@ static int json_write(JsonOut *J, Value holder, JsStr *key, Value v, int *skip) 
         return C_NORMAL;
     }
     case V_STR: json_quote(&J->out, v.u.s); return C_NORMAL;
+    case V_BIG: return throw_type("Do not know how to serialize a BigInt", NULL, NULL);
     }
     JsObj *o = v.u.o;
     if (o->cls == CL_FUNCTION) {
@@ -2882,7 +3138,14 @@ NATIVE(json_stringify) {
 
 /* ================================================================ Date */
 
-static double now_ms(void) { return (double)time_now() * 1000.0 + (double)(uptime_ms() % 1000); }
+/* Milliseconds since 1970. The hardware clock only counts whole seconds,
+   and it and the uptime counter are not in step: the date is read once,
+   and from then on time goes forward with the uptime (never backwards). */
+static double now_ms(void) {
+    static double base;
+    if (!base) base = (double)time_now() * 1000.0 - (double)uptime_ms();
+    return base + (double)uptime_ms();
+}
 
 static double days_from_civil(double y, double m, double d) {
     /* m: 1..12 */
@@ -3414,9 +3677,8 @@ static void run_microtasks(void) {
         int kind = (int)job->arr[0].u.n;
         Value a = job->arr[1], b = job->arr[2], c = job->arr[3];
         char here;
-        js_stack_base = &here;
-        js_steps = 0;
-        js_abort = 0;
+        js_set_stack_base(&here);
+        js_start_run(500);
         if (kind == 1) { /* a reaction: handler a, value b, child promise c (state in the reaction) */
             JsObj *child = c.t == V_OBJ ? c.u.o : NULL;
             Value r;
@@ -3661,6 +3923,88 @@ NATIVE(error_to_string) {
     return C_NORMAL;
 }
 
+/* ---------------------------------------------------------------- BigInt */
+
+/* ToBigInt for BigInt(): numbers must be whole */
+static int to_bigint(Value v, int from_ctor, Value *out) {
+    if (v.t == V_OBJ) TRY(to_primitive(v, 'n', &v));
+    Big b = {0};
+    switch (v.t) {
+    case V_BIG: *out = v; return C_NORMAL;
+    case V_BOOL: *out = v_big(big_small(v.u.b)); return C_NORMAL;
+    case V_NUM:
+        if (!from_ctor) return throw_type("Cannot convert a Number to a BigInt", NULL, NULL);
+        if (!big_from_double(&b, v.u.n)) {
+            big_free(&b);
+            char t[40], m[96] = "The number ";
+            number_to_text(v.u.n, t);
+            strncat_safe(m, t, 40);
+            strncat_safe(m, " cannot be converted to a BigInt because it is not an integer", 70);
+            return throw_error(RangeErrorProto, m);
+        }
+        *out = v_big(big_store(&b));
+        return C_NORMAL;
+    case V_STR:
+        if (!big_from_text(&b, v.u.s->s, v.u.s->len, 0)) {
+            big_free(&b);
+            return throw_error(SyntaxErrorProto, "Cannot convert string to a BigInt");
+        }
+        *out = v_big(big_store(&b));
+        return C_NORMAL;
+    }
+    return throw_type("Cannot convert this value to a BigInt", NULL, NULL);
+}
+
+NATIVE(bigint_ctor) {
+    UNUSED;
+    if (native_new_target) return throw_type("BigInt is not a constructor", NULL, NULL);
+    return to_bigint(ARG(0), 1, ret);
+}
+
+/* BigInt.asIntN (magic 1) / asUintN (0) */
+NATIVE(bigint_as_n) {
+    UNUSED;
+    double bits;
+    TRY(to_number(ARG(0), &bits));
+    if (is_nan(bits) || bits < 0 || bits > 9007199254740991.0) return throw_error(RangeErrorProto, "Invalid value: not (convertible to) a safe integer");
+    Value v;
+    TRY(to_bigint(ARG(1), 0, &v));
+    Big b;
+    big_load(v.u.s, &b);
+    big_as_n(&b, (unsigned long long)bits, self->magic & 1);
+    *ret = v_big(big_store(&b));
+    return C_NORMAL;
+}
+
+static int this_bigint(Value v, JsStr **out) {
+    if (v.t == V_BIG) {
+        *out = v.u.s;
+        return C_NORMAL;
+    }
+    if (v.t == V_OBJ && v.u.o->this_val.t == V_BIG) {
+        *out = v.u.o->this_val.u.s;
+        return C_NORMAL;
+    }
+    return throw_type("BigInt.prototype method called on a value that is not a BigInt", NULL, NULL);
+}
+
+/* BigInt.prototype: magic 0 toString, 1 valueOf, 2 toLocaleString */
+NATIVE(bigint_method) {
+    UNUSED;
+    JsStr *b;
+    TRY(this_bigint(this_v, &b));
+    int mode = self->magic & 0xFFFF;
+    if (mode == 1) {
+        *ret = v_big(b);
+        return C_NORMAL;
+    }
+    double radix = 10;
+    if (mode == 0 && ARG(0).t != V_UNDEF) TRY(to_number(ARG(0), &radix));
+    if (radix < 2 || radix > 36) return throw_error(RangeErrorProto, "toString() radix must be between 2 and 36");
+    *ret = v_str(big_text(b, (int)radix));
+    return C_NORMAL;
+}
+
 static int symbol_counter;
 
 NATIVE(symbol_ctor) {
@@ -3677,7 +4021,7 @@ NATIVE(symbol_ctor) {
         TRY(to_string(ARG(0), &d));
         buf_add(&b, d->s, d->len);
     }
-    *ret = v_str(interned(buf_done(&b)));
+    *ret = v_sym(interned(buf_done(&b)));
     return C_NORMAL;
 }
 
@@ -3688,7 +4032,65 @@ NATIVE(symbol_for) {
     Buf b = {0};
     buf_c(&b, "@@symbol.for:");
     buf_add(&b, d->s, d->len);
-    *ret = v_str(interned(buf_done(&b)));
+    *ret = v_sym(interned(buf_done(&b)));
+    return C_NORMAL;
+}
+
+/* A symbol's description, from its key. */
+static JsStr *symbol_description(JsStr *key, int *has) {
+    *has = 1;
+    if (!strncmp(key->s, "@@symbol.for:", 13)) return str_new(key->s + 13, key->len - 13);
+    if (!strncmp(key->s, "@@symbol:", 9)) {
+        const char *colon = strchr(key->s + 9, ':');
+        if (colon && colon - key->s + 1 < key->len) return str_new(colon + 1, key->len - (int)(colon - key->s) - 1);
+        *has = colon && colon[1] == 0 && key->s[key->len - 1] == ':' ? 0 : 1;
+        return S_empty;
+    }
+    Buf b = {0}; /* a well-known one: "@@iterator" is Symbol.iterator */
+    buf_c(&b, "Symbol.");
+    buf_add(&b, key->s + 2, key->len - 2);
+    return buf_done(&b);
+}
+
+static int this_symbol(Value this_v, JsStr **key) {
+    if (this_v.t == V_SYM) {
+        *key = this_v.u.s;
+        return C_NORMAL;
+    }
+    if (this_v.t == V_OBJ && this_v.u.o->this_val.t == V_SYM) {
+        *key = this_v.u.o->this_val.u.s;
+        return C_NORMAL;
+    }
+    return throw_type("not a symbol", NULL, NULL);
+}
+
+/* Symbol.prototype: magic 0 toString, 1 valueOf, 2 description */
+NATIVE(symbol_method) {
+    UNUSED;
+    JsStr *key;
+    TRY(this_symbol(this_v, &key));
+    int has;
+    JsStr *d = symbol_description(key, &has);
+    switch (self->magic & 0xFFFF) {
+    case 0: {
+        Buf b = {0};
+        buf_c(&b, "Symbol(");
+        if (has) buf_add(&b, d->s, d->len);
+        buf_ch(&b, ')');
+        *ret = v_str(buf_done(&b));
+        break;
+    }
+    case 1: *ret = v_sym(key); break;
+    default: *ret = has ? v_str(d) : v_undef(); break;
+    }
+    return C_NORMAL;
+}
+
+NATIVE(symbol_key_for) {
+    UNUSED;
+    if (ARG(0).t != V_SYM) return throw_type("Symbol.keyFor: not a symbol", NULL, NULL);
+    JsStr *k = ARG(0).u.s;
+    *ret = !strncmp(k->s, "@@symbol.for:", 13) ? v_str(str_new(k->s + 13, k->len - 13)) : v_undef();
     return C_NORMAL;
 }
 
@@ -3755,17 +4157,78 @@ NATIVE(global_eval) {
 
 static JsObj *make_ctor(const char *name, Native fn, int nargs, int magic, JsObj *proto);
 
-static JsObj *TypedArrayProto;
-static const int TYPED_BYTES[10] = {0, 1, 1, 1, 2, 2, 4, 4, 4, 8};
+/* TypedArrayProto is %TypedArray%.prototype (the shared methods and the
+   buffer getters); each kind has its own prototype under it. */
+static JsObj *TypedArrayProto, *ArrayBufferProto, *DataViewProto, *TypedProtos[10];
 static const char *TYPED_NAMES[10] = {NULL, "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
                                       "Int32Array", "Uint32Array", "Float32Array", "Float64Array"};
 
 static JsObj *typed_new(int kind, int length) {
     JsObj *a = new_array(length);
     a->fn_kind = (unsigned char)kind;
-    a->proto = TypedArrayProto;
+    a->proto = TypedProtos[kind] ? TypedProtos[kind] : TypedArrayProto;
     for (int i = 0; i < length; i++) arr_push(a, v_num(0));
     return a;
+}
+
+static JsObj *buffer_new(int bytes) {
+    JsObj *b = obj_new_raw(CL_BUFFER, ArrayBufferProto);
+    b->extra = malloc((size_t)(bytes > 0 ? bytes : 1));
+    if (!b->extra) {
+        js_oom_where(__LINE__);
+        bytes = 0;
+    } else {
+        memset(b->extra, 0, (size_t)(bytes > 0 ? bytes : 1));
+    }
+    b->extra_len = bytes;
+    buffers_made = 1;
+    return b;
+}
+
+static void buffer_add_view(JsObj *buf, JsObj *view) {
+    if (buf->nbound >= buf->extra_cap) {
+        int cap = buf->extra_cap ? buf->extra_cap * 2 : 4;
+        Value *p = realloc(buf->bound, sizeof(Value) * (size_t)cap);
+        if (!p) {
+            js_oom_where(__LINE__);
+            return;
+        }
+        buf->bound = p;
+        buf->extra_cap = cap;
+    }
+    buf->bound[buf->nbound++] = v_obj(view);
+}
+
+/* a typed array over bytes [offset, offset + length * size) of buf */
+static JsObj *view_new(int kind, JsObj *buf, int offset, int length) {
+    JsObj *a = typed_new(kind, length);
+    a->target = buf;
+    a->magic = offset;
+    for (int k = 0; k < length && k < a->alen; k++)
+        a->arr[k] = v_num(typed_decode(kind, (unsigned char *)buf->extra + offset + k * TYPED_BYTES[kind]));
+    buffer_add_view(buf, a);
+    return a;
+}
+
+/* the buffer under a typed array (made now, if it had none) */
+static JsObj *typed_buffer_of(JsObj *a) {
+    if (is_view(a)) return a->target;
+    int size = TYPED_BYTES[a->fn_kind ? a->fn_kind : 9];
+    JsObj *buf = buffer_new(a->alen * size);
+    a->target = buf;
+    a->magic = 0;
+    buffer_add_view(buf, a);
+    view_wrote(a, 0, a->alen);
+    return buf;
+}
+
+static int to_index(Value v, const char *what, double *out) {
+    double d = 0;
+    if (v.t != V_UNDEF) TRY(to_number(v, &d));
+    d = is_nan(d) ? 0 : js_trunc(d);
+    if (d < 0 || d > 2147483647.0) return throw_error(RangeErrorProto, what);
+    *out = d;
+    return C_NORMAL;
 }
 
 NATIVE(typed_ctor) {
@@ -3777,59 +4240,259 @@ NATIVE(typed_ctor) {
         double n = src.t == V_NUM ? src.u.n : 0;
         if (n < 0 || n != js_trunc(n) || n > 50000000) return throw_error(RangeErrorProto, "Invalid typed array length");
         a = typed_new(kind, (int)n);
-    } else if (src.t == V_OBJ && src.u.o->cls == CL_OBJECT && own_prop(src.u.o, intern_c("byteLength"))) { /* an ArrayBuffer */
-        Value bl;
-        TRY(get_value(src, intern_c("byteLength"), &bl));
-        double off = 0, len;
-        TRY(arg_int(args, argc, 1, 0, &off));
-        TRY(arg_int(args, argc, 2, (bl.u.n - off) / TYPED_BYTES[kind], &len));
-        a = typed_new(kind, len < 0 ? 0 : (int)len);
+    } else if (src.t == V_OBJ && src.u.o->cls == CL_BUFFER) {
+        JsObj *buf = src.u.o;
+        int size = TYPED_BYTES[kind];
+        double off, len;
+        TRY(to_index(ARG(1), "Start offset is outside the bounds of the buffer", &off));
+        if ((int)off % size) return throw_error(RangeErrorProto, "start offset should be a multiple of the element size");
+        if (off > buf->extra_len) return throw_error(RangeErrorProto, "Start offset is outside the bounds of the buffer");
+        if (ARG(2).t == V_UNDEF) {
+            if ((buf->extra_len - (int)off) % size) return throw_error(RangeErrorProto, "byte length should be a multiple of the element size");
+            len = (buf->extra_len - off) / size;
+        } else {
+            TRY(to_index(ARG(2), "Invalid typed array length", &len));
+            if (off + len * size > buf->extra_len) return throw_error(RangeErrorProto, "Invalid typed array length");
+        }
+        a = view_new(kind, buf, (int)off, (int)len);
     } else {
         JsObj *items;
         TRY(iterate_to_array(src, &items));
         a = typed_new(kind, items->alen);
         for (int i = 0; i < items->alen; i++) TRY(typed_put(a, i, items->arr[i]));
+        if (argc > 1 && is_callable(args[1]) && (self->magic & 0x10000)) { /* from(items, mapFn) */
+            for (int i = 0; i < a->alen; i++) {
+                Value cb[2] = {items->arr[i], v_num(i)}, r;
+                TRY(call_function(args[1].u.o, ARG(2), cb, 2, &r));
+                TRY(typed_put(a, i, r));
+            }
+        }
     }
     *ret = v_obj(a);
+    return C_NORMAL;
+}
+
+static int this_typed(Value this_v, JsObj **out) {
+    if (this_v.t != V_OBJ || this_v.u.o->cls != CL_ARRAY || !this_v.u.o->fn_kind) return throw_type("not a typed array", NULL, NULL);
+    *out = this_v.u.o;
     return C_NORMAL;
 }
 
 /* set(array, offset) */
 NATIVE(typed_set) {
     UNUSED;
-    if (this_v.t != V_OBJ || this_v.u.o->cls != CL_ARRAY) return throw_type("not a typed array", NULL, NULL);
-    JsObj *a = this_v.u.o, *items;
+    JsObj *a, *items;
+    TRY(this_typed(this_v, &a));
     TRY(iterate_to_array(ARG(0), &items));
     double off;
     TRY(arg_int(args, argc, 1, 0, &off));
     if (off < 0 || off + items->alen > a->alen) return throw_error(RangeErrorProto, "offset is out of bounds");
-    for (int i = 0; i < items->alen; i++) TRY(put_index(this_v, v_num(off + i), items->arr[i]));
+    for (int i = 0; i < items->alen; i++) {
+        double d;
+        TRY(to_number(items->arr[i], &d));
+        a->arr[(int)off + i] = v_num(typed_coerce(a->fn_kind, d));
+    }
+    if (is_view(a)) view_wrote(a, (int)off, (int)off + items->alen);
     *ret = v_undef();
     return C_NORMAL;
 }
 
-/* subarray / slice (copies: views over shared memory are not modelled) */
+/* subarray (magic 0: a view over the same bytes) / slice (1: a copy) */
 NATIVE(typed_subarray) {
     UNUSED;
-    if (this_v.t != V_OBJ || this_v.u.o->cls != CL_ARRAY) return throw_type("not a typed array", NULL, NULL);
-    JsObj *a = this_v.u.o;
+    JsObj *a;
+    TRY(this_typed(this_v, &a));
     double s, e;
     TRY(arg_int(args, argc, 0, 0, &s));
     TRY(arg_int(args, argc, 1, a->alen, &e));
     int from = rel_index(s, a->alen), to = rel_index(e, a->alen);
-    JsObj *out = typed_new(a->fn_kind ? a->fn_kind : 9, to > from ? to - from : 0);
+    if (to < from) to = from;
+    if ((self->magic & 0xFFFF) == 0) {
+        JsObj *buf = typed_buffer_of(a);
+        *ret = v_obj(view_new(a->fn_kind, buf, a->magic + from * TYPED_BYTES[a->fn_kind], to - from));
+        return C_NORMAL;
+    }
+    JsObj *out = typed_new(a->fn_kind, to - from);
     for (int i = from; i < to; i++) out->arr[i - from] = a->arr[i];
     *ret = v_obj(out);
+    return C_NORMAL;
+}
+
+/* buffer (magic 0), byteOffset (1), byteLength (2), [Symbol.toStringTag] (3) */
+NATIVE(typed_info) {
+    UNUSED;
+    if ((self->magic & 0xFFFF) == 3) { /* (undefined for anything but a typed array) */
+        int k = this_v.t == V_OBJ && this_v.u.o->cls == CL_ARRAY ? this_v.u.o->fn_kind : 0;
+        *ret = k > 0 && k < 10 ? v_str(intern_c(TYPED_NAMES[k])) : v_undef();
+        return C_NORMAL;
+    }
+    JsObj *a;
+    TRY(this_typed(this_v, &a));
+    switch (self->magic & 0xFFFF) {
+    case 0: *ret = v_obj(typed_buffer_of(a)); break;
+    case 1: *ret = v_num(is_view(a) ? a->magic : 0); break;
+    default: *ret = v_num(a->alen * TYPED_BYTES[a->fn_kind]); break;
+    }
+    return C_NORMAL;
+}
+
+/* fill (0), reverse (1), sort (2): the array versions, then the bytes */
+static int array_fill(JsObj *self, Value this_v, Value *args, int argc, Value *ret);
+static int array_reverse(JsObj *self, Value this_v, Value *args, int argc, Value *ret);
+static int array_sort(JsObj *self, Value this_v, Value *args, int argc, Value *ret);
+
+static int compare_doubles(const void *x, const void *y) {
+    double a = ((const Value *)x)->u.n, b = ((const Value *)y)->u.n;
+    if (is_nan(a)) return is_nan(b) ? 0 : 1;
+    if (is_nan(b)) return -1;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+NATIVE(typed_in_place) {
+    JsObj *a;
+    TRY(this_typed(this_v, &a));
+    switch (self->magic & 0xFFFF) {
+    case 0:
+        TRY(array_fill(self, this_v, args, argc, ret));
+        for (int i = 0; i < a->alen; i++) {
+            if (a->arr[i].t != V_NUM) {
+                double d;
+                TRY(to_number(a->arr[i], &d));
+                a->arr[i] = v_num(d);
+            }
+            a->arr[i] = v_num(typed_coerce(a->fn_kind, a->arr[i].u.n));
+        }
+        break;
+    case 1: TRY(array_reverse(self, this_v, args, argc, ret)); break;
+    default:
+        if (is_callable(ARG(0))) TRY(array_sort(self, this_v, args, argc, ret));
+        else { /* numbers, in numeric order */
+            for (int gap = a->alen / 2; gap > 0; gap /= 2) /* (a shell sort) */
+                for (int i = gap; i < a->alen; i++)
+                    for (int j = i; j >= gap && compare_doubles(&a->arr[j - gap], &a->arr[j]) > 0; j -= gap) {
+                        Value t = a->arr[j];
+                        a->arr[j] = a->arr[j - gap];
+                        a->arr[j - gap] = t;
+                    }
+            *ret = this_v;
+        }
+        break;
+    }
+    typed_touched(this_v);
     return C_NORMAL;
 }
 
 NATIVE(array_buffer_ctor) {
     UNUSED;
     double n;
-    TRY(arg_int(args, argc, 0, 0, &n));
-    JsObj *b = new_object();
-    prop_set_raw(b, intern_c("byteLength"), v_num(n < 0 ? 0 : n), P_HIDDEN);
-    *ret = v_obj(b);
+    TRY(to_index(ARG(0), "Array buffer allocation failed", &n));
+    if (n > 256.0 * 1024 * 1024) return throw_error(RangeErrorProto, "Array buffer allocation failed");
+    *ret = v_obj(buffer_new((int)n));
+    return C_NORMAL;
+}
+
+/* byteLength (magic 0), slice (1) */
+NATIVE(array_buffer_method) {
+    UNUSED;
+    if (this_v.t != V_OBJ || this_v.u.o->cls != CL_BUFFER) return throw_type("not an ArrayBuffer", NULL, NULL);
+    JsObj *b = this_v.u.o;
+    if ((self->magic & 0xFFFF) == 0) {
+        *ret = v_num(b->extra_len);
+        return C_NORMAL;
+    }
+    double s, e;
+    TRY(arg_int(args, argc, 0, 0, &s));
+    TRY(arg_int(args, argc, 1, b->extra_len, &e));
+    int from = rel_index(s, b->extra_len), to = rel_index(e, b->extra_len);
+    if (to < from) to = from;
+    JsObj *c = buffer_new(to - from);
+    if (c->extra_len == to - from && to > from) memcpy(c->extra, (char *)b->extra + from, (size_t)(to - from));
+    *ret = v_obj(c);
+    return C_NORMAL;
+}
+
+/* ArrayBuffer.isView(x): is x a typed array or a DataView? */
+NATIVE(array_buffer_is_view) {
+    UNUSED;
+    Value v = ARG(0);
+    *ret = v_bool(v.t == V_OBJ && ((v.u.o->cls == CL_ARRAY && v.u.o->fn_kind) || (DataViewProto && v.u.o->proto == DataViewProto)));
+    return C_NORMAL;
+}
+
+/* DataView: target = the buffer, magic = byte offset, extra_len = byte length */
+NATIVE(data_view_ctor) {
+    UNUSED;
+    if (ARG(0).t != V_OBJ || ARG(0).u.o->cls != CL_BUFFER) return throw_type("First argument to DataView constructor must be an ArrayBuffer", NULL, NULL);
+    JsObj *buf = ARG(0).u.o;
+    double off, len;
+    TRY(to_index(ARG(1), "Start offset is outside the bounds of the buffer", &off));
+    if (off > buf->extra_len) return throw_error(RangeErrorProto, "Start offset is outside the bounds of the buffer");
+    if (ARG(2).t == V_UNDEF) len = buf->extra_len - off;
+    else TRY(to_index(ARG(2), "Invalid DataView length", &len));
+    if (off + len > buf->extra_len) return throw_error(RangeErrorProto, "Invalid DataView length");
+    JsObj *v = obj_new_raw(CL_OBJECT, DataViewProto);
+    v->target = buf;
+    v->magic = (int)off;
+    v->extra_len = (int)len;
+    *ret = v_obj(v);
+    return C_NORMAL;
+}
+
+/* buffer (0), byteOffset (1), byteLength (2) */
+NATIVE(data_view_info) {
+    UNUSED;
+    if (this_v.t != V_OBJ || this_v.u.o->proto != DataViewProto || !this_v.u.o->target) return throw_type("not a DataView", NULL, NULL);
+    JsObj *v = this_v.u.o;
+    int mode = self->magic & 0xFFFF;
+    *ret = mode == 0 ? v_obj(v->target) : v_num(mode == 1 ? v->magic : v->extra_len);
+    return C_NORMAL;
+}
+
+/* get<Type>(offset, littleEndian) / set<Type>(offset, value, littleEndian):
+   magic = element kind (10 BigInt64, 11 BigUint64), | 0x100 for set */
+NATIVE(data_view_access) {
+    UNUSED;
+    if (this_v.t != V_OBJ || this_v.u.o->proto != DataViewProto || !this_v.u.o->target) return throw_type("not a DataView", NULL, NULL);
+    JsObj *v = this_v.u.o, *buf = v->target;
+    int kind = self->magic & 0xFF, set = (self->magic & 0x100) != 0, size = TYPED_BYTES[kind];
+    double off;
+    TRY(to_index(ARG(0), "Offset is outside the bounds of the DataView", &off));
+    if (off + size > v->extra_len) return throw_error(RangeErrorProto, "Offset is outside the bounds of the DataView");
+    int little = to_boolean(ARG(set ? 2 : 1));
+    unsigned char t[8], *at = (unsigned char *)buf->extra + v->magic + (int)off;
+    if (!set) {
+        for (int i = 0; i < size; i++) t[i] = at[little ? i : size - 1 - i];
+        if (kind >= 10) {
+            unsigned long long u;
+            memcpy(&u, t, 8);
+            Big b = {0};
+            int neg = kind == 10 && (u >> 63);
+            big_set_u64(&b, neg ? ~u + 1 : u);
+            b.neg = neg;
+            *ret = v_big(big_store(&b));
+        } else {
+            *ret = v_num(typed_decode(kind, t));
+        }
+        return C_NORMAL;
+    }
+    if (kind >= 10) {
+        Value x;
+        TRY(to_bigint(ARG(1), 0, &x));
+        Big b;
+        big_load(x.u.s, &b);
+        big_as_n(&b, 64, 0);
+        unsigned long long u = (b.n > 0 ? b.d[0] : 0) | (unsigned long long)(b.n > 1 ? b.d[1] : 0) << 32;
+        big_free(&b);
+        memcpy(t, &u, 8);
+    } else {
+        double d;
+        TRY(to_number(ARG(1), &d));
+        typed_encode(kind, typed_coerce(kind, d), t);
+    }
+    for (int i = 0; i < size; i++) at[little ? i : size - 1 - i] = t[i];
+    int from = v->magic + (int)off;
+    buffer_changed(buf, from, from + size, NULL);
+    *ret = v_undef();
     return C_NORMAL;
 }
 
@@ -3847,7 +4510,14 @@ NATIVE(text_encode) {
 NATIVE(text_decode) {
     UNUSED;
     Buf b = {0};
-    if (ARG(0).t == V_OBJ) {
+    if (ARG(0).t == V_OBJ && ARG(0).u.o->cls == CL_BUFFER) {
+        buf_add(&b, ARG(0).u.o->extra, ARG(0).u.o->extra_len);
+    } else if (ARG(0).t == V_OBJ && ARG(0).u.o->cls == CL_ARRAY && ARG(0).u.o->fn_kind) {
+        JsObj *a = ARG(0).u.o, *buf = typed_buffer_of(a);
+        buf_add(&b, (char *)buf->extra + a->magic, a->alen * TYPED_BYTES[a->fn_kind]);
+    } else if (ARG(0).t == V_OBJ && DataViewProto && ARG(0).u.o->proto == DataViewProto && ARG(0).u.o->target) {
+        buf_add(&b, (char *)ARG(0).u.o->target->extra + ARG(0).u.o->magic, ARG(0).u.o->extra_len);
+    } else if (ARG(0).t == V_OBJ) {
         JsObj *items;
         TRY(iterate_to_array(ARG(0), &items));
         for (int i = 0; i < items->alen; i++) {
@@ -3860,13 +4530,44 @@ NATIVE(text_decode) {
     return C_NORMAL;
 }
 
+static JsObj *TextEncoderProto, *TextDecoderProto;
+
 NATIVE(coder_ctor) {
     UNUSED;
-    JsObj *o = new_object();
-    if ((self->magic & 0xFFFF) == 0) define_method(o, "encode", text_encode, 1, 0);
-    else define_method(o, "decode", text_decode, 1, 0);
-    prop_set_raw(o, intern_c("encoding"), v_str(intern_c("utf-8")), 0);
+    JsObj *o = obj_new_raw(CL_OBJECT, (self->magic & 0xFFFF) == 0 ? TextEncoderProto : TextDecoderProto);
+    prop_set_raw(o, intern_c("encoding"), v_str(intern_c("utf-8")), P_HIDDEN);
+    if (self->magic & 0xFFFF) {
+        Value opts = ARG(1), fatal = v_undef(), bom = v_undef();
+        if (opts.t == V_OBJ) {
+            TRY(get_value(opts, intern_c("fatal"), &fatal));
+            TRY(get_value(opts, intern_c("ignoreBOM"), &bom));
+        }
+        prop_set_raw(o, intern_c("fatal"), v_bool(to_boolean(fatal)), P_HIDDEN);
+        prop_set_raw(o, intern_c("ignoreBOM"), v_bool(to_boolean(bom)), P_HIDDEN);
+    }
     *ret = v_obj(o);
+    return C_NORMAL;
+}
+
+/* encoder.encodeInto(text, bytes): {read, written} */
+NATIVE(text_encode_into) {
+    UNUSED;
+    JsStr *s = S_empty;
+    if (ARG(0).t != V_UNDEF) TRY(to_string(ARG(0), &s));
+    Value dest = ARG(1);
+    if (dest.t != V_OBJ || dest.u.o->cls != CL_ARRAY || !dest.u.o->fn_kind) return throw_type("encodeInto: not a Uint8Array", NULL, NULL);
+    JsObj *a = dest.u.o;
+    int n = s->len < a->alen ? s->len : a->alen;
+    while (n > 0 && n < s->len && ((unsigned char)s->s[n] & 0xC0) == 0x80) n--; /* (whole characters only) */
+    for (int i = 0; i < n; i++) a->arr[i] = v_num((unsigned char)s->s[i]);
+    typed_touched(dest);
+    int chars = 0;
+    for (int i = 0; i < n; i++)
+        if (((unsigned char)s->s[i] & 0xC0) != 0x80) chars += ((unsigned char)s->s[i] >= 0xF0) ? 2 : 1;
+    JsObj *r = new_object();
+    prop_set_raw(r, intern_c("read"), v_num(chars), 0);
+    prop_set_raw(r, intern_c("written"), v_num(n), 0);
+    *ret = v_obj(r);
     return C_NORMAL;
 }
 
@@ -3881,6 +4582,7 @@ NATIVE(get_random_values) {
         double d = arr->fn_kind == 8 || arr->fn_kind == 9 ? js_random() : (double)r;
         arr->arr[i] = v_num(arr->fn_kind ? typed_coerce(arr->fn_kind, d) : d);
     }
+    typed_touched(a);
     *ret = a;
     return C_NORMAL;
 }
@@ -3909,7 +4611,11 @@ NATIVE(reflect_method) {
     case 2: {
         JsObj *keys = new_array(0);
         for (int i = 0; i < t.u.o->alen && (t.u.o->cls == CL_ARRAY || t.u.o->cls == CL_ARGUMENTS); i++) arr_push(keys, v_str(number_str(i)));
-        for (int i = 0; i < t.u.o->nprops; i++) arr_push(keys, v_str(t.u.o->props[i].key));
+        function_own_props(t.u.o);
+        for (int i = 0; i < t.u.o->nprops; i++) {
+            JsStr *k = t.u.o->props[i].key;
+            arr_push(keys, is_symbol_key(k) ? v_sym(k) : v_str(k));
+        }
         *ret = v_obj(keys);
         return C_NORMAL;
     }
@@ -3963,16 +4669,53 @@ static void init_typed_arrays(void) {
     TypedArrayProto = obj_new_raw(CL_OBJECT, ArrayProto);
     define_method(TypedArrayProto, "set", typed_set, 2, 0);
     define_method(TypedArrayProto, "subarray", typed_subarray, 2, 0);
-    define_method(TypedArrayProto, "slice", typed_subarray, 2, 0);
+    define_method(TypedArrayProto, "slice", typed_subarray, 2, 1);
+    define_method(TypedArrayProto, "fill", typed_in_place, 1, 0);
+    define_method(TypedArrayProto, "reverse", typed_in_place, 0, 1);
+    define_method(TypedArrayProto, "sort", typed_in_place, 1, 2);
+    define_getter(TypedArrayProto, "buffer", typed_info, NULL, 0);
+    define_getter(TypedArrayProto, "byteOffset", typed_info, NULL, 1);
+    define_getter(TypedArrayProto, "byteLength", typed_info, NULL, 2);
+    define_getter(TypedArrayProto, "@@toStringTag", typed_info, NULL, 3);
+    JsObj *base = make_native("TypedArray", noop, 0, 0); /* %TypedArray%: not a global */
+    prop_set_raw(base, S_prototype, v_obj(TypedArrayProto), P_HIDDEN);
+    define_hidden(TypedArrayProto, "constructor", v_obj(base));
     for (int k = 1; k <= 9; k++) {
-        JsObj *c = make_ctor(TYPED_NAMES[k], typed_ctor, 3, k, NULL);
-        prop_set_raw(c, S_prototype, v_obj(TypedArrayProto), P_HIDDEN);
+        TypedProtos[k] = obj_new_raw(CL_OBJECT, TypedArrayProto);
+        JsObj *c = make_ctor(TYPED_NAMES[k], typed_ctor, 3, k, TypedProtos[k]);
+        c->proto = base;
         define_hidden(c, "BYTES_PER_ELEMENT", v_num(TYPED_BYTES[k]));
-        define_method(c, "from", typed_ctor, 1, k);
+        define_hidden(TypedProtos[k], "BYTES_PER_ELEMENT", v_num(TYPED_BYTES[k]));
+        define_method(c, "from", typed_ctor, 1, k | 0x10000);
     }
-    make_ctor("ArrayBuffer", array_buffer_ctor, 1, 0, NULL);
-    make_ctor("TextEncoder", coder_ctor, 0, 0, NULL);
-    make_ctor("TextDecoder", coder_ctor, 0, 1, NULL);
+    ArrayBufferProto = obj_new_raw(CL_OBJECT, ObjectProto);
+    JsObj *ab = make_ctor("ArrayBuffer", array_buffer_ctor, 1, 0, ArrayBufferProto);
+    define_method(ab, "isView", array_buffer_is_view, 1, 0);
+    define_getter(ArrayBufferProto, "byteLength", array_buffer_method, NULL, 0);
+    define_method(ArrayBufferProto, "slice", array_buffer_method, 2, 1);
+    define_hidden(ArrayBufferProto, "@@toStringTag", v_str(intern_c("ArrayBuffer")));
+    DataViewProto = obj_new_raw(CL_OBJECT, ObjectProto);
+    make_ctor("DataView", data_view_ctor, 1, 0, DataViewProto);
+    define_getter(DataViewProto, "buffer", data_view_info, NULL, 0);
+    define_getter(DataViewProto, "byteOffset", data_view_info, NULL, 1);
+    define_getter(DataViewProto, "byteLength", data_view_info, NULL, 2);
+    define_hidden(DataViewProto, "@@toStringTag", v_str(intern_c("DataView")));
+    static const char *dv_names[12] = {NULL, "Int8", "Uint8", NULL, "Int16", "Uint16", "Int32", "Uint32", "Float32", "Float64", "BigInt64", "BigUint64"};
+    for (int k = 1; k < 12; k++) {
+        if (!dv_names[k]) continue;
+        char name[24] = "get";
+        strncat_safe(name, dv_names[k], 16);
+        define_method(DataViewProto, name, data_view_access, 1, k);
+        name[0] = 's';
+        define_method(DataViewProto, name, data_view_access, 2, k | 0x100);
+    }
+    TextEncoderProto = obj_new_raw(CL_OBJECT, ObjectProto);
+    TextDecoderProto = obj_new_raw(CL_OBJECT, ObjectProto);
+    make_ctor("TextEncoder", coder_ctor, 0, 0, TextEncoderProto);
+    make_ctor("TextDecoder", coder_ctor, 0, 1, TextDecoderProto);
+    define_method(TextEncoderProto, "encode", text_encode, 1, 0);
+    define_method(TextEncoderProto, "encodeInto", text_encode_into, 2, 0);
+    define_method(TextDecoderProto, "decode", text_decode, 1, 0);
 }
 
 /* ================================================================ setting it all up */
@@ -3980,10 +4723,9 @@ static void init_typed_arrays(void) {
 static JsObj *make_ctor(const char *name, Native fn, int nargs, int magic, JsObj *proto) {
     JsObj *c = make_native(name, fn, nargs, magic);
     c->fn_kind = FN_NORMAL;
-    if (proto) {
-        prop_set_raw(c, S_prototype, v_obj(proto), P_HIDDEN);
-        prop_set_raw(proto, S_constructor, v_obj(c), P_HIDDEN);
-    }
+    if (!proto) proto = obj_new_raw(CL_OBJECT, ObjectProto); /* (every constructor has a prototype) */
+    prop_set_raw(c, S_prototype, v_obj(proto), P_HIDDEN);
+    prop_set_raw(proto, S_constructor, v_obj(c), P_HIDDEN);
     define_hidden(global_obj, name, v_obj(c));
     return c;
 }
@@ -4209,7 +4951,15 @@ static void js_init_builtins(void) {
     define_method(DateProto, "toGMTString", date_format, 0, 7);
 
     /* RegExp */
-    make_ctor("RegExp", regexp_ctor, 2, 0, RegExpProto);
+    JsObj *re_ctor = make_ctor("RegExp", regexp_ctor, 2, 0, RegExpProto);
+    /* the old static properties: the last match */
+    static const char *legacy[] = {"lastMatch", "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9", "leftContext", "rightContext", "input", "lastParen"};
+    static const char *legacy_short[] = {"$&", 0, 0, 0, 0, 0, 0, 0, 0, 0, "$`", "$'", "$_", "$+"};
+    for (int i = 0; i < 14; i++) {
+        define_getter(re_ctor, legacy[i], regexp_legacy, NULL, i);
+        if (legacy_short[i]) define_getter(re_ctor, legacy_short[i], regexp_legacy, NULL, i);
+    }
+    define_hidden(re_ctor, "multiline", v_bool(0));
     define_method(RegExpProto, "exec", regexp_exec, 1, 0);
     define_method(RegExpProto, "test", regexp_exec, 1, 1);
     define_method(RegExpProto, "toString", regexp_to_string, 0, 0);
@@ -4261,11 +5011,34 @@ static void js_init_builtins(void) {
     JsObj *Sym = make_native("Symbol", symbol_ctor, 0, 0);
     define_hidden(global_obj, "Symbol", v_obj(Sym));
     define_method(Sym, "for", symbol_for, 1, 0);
-    define_hidden(Sym, "iterator", v_str(intern_c("@@iterator")));
-    define_hidden(Sym, "asyncIterator", v_str(intern_c("@@asyncIterator")));
-    define_hidden(Sym, "hasInstance", v_str(intern_c("@@hasInstance")));
-    define_hidden(Sym, "toPrimitive", v_str(intern_c("@@toPrimitive")));
-    define_hidden(Sym, "toStringTag", v_str(intern_c("@@toStringTag")));
+    define_method(Sym, "keyFor", symbol_key_for, 1, 0);
+    static const char *well_known[] = {"iterator", "asyncIterator", "hasInstance", "toPrimitive", "toStringTag", "species",
+                                       "isConcatSpreadable", "unscopables", "match", "matchAll", "replace", "search", "split", NULL};
+    for (int i = 0; well_known[i]; i++) {
+        char key[40] = "@@";
+        strncat_safe(key, well_known[i], 30);
+        prop_set_raw(Sym, intern_c(well_known[i]), v_sym(intern_c(key)), P_HIDDEN | P_READONLY);
+    }
+    SymbolProto = obj_new_raw(CL_OBJECT, ObjectProto);
+    prop_set_raw(Sym, intern_c("prototype"), v_obj(SymbolProto), P_HIDDEN | P_READONLY);
+    define_hidden(SymbolProto, "constructor", v_obj(Sym));
+    define_method(SymbolProto, "toString", symbol_method, 0, 0);
+    define_method(SymbolProto, "valueOf", symbol_method, 0, 1);
+    define_getter(SymbolProto, "description", symbol_method, NULL, 2);
+    define_hidden(SymbolProto, "@@toStringTag", v_str(intern_c("Symbol")));
+
+    /* BigInt */
+    JsObj *Big_ = make_native("BigInt", bigint_ctor, 1, 0);
+    define_hidden(global_obj, "BigInt", v_obj(Big_));
+    define_method(Big_, "asUintN", bigint_as_n, 2, 0);
+    define_method(Big_, "asIntN", bigint_as_n, 2, 1);
+    BigIntProto = obj_new_raw(CL_OBJECT, ObjectProto);
+    prop_set_raw(Big_, intern_c("prototype"), v_obj(BigIntProto), P_HIDDEN | P_READONLY);
+    define_hidden(BigIntProto, "constructor", v_obj(Big_));
+    define_method(BigIntProto, "toString", bigint_method, 0, 0);
+    define_method(BigIntProto, "valueOf", bigint_method, 0, 1);
+    define_method(BigIntProto, "toLocaleString", bigint_method, 0, 2);
+    define_hidden(BigIntProto, "@@toStringTag", v_str(intern_c("BigInt")));
 
     /* globals */
     define_hidden(global_obj, "NaN", v_num(js_nan()));

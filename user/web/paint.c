@@ -2,6 +2,7 @@
    pointer. Part of the browser. */
 
 static Node *focused_control(void) { return focused_node; }
+static int frame_paint(Node *n, canvas *v, int x, int y); /* (realm.c) */
 
 static int is_text_control(Node *n) {
     if (!n || n->type != NODE_ELEMENT) return 0;
@@ -93,8 +94,12 @@ static void draw_control(canvas *v, Item *it, int x, int y) {
         if (n == focused_control()) fill_rect(v, x + (n->value ? (int)strlen(n->value) - start : 0) * 8, y + (it->h - 16) / 2, 2, 16, 0x1A5FD6);
         return;
     }
-    /* svg (icons, mostly) is not drawn; video, canvas, iframe, object: a labelled box */
-    if (is(n->tag, "svg")) return;
+    /* svg: its drawing, once made; video, canvas, iframe, object: a labelled box */
+    if (is(n->tag, "svg")) {
+        if (n->img_state == 1 && n->img) image_draw(v, (image *)n->img, x, y, it->w, it->h);
+        return;
+    }
+    if (is(n->tag, "iframe") && frame_paint(n, v, x, y)) return;
     fill_rect(v, x, y, it->w, it->h, 0xEDEFF3);
     draw_rect(v, x, y, it->w, it->h, 0xC9CDD6);
     char label[32] = "[";
@@ -134,10 +139,12 @@ static void paint_page(canvas *v, int scroll, int left) {
             fill_rect(v, x, y, it->w, it->h, it->color);
             break;
         case IT_BORDER:
-            if (it->border[0]) fill_rect(v, x, y, it->w, it->border[0], it->border_color[0]);
-            if (it->border[2]) fill_rect(v, x, y + it->h - it->border[2], it->w, it->border[2], it->border_color[2]);
-            if (it->border[3]) fill_rect(v, x, y, it->border[3], it->h, it->border_color[3]);
-            if (it->border[1]) fill_rect(v, x + it->w - it->border[1], y, it->border[1], it->h, it->border_color[1]);
+            if (it->border[0] && !(it->border_color[0] & BORDER_INVISIBLE)) fill_rect(v, x, y, it->w, it->border[0], it->border_color[0]);
+            if (it->border[2] && !(it->border_color[2] & BORDER_INVISIBLE))
+                fill_rect(v, x, y + it->h - it->border[2], it->w, it->border[2], it->border_color[2]);
+            if (it->border[3] && !(it->border_color[3] & BORDER_INVISIBLE)) fill_rect(v, x, y, it->border[3], it->h, it->border_color[3]);
+            if (it->border[1] && !(it->border_color[1] & BORDER_INVISIBLE))
+                fill_rect(v, x + it->w - it->border[1], y, it->border[1], it->h, it->border_color[1]);
             break;
         case IT_TEXT:
         case IT_MARKER: {
@@ -151,8 +158,7 @@ static void paint_page(canvas *v, int scroll, int left) {
             Node *n = it->node;
             if (n->img_state == 1 && n->img) {
                 image_draw(v, (image *)n->img, x, y, it->w, it->h);
-            } else if (it->w > 4 && it->h > 4) {
-                draw_rect(v, x, y, it->w, it->h, 0xC9CDD6);
+            } else if (it->w > 4 && it->h > 4) { /* not (yet) shown: its description, if it has one */
                 char alt[80];
                 if (attr(n, "alt", alt, sizeof(alt)) && alt[0] && it->h >= 18) {
                     int len = (int)strlen(alt), fit = (it->w - 4) / 8;

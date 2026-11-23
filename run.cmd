@@ -47,7 +47,7 @@ if not exist "%OVMF%" (
 )
 
 echo === Booting RDX in QEMU (close the QEMU window to stop) ===
-"%QEMU%" -machine q35 -m 512M -smp 4 ^
+"%QEMU%" -machine q35 -accel whpx -accel tcg -m 1G -smp 4 ^
     -drive "if=pflash,format=raw,readonly=on,file=%OVMF%" ^
     -drive "format=raw,file=fat:rw:build\esp" ^
     -drive "format=raw,file=build\disk.img" ^

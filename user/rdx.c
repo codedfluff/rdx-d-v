@@ -541,15 +541,23 @@ int atoi(const char *s) {
 }
 
 /* ---------------------------------------------------------------- heap
-   Power-of-two size classes. Each block has a 16-byte header recording its
-   class; freed blocks go on that class's free list and are reused first. */
+   A buddy allocator. Blocks are powers of two in size (32 bytes
+   up), each at an address that is a multiple of its size (counted from
+   the heap's start), with a 16-byte header recording its size class. A
+   freed block whose "buddy" (the other half of the block twice its size)
+   is free too is joined with it, again and again: memory freed in small
+   pieces can come back together for big requests, and big free blocks
+   are split for small ones. */
+
+#define BLOCK_FREE ((size_t)1 << 63) /* (in Block.class: on a free list) */
 
 typedef struct Block {
-    size_t class;
-    struct Block *next_free;
-} Block;
+    size_t class;            /* size class (block size = 1 << class), | BLOCK_FREE */
+    struct Block *next_free; /* free blocks: the next on the list ... */
+} Block;                     /* ... and the previous, just after the header */
 
 static Block *free_lists[48];
+static char *heap_start, *heap_end; /* what sbrk has given */
 
 static size_t class_for(size_t size) {
     size_t class = 5; /* smallest block: 32 bytes including the header */
@@ -557,34 +565,100 @@ static size_t class_for(size_t size) {
     return class;
 }
 
+static Block **prev_of(Block *b) { return (Block **)(b + 1); }
+
+static void list_push(Block *b, size_t class) {
+    b->class = class | BLOCK_FREE;
+    b->next_free = free_lists[class];
+    *prev_of(b) = NULL;
+    if (free_lists[class]) *prev_of(free_lists[class]) = b;
+    free_lists[class] = b;
+}
+
+static void list_remove(Block *b, size_t class) {
+    Block *prev = *prev_of(b);
+    if (prev) prev->next_free = b->next_free;
+    else free_lists[class] = b->next_free;
+    if (b->next_free) *prev_of(b->next_free) = prev;
+    b->class = class;
+}
+
+/* A block of `class` from fresh memory at the heap's end, aligned to its
+   size (the gap before it becomes free blocks). */
+static Block *heap_grow(size_t class) {
+    if (!heap_start) heap_start = heap_end = sbrk(0);
+    if (!heap_start) return NULL;
+    size_t size = (size_t)1 << class;
+    size_t at = (size_t)(heap_end - heap_start);
+    size_t aligned = (at + size - 1) & ~(size - 1);
+    if (!sbrk((i64)(aligned + size - at))) return NULL;
+    /* the gap: the biggest aligned free blocks that fit */
+    while (at < aligned) {
+        size_t c = 5;
+        while (c + 1 < 48 && (at & (((size_t)1 << (c + 1)) - 1)) == 0 && at + ((size_t)1 << (c + 1)) <= aligned) c++;
+        list_push((Block *)(heap_start + at), c);
+        at += (size_t)1 << c;
+    }
+    heap_end = heap_start + aligned + size;
+    Block *b = (Block *)(heap_start + aligned);
+    b->class = class;
+    return b;
+}
+
 void *malloc(size_t size) {
     size_t class = class_for(size);
-    if (class >= 48) return NULL;
+    if (class >= 40) return NULL;
     mutex_lock(&heap_lock);
-    Block *b = free_lists[class];
-    if (b) {
-        free_lists[class] = b->next_free;
+    Block *b = NULL;
+    size_t c = class;
+    while (c < 48 && !free_lists[c]) c++;
+    if (c < 48) { /* a free block this size, or a bigger one split in halves */
+        b = free_lists[c];
+        list_remove(b, c);
+        while (c > class) {
+            c--;
+            list_push((Block *)((char *)b + ((size_t)1 << c)), c);
+        }
+        b->class = class;
     } else {
-        b = sbrk((i64)((size_t)1 << class));
-        if (b) b->class = class;
+        b = heap_grow(class);
     }
     mutex_unlock(&heap_lock);
     return b ? b + 1 : NULL;
+}
+
+size_t heap_free_bytes(void) {
+    size_t total = 0;
+    mutex_lock(&heap_lock);
+    for (int c = 0; c < 48; c++) {
+        for (Block *b = free_lists[c]; b; b = b->next_free) total += (size_t)1 << c;
+    }
+    mutex_unlock(&heap_lock);
+    return total;
 }
 
 void free(void *ptr) {
     if (!ptr) return;
     Block *b = (Block *)ptr - 1;
     mutex_lock(&heap_lock);
-    b->next_free = free_lists[b->class];
-    free_lists[b->class] = b;
+    size_t class = b->class & ~BLOCK_FREE;
+    /* join with the buddy while it is free and whole */
+    while (class < 39) {
+        size_t off = (size_t)((char *)b - heap_start);
+        Block *buddy = (Block *)(heap_start + (off ^ ((size_t)1 << class)));
+        if ((char *)buddy + ((size_t)1 << class) > heap_end || buddy->class != (class | BLOCK_FREE)) break;
+        list_remove(buddy, class);
+        if (buddy < b) b = buddy;
+        class++;
+    }
+    list_push(b, class);
     mutex_unlock(&heap_lock);
 }
 
 void *realloc(void *ptr, size_t size) {
     if (!ptr) return malloc(size);
     Block *b = (Block *)ptr - 1;
-    size_t have = ((size_t)1 << b->class) - sizeof(Block);
+    size_t have = ((size_t)1 << (b->class & ~BLOCK_FREE)) - sizeof(Block);
     if (size <= have) return ptr;
     void *fresh = malloc(size);
     if (!fresh) return NULL;

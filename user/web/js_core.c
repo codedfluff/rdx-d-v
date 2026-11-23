@@ -5,32 +5,24 @@
    interpreter for most of modern JavaScript: functions and closures, arrow
    functions, classes, let/const, destructuring, spread, template strings,
    exceptions, regular expressions, JSON, promises and timers, and the DOM.
+   BigInt is in js_bigint.c.
    Not supported: generators, real async/await (await only unwraps promises
-   that have already settled), modules, Proxy, typed arrays.
+   that have already settled), modules, Proxy.
 
-   Memory is collected by mark and sweep, but only between events (when no
-   script is running), so nothing on the C stack ever needs to be found. */
+   Memory is collected by mark and sweep: between events from the roots
+   alone, and while a script runs (when it allocates a lot) also from
+   anything on the C stack that looks like a pointer into the heap. */
 
-/* (the runtime has no strcat / strncpy) */
-static char *js_strcat(char *d, const char *s) {
-    strcpy(d + strlen(d), s);
-    return d;
-}
-static char *js_strncpy(char *d, const char *s, size_t n) {
-    size_t i = 0;
-    for (; i < n && s[i]; i++) d[i] = s[i];
-    for (; i < n; i++) d[i] = 0;
-    return d;
-}
-#define strcat js_strcat
-#define strncpy js_strncpy
 
 typedef struct Ast Ast;
 typedef struct JsStr JsStr;
 typedef struct JsObj JsObj;
 typedef struct Env Env;
 
-enum { V_UNDEF, V_NULL, V_BOOL, V_NUM, V_STR, V_OBJ };
+/* V_SYM: a symbol. It is its property key: an interned string starting
+   "@@" ("@@iterator", "@@symbol:7:description", "@@symbol.for:name").
+   V_BIG: a BigInt, kept in a string-kind block (see js_bigint.c). */
+enum { V_UNDEF, V_NULL, V_BOOL, V_NUM, V_STR, V_OBJ, V_SYM, V_BIG };
 
 typedef struct {
     unsigned char t;
@@ -74,6 +66,13 @@ static Value v_str(JsStr *s) {
     v.u.s = s;
     return v;
 }
+static Value v_sym(JsStr *key) {
+    Value v;
+    v.t = V_SYM;
+    v.u.n = 0;
+    v.u.s = key;
+    return v;
+}
 static Value v_obj(JsObj *o) {
     Value v;
     v.t = V_OBJ;
@@ -87,6 +86,8 @@ static Value v_obj(JsObj *o) {
 typedef struct Gc {
     struct Gc *next;
     unsigned char kind, mark, perm;
+    unsigned char builtin; /* (made before the page's scripts: for BROWSER_MISSING) */
+    unsigned size; /* bytes, for recognising pointers into it */
 } Gc;
 
 enum { K_STR = 1, K_OBJ, K_ENV };
@@ -94,12 +95,53 @@ enum { K_STR = 1, K_OBJ, K_ENV };
 static Gc *heap_list;
 static size_t heap_since_gc, heap_live;
 static int js_oom; /* out of memory: scripts are stopped */
+static void js_oom_where(int line) {
+    if (!js_oom && getenv("BROWSER_TRACE")) printf("[oom] at js_core.c line %d\n", line);
+    js_oom = 1;
+}
 static unsigned char oom_scratch[65536];
 
+/* Collecting while scripts run (in js_dom.c): after this much allocation. */
+static void js_gc_during(void);
+#define GC_TRIGGER_BYTES (24u << 20)
+
+/* Memory outside the heap that may hold the only reference to heap values
+   (big argument lists): the collector scans these ranges too. */
+static char *gc_extra_lo[64], *gc_extra_hi[64];
+static int gc_extra_n;
+
+static void gc_extra_add(void *p, size_t bytes) {
+    if (gc_extra_n < 64) {
+        gc_extra_lo[gc_extra_n] = p;
+        gc_extra_hi[gc_extra_n] = (char *)p + bytes;
+        gc_extra_n++;
+    }
+}
+
+static void gc_extra_remove(void *p) {
+    for (int i = gc_extra_n - 1; i >= 0; i--) {
+        if (gc_extra_lo[i] == p) {
+            gc_extra_lo[i] = gc_extra_lo[gc_extra_n - 1];
+            gc_extra_hi[i] = gc_extra_hi[gc_extra_n - 1];
+            gc_extra_n--;
+            return;
+        }
+    }
+}
+
+static void free_args(Value *args, Value *small) {
+    if (args != small) {
+        gc_extra_remove(args);
+        free(args);
+    }
+}
+
+
 static void *js_alloc(size_t size, int kind) {
+    if (heap_since_gc > GC_TRIGGER_BYTES) js_gc_during();
     Gc *g = js_oom ? NULL : malloc(size);
     if (!g) {
-        js_oom = 1;
+        js_oom_where(__LINE__);
         if (size > sizeof(oom_scratch)) size = sizeof(oom_scratch);
         memset(oom_scratch, 0, sizeof(oom_scratch));
         g = (Gc *)oom_scratch;
@@ -109,6 +151,7 @@ static void *js_alloc(size_t size, int kind) {
     }
     memset(g, 0, size);
     g->kind = (unsigned char)kind;
+    g->size = (unsigned)size;
     g->next = heap_list;
     heap_list = g;
     heap_since_gc += size;
@@ -168,7 +211,7 @@ static JsStr *intern(const char *s, int len) {
         int cap = intern_cap ? intern_cap * 2 : 4096;
         JsStr **t = malloc(sizeof(JsStr *) * (size_t)cap);
         if (!t) {
-            js_oom = 1;
+            js_oom_where(__LINE__);
             return str_new(s, len);
         }
         memset(t, 0, sizeof(JsStr *) * (size_t)cap);
@@ -192,7 +235,7 @@ static JsStr *intern(const char *s, int len) {
     }
     JsStr *r = malloc(sizeof(JsStr) + (size_t)len);
     if (!r) {
-        js_oom = 1;
+        js_oom_where(__LINE__);
         return str_new(s, len);
     }
     memset(r, 0, sizeof(JsStr));
@@ -244,7 +287,7 @@ static void buf_add(Buf *b, const char *s, int n) {
         while (cap < b->len + n + 1) cap *= 2;
         char *p = realloc(b->p, (size_t)cap);
         if (!p) {
-            js_oom = 1;
+            js_oom_where(__LINE__);
             return;
         }
         b->p = p;
@@ -270,7 +313,7 @@ static JsStr *buf_done(Buf *b) {
 
 enum {
     CL_OBJECT, CL_ARRAY, CL_FUNCTION, CL_ERROR, CL_BOOLEAN, CL_NUMBER, CL_STRING, CL_DATE, CL_REGEXP,
-    CL_ARGUMENTS, CL_MAP, CL_SET, CL_PROMISE, CL_NODE, CL_STYLE, CL_CLASSLIST, CL_DATASET, CL_EVENT, CL_STORAGE
+    CL_ARGUMENTS, CL_MAP, CL_SET, CL_PROMISE, CL_BUFFER, CL_NODE, CL_STYLE, CL_CLASSLIST, CL_DATASET, CL_EVENT, CL_STORAGE
 };
 
 enum { P_HIDDEN = 1, P_ACCESSOR = 2, P_READONLY = 4 };
@@ -364,7 +407,9 @@ static Prop *prop_add(JsObj *o, JsStr *key) {
         int cap = o->pcap ? o->pcap * 2 : 4;
         Prop *p = realloc(o->props, sizeof(Prop) * (size_t)cap);
         if (!p) {
-            js_oom = 1;
+            if (!js_oom && getenv("BROWSER_TRACE"))
+                printf("[oom] object of class %d with %d properties, adding '%s'\n", o->cls, o->nprops, key->s);
+            js_oom_where(__LINE__);
             static Prop dummy;
             return &dummy;
         }
@@ -407,19 +452,20 @@ static void arr_reserve(JsObj *a, int n) {
     while (cap < n) cap *= 2;
     Value *p = realloc(a->arr, sizeof(Value) * (size_t)cap);
     if (!p) {
-        js_oom = 1;
+        js_oom_where(__LINE__);
         return;
     }
     a->arr = p;
     a->acap = cap;
 }
 
+/* Elements this far past an array's end are kept as plain properties
+   instead (a sparse array): a[1e9] = x must not allocate a billion slots. */
+#define SPARSE_GAP (1 << 20)
+
 static void arr_set_len(JsObj *a, int n) {
     if (n < 0) n = 0;
-    if (n > 50000000) {
-        js_oom = 1;
-        return;
-    }
+    if (n > a->alen + SPARSE_GAP) return; /* a huge, empty length: not representable here, ignored */
     arr_reserve(a, n);
     if (js_oom) return;
     for (int i = a->alen; i < n; i++) a->arr[i] = v_undef();
@@ -476,7 +522,7 @@ static Value *env_define(Env *e, JsStr *name, Value v, int is_const) {
         if (names) e->names = names;
         if (vals) e->vals = vals;
         if (!names || !vals || !consts) {
-            js_oom = 1;
+            js_oom_where(__LINE__);
             static Value dummy;
             return &dummy;
         }

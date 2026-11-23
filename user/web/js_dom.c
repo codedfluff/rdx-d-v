@@ -4,8 +4,8 @@
 
 static void relayout(void);
 
-#define PAGE_VIEW_W 808 /* the page's part of the browser window */
-#define PAGE_VIEW_H 526
+#define PAGE_VIEW_W (layout_viewport_w ? layout_viewport_w : 808) /* the page's part of the browser window (or a frame) */
+#define PAGE_VIEW_H (layout_viewport_h ? layout_viewport_h : 526)
 
 static int dom_dirty;              /* scripts changed the page: lay it out again */
 static char *js_navigate;          /* a script asked to go to this address */
@@ -16,7 +16,6 @@ static int js_enabled = 1;
 static int js_errors;              /* how many errors this page's scripts had */
 static Node *current_script;       /* the <script> running (document.write, currentScript) */
 static int page_loaded;            /* the load event has fired */
-static char cookie_jar[4096];
 
 static JsObj *DocumentProto, *StyleProto, *ClassListProto, *DatasetProto, *StorageProto, *XhrProto;
 static JsObj *local_storage, *session_storage;
@@ -44,7 +43,8 @@ static void orphan_add(Node *n) {
     X(htmlFor) X(name) X(alt) X(placeholder) X(rel) X(target) X(action) X(method) X(lang) X(dir) X(role) X(tabIndex)   \
     X(width) X(height) X(content) X(selected) X(text) X(label) X(colSpan) X(rowSpan) X(naturalWidth)                  \
     X(naturalHeight) X(complete) X(defaultValue) X(defaultChecked) X(readOnly) X(required) X(multiple) X(maxLength)   \
-    X(baseURI) X(compatMode) X(contentType) X(fullscreenElement) X(hasFocus)
+    X(baseURI) X(compatMode) X(contentType) X(fullscreenElement) X(hasFocus) X(attributes) \
+    X(protocol) X(host) X(hostname) X(port) X(pathname) X(search) X(hash) X(origin) X(contentWindow) X(contentDocument)
 
 #define DECLARE_NAME(n) static JsStr *K_##n;
 DOM_NAMES(DECLARE_NAME)
@@ -78,10 +78,46 @@ static void init_dom_names(void) {
 
 /* ---------------------------------------------------------------- wrappers */
 
+/* The DOM's interfaces: each has its own prototype, under one another as
+   in browsers (HTMLInputElement.prototype -> HTMLElement.prototype ->
+   Element.prototype -> Node.prototype, where the methods all are), so
+   instanceof tells them apart. */
+static const char *const IFACE_TAGS[][2] = {
+    {"div", "HTMLDivElement"}, {"span", "HTMLSpanElement"}, {"a", "HTMLAnchorElement"}, {"img", "HTMLImageElement"},
+    {"input", "HTMLInputElement"}, {"button", "HTMLButtonElement"}, {"form", "HTMLFormElement"}, {"select", "HTMLSelectElement"},
+    {"option", "HTMLOptionElement"}, {"textarea", "HTMLTextAreaElement"}, {"script", "HTMLScriptElement"},
+    {"canvas", "HTMLCanvasElement"}, {"iframe", "HTMLIFrameElement"}, {"video", "HTMLVideoElement"}, {"audio", "HTMLAudioElement"},
+    {"p", "HTMLParagraphElement"}, {"ul", "HTMLUListElement"}, {"ol", "HTMLOListElement"}, {"li", "HTMLLIElement"},
+    {"body", "HTMLBodyElement"}, {"head", "HTMLHeadElement"}, {"html", "HTMLHtmlElement"}, {"link", "HTMLLinkElement"},
+    {"style", "HTMLStyleElement"}, {"meta", "HTMLMetaElement"}, {"title", "HTMLTitleElement"}, {"label", "HTMLLabelElement"},
+    {"table", "HTMLTableElement"}, {"tr", "HTMLTableRowElement"}, {"td", "HTMLTableCellElement"}, {"th", "HTMLTableCellElement"},
+    {"br", "HTMLBRElement"}, {"hr", "HTMLHRElement"}, {"h1", "HTMLHeadingElement"}, {"h2", "HTMLHeadingElement"},
+    {"h3", "HTMLHeadingElement"}, {"h4", "HTMLHeadingElement"}, {"h5", "HTMLHeadingElement"}, {"h6", "HTMLHeadingElement"},
+    {"template", "HTMLTemplateElement"}, {"pre", "HTMLPreElement"}, {"source", "HTMLSourceElement"}, {"nav", "HTMLElement"},
+    {"slot", "HTMLSlotElement"}, {"dialog", "HTMLDialogElement"}, {"progress", "HTMLProgressElement"}, {"object", "HTMLObjectElement"},
+    {"embed", "HTMLEmbedElement"}, {"picture", "HTMLPictureElement"}, {"fieldset", "HTMLFieldSetElement"}, {"legend", "HTMLLegendElement"},
+    {"noscript", "HTMLElement"}};
+#define IFACE_COUNT ((int)(sizeof(IFACE_TAGS) / sizeof(IFACE_TAGS[0])))
+static JsObj *ElementProto, *HTMLElementProto, *SVGElementProto, *CharacterDataProto, *TextProto, *CommentProto, *FragmentProto,
+    *ShadowRootProto, *EventTargetProto, *tag_protos[IFACE_COUNT];
+
+static JsObj *proto_for_node(Node *n) {
+    if (n == document) return DocumentProto;
+    if (!ElementProto) return NodeProto;
+    if (n->type == NODE_TEXT) return TextProto;
+    if (!strcmp(n->tag, "#shadow-root")) return ShadowRootProto;
+    if (n->tag[0] == '#') return FragmentProto;
+    for (Node *a = n; a; a = a->parent)
+        if (a->type == NODE_ELEMENT && is(a->tag, "svg")) return SVGElementProto;
+    for (int i = 0; i < IFACE_COUNT; i++)
+        if (is(n->tag, IFACE_TAGS[i][0])) return tag_protos[i];
+    return HTMLElementProto;
+}
+
 static JsObj *wrap(Node *n) {
     if (!n) return NULL;
     if (n->js) return n->js;
-    JsObj *o = obj_new_raw(CL_NODE, n == document ? DocumentProto : NodeProto);
+    JsObj *o = obj_new_raw(CL_NODE, proto_for_node(n));
     o->node = n;
     n->js = o;
     return o;
@@ -487,6 +523,11 @@ NATIVE(dom_create_element) {
     JsStr *tag;
     TRY(arg_string(args, argc, 0, &tag));
     int text = (self->magic & 0xFFFF) == 1, frag = (self->magic & 0xFFFF) == 2, comment = (self->magic & 0xFFFF) == 3;
+    if ((self->magic & 0xFFFF) == 4) { /* createElementNS(namespace, "prefix:name") */
+        TRY(arg_string(args, argc, 1, &tag));
+        const char *colon = strchr(tag->s, ':');
+        if (colon) tag = str_c(colon + 1);
+    }
     Node *n;
     if (text || comment) {
         n = text_node(comment ? "" : tag->s, comment ? 0 : tag->len);
@@ -508,6 +549,33 @@ static int contains_node(Node *outer, Node *inner) {
         if (p == outer) return 1;
     }
     return 0;
+}
+
+static int insert_node(Node *parent, Node *child, Node *before);
+
+/* element.attachShadow({mode}): a shadow root, shown as the element's
+   content (here: a box first inside it; its own children come after). */
+NATIVE(dom_attach_shadow) {
+    UNUSED;
+    Node *host;
+    TRY(this_node(this_v, &host));
+    JsObj *h = wrap(host);
+    if (own_prop(h, intern_c("__shadow"))) return throw_error(ErrorProto, "NotSupportedError: Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.");
+    Value opts = ARG(0), mode = v_undef();
+    if (opts.t == V_OBJ) TRY(get_value(opts, intern_c("mode"), &mode));
+    Node *root = new_node(NODE_ELEMENT, "#shadow-root");
+    if (!root) return throw_error(RangeErrorProto, "out of memory");
+    set_attr(root, "style", "display:block");
+    TRY(insert_node(host, root, host->first));
+    JsObj *r = wrap(root);
+    int open = mode.t == V_STR && !strcmp(mode.u.s->s, "open");
+    prop_set_raw(r, intern_c("mode"), v_str(intern_c(open ? "open" : "closed")), P_HIDDEN);
+    prop_set_raw(r, intern_c("host"), v_obj(h), P_HIDDEN);
+    prop_set_raw(h, intern_c("__shadow"), v_obj(r), P_HIDDEN);
+    prop_set_raw(h, intern_c("shadowRoot"), open ? v_obj(r) : v_null(), P_HIDDEN);
+    dom_dirty = 1;
+    *ret = v_obj(r);
+    return C_NORMAL;
 }
 
 /* Insert `child` (a node or fragment) into parent before `before`. */
@@ -646,6 +714,48 @@ NATIVE(dom_contains) {
     TRY(this_node(this_v, &n));
     Node *other = node_of(ARG(0));
     *ret = v_bool(other && contains_node(n, other));
+    return C_NORMAL;
+}
+
+/* a.compareDocumentPosition(b): where b is relative to a, as bits:
+   1 disconnected, 2 preceding, 4 following, 8 contains a, 16 inside a. */
+NATIVE(dom_compare_position) {
+    UNUSED;
+    Node *a;
+    TRY(this_node(this_v, &a));
+    Node *b = node_of(ARG(0));
+    if (!b) return throw_type("compareDocumentPosition: not a node", NULL, NULL);
+    if (a == b) {
+        *ret = v_num(0);
+        return C_NORMAL;
+    }
+    Node *ra = a, *rb = b;
+    while (ra->parent) ra = ra->parent;
+    while (rb->parent) rb = rb->parent;
+    if (ra != rb) { /* in different trees: some fixed order */
+        *ret = v_num(1 | 32 | (a < b ? 4 : 2));
+        return C_NORMAL;
+    }
+    if (contains_node(b, a)) {
+        *ret = v_num(8 | 2);
+        return C_NORMAL;
+    }
+    if (contains_node(a, b)) {
+        *ret = v_num(16 | 4);
+        return C_NORMAL;
+    }
+    /* otherwise by document order: which comes first walking the tree */
+    for (Node *n = ra; n; n = next_in_tree(n, ra)) {
+        if (n == a) {
+            *ret = v_num(4);
+            return C_NORMAL;
+        }
+        if (n == b) {
+            *ret = v_num(2);
+            return C_NORMAL;
+        }
+    }
+    *ret = v_num(1 | 32);
     return C_NORMAL;
 }
 
@@ -1419,7 +1529,32 @@ static int select_option(Node *select, int index, Node **out) {
     return 0;
 }
 
+static int make_attributes(JsObj *o, Value *out);
+static void set_url_parts(JsObj *o, const char *url);
+
+static int is_url_part(JsStr *key) {
+    return key == K_protocol || key == K_host || key == K_hostname || key == K_port || key == K_pathname || key == K_search ||
+           key == K_hash || key == K_origin;
+}
+
+static int iframe_content(Node *n, int document_too, Value *out); /* (js_frames.c) */
+static void frames_js_init(JsObj *w);
+static void frames_js_mark(void);
+
 static int node_get(JsObj *o, Node *n, JsStr *key, Value *out, int *handled) {
+    if ((key == K_contentWindow || key == K_contentDocument) && n->type == NODE_ELEMENT && is(n->tag, "iframe"))
+        return iframe_content(n, key == K_contentDocument, out);
+    if (is_url_part(key) && n->type == NODE_ELEMENT && (is(n->tag, "a") || is(n->tag, "area"))) {
+        /* a link's address in parts, as location has (a common way to take a URL apart) */
+        Value href = resolved_attr(n, "href");
+        JsStr *s = href.t == V_STR ? href.u.s : S_empty;
+        JsObj *parts = new_object();
+        set_url_parts(parts, s->s);
+        Prop *p = own_prop(parts, key);
+        *out = p ? p->v : v_str(S_empty);
+        if (!s->len && key != K_pathname) *out = v_str(S_empty);
+        return C_NORMAL;
+    }
     int el = n->type == NODE_ELEMENT;
     int doc = n == document;
     if (key->len == 0 || key->s[0] == '_') {
@@ -1481,7 +1616,11 @@ static int node_get(JsObj *o, Node *n, JsStr *key, Value *out, int *handled) {
         else if (key == K_documentElement) *out = wrap_v(html_element);
         else if (key == K_readyState) *out = v_str(intern_c(page_loaded ? "complete" : current_script ? "loading" : "interactive"));
         else if (key == K_location) *out = location_obj ? v_obj(location_obj) : v_null();
-        else if (key == K_cookie) *out = v_str(str_c(cookie_jar));
+        else if (key == K_cookie) {
+            static char jar[8192];
+            cookie_header(current_url, CTX_SAME_SITE, 1, jar, sizeof(jar));
+            *out = v_str(str_c(jar));
+        }
         else if (key == K_URL || key == K_documentURI || key == K_baseURI) *out = v_str(str_c(current_url));
         else if (key == K_domain) {
             Value loc;
@@ -1509,6 +1648,7 @@ static int node_get(JsObj *o, Node *n, JsStr *key, Value *out, int *handled) {
         else if (key == K_scrollTop || key == K_scrollLeft) *out = v_num(key == K_scrollTop ? page_scroll_y : 0);
         else *handled = 0;
     } else if (key == K_id) *out = attr_or_empty(n, "id");
+    else if (key == K_attributes && n->type == NODE_ELEMENT) return make_attributes(o, out);
     else if (key == K_className) *out = attr_or_empty(n, "class");
     else if (key == K_classList) {
         Value cached;
@@ -1686,36 +1826,7 @@ static int node_set(JsObj *o, Node *n, JsStr *key, Value v, int *handled) {
             if (t) set_text_children(t, s->s, s->len);
         } else if (key == K_cookie) {
             TRY(to_string(v, &s));
-            /* keep name=value; replace an existing cookie of that name */
-            int nl = 0;
-            while (nl < s->len && s->s[nl] != '=' && s->s[nl] != ';') nl++;
-            int vl = nl;
-            while (vl < s->len && s->s[vl] != ';') vl++;
-            char fresh[4096] = "";
-            for (char *c = cookie_jar; *c;) {
-                char *end = strstr(c, "; ");
-                int len = end ? (int)(end - c) : (int)strlen(c);
-                if (!(len > nl && c[nl] == '=' && !strncmp(c, s->s, (size_t)nl))) {
-                    if (fresh[0]) strncat_safe(fresh, "; ", 3);
-                    char part[1024];
-                    int pl = len < 1023 ? len : 1023;
-                    memcpy(part, c, (size_t)pl);
-                    part[pl] = 0;
-                    strncat_safe(fresh, part, sizeof(fresh) - strlen(fresh) - 1);
-                }
-                c += len;
-                if (end) c += 2;
-            }
-            int expired = strstr(s->s, "expires=Thu, 01 Jan 1970") != NULL || strstr(s->s, "max-age=0") != NULL;
-            if (!expired && vl > nl) {
-                if (fresh[0]) strncat_safe(fresh, "; ", 3);
-                char part[1024];
-                int pl = vl < 1023 ? vl : 1023;
-                memcpy(part, s->s, (size_t)pl);
-                part[pl] = 0;
-                strncat_safe(fresh, part, sizeof(fresh) - strlen(fresh) - 1);
-            }
-            strcpy(cookie_jar, fresh);
+            cookie_set(current_url, s->s, 1);
         } else if (key == K_location) {
             return navigate_to_value(v);
         } else if (key == K_body) {
@@ -1845,6 +1956,56 @@ static int node_set(JsObj *o, Node *n, JsStr *key, Value v, int *handled) {
     return C_NORMAL;
 }
 
+/* element.attributes: a list of {name, value} (also by name). A snapshot,
+   made at each use, rather than live. */
+/* attributes.getNamedItem(name) (magic 0), attributes.item(i) (magic 1) */
+NATIVE(attributes_method) {
+    UNUSED;
+    *ret = v_null();
+    if (this_v.t != V_OBJ) return C_NORMAL;
+    if ((self->magic & 0xFFFF) == 1) {
+        Value v;
+        TRY(get_index(this_v, ARG(0), &v));
+        if (v.t == V_OBJ) *ret = v;
+        return C_NORMAL;
+    }
+    JsStr *k;
+    TRY(to_key(ARG(0), &k));
+    Prop *p = own_prop(this_v.u.o, k);
+    if (p && p->v.t == V_OBJ) *ret = p->v;
+    return C_NORMAL;
+}
+
+static int make_attributes(JsObj *o, Value *out) {
+    Value names_fn, getter, names;
+    TRY(get_value(v_obj(o), intern_c("getAttributeNames"), &names_fn));
+    TRY(get_value(v_obj(o), intern_c("getAttribute"), &getter));
+    JsObj *list = new_array(0);
+    *out = v_obj(list);
+    define_method(list, "getNamedItem", attributes_method, 1, 0);
+    define_method(list, "item", attributes_method, 1, 1);
+    if (!is_callable(names_fn) || !is_callable(getter)) return C_NORMAL;
+    TRY(call_function(names_fn.u.o, v_obj(o), NULL, 0, &names));
+    for (int i = 0; names.t == V_OBJ && i < names.u.o->alen; i++) {
+        Value name = names.u.o->arr[i], value;
+        TRY(call_function(getter.u.o, v_obj(o), &name, 1, &value));
+        JsObj *a = new_object();
+        prop_set_raw(a, S_name, name, 0);
+        prop_set_raw(a, intern_c("value"), value, 0);
+        prop_set_raw(a, intern_c("nodeName"), name, 0);
+        prop_set_raw(a, intern_c("localName"), name, 0);
+        prop_set_raw(a, intern_c("nodeValue"), value, 0);
+        prop_set_raw(a, intern_c("nodeType"), v_num(2), 0);
+        prop_set_raw(a, intern_c("specified"), v_bool(1), 0);
+        prop_set_raw(a, intern_c("ownerElement"), v_obj(o), 0);
+        arr_push(list, v_obj(a));
+        JsStr *k;
+        TRY(to_key(name, &k));
+        if (k->index < 0) prop_set_raw(list, k, v_obj(a), P_HIDDEN);
+    }
+    return C_NORMAL;
+}
+
 static int dom_get(JsObj *o, JsStr *key, Value *out, int *handled) {
     *handled = 1;
     switch (o->cls) {
@@ -1858,6 +2019,48 @@ static int dom_get(JsObj *o, JsStr *key, Value *out, int *handled) {
     }
     *handled = 0;
     return C_NORMAL;
+}
+
+static int dom_set(JsObj *o, JsStr *key, Value v, int *handled);
+
+/* The get / set (magic 1) half of a DOM property's accessor: self->this_val
+   is the property's name. */
+NATIVE(dom_accessor) {
+    UNUSED;
+    JsStr *key = self->this_val.u.s;
+    *ret = v_undef();
+    if (this_v.t != V_OBJ) return C_NORMAL;
+    int handled = 0;
+    if (self->magic & 0xFFFF) {
+        TRY(dom_set(this_v.u.o, key, ARG(0), &handled));
+        if (!handled) prop_set_raw(this_v.u.o, key, ARG(0), 0);
+        return C_NORMAL;
+    }
+    return dom_get(this_v.u.o, key, ret, &handled);
+}
+
+static int is_dom_name(JsStr *k) {
+#define IS_DOM_NAME(n) if (k == K_##n) return 1;
+    DOM_NAMES(IS_DOM_NAME)
+    return 0;
+}
+
+/* DOM properties are worked out per node rather than stored, so the
+   prototypes have no properties for them. Code that asks for one's
+   descriptor (Object.getOwnPropertyDescriptor(HTMLElement.prototype,
+   "innerHTML").get, often to call the original getter) gets an accessor,
+   made the first time and kept. */
+static int dom_accessor_prepare(JsObj *o, JsStr *key) {
+    int dom_proto = o == NodeProto || o == DocumentProto || o == ElementProto || o == HTMLElementProto;
+    for (int i = 0; i < IFACE_COUNT && !dom_proto; i++) dom_proto = o == tag_protos[i];
+    if (!dom_proto || !is_dom_name(key)) return 0;
+    JsObj *g = make_native(key->s, dom_accessor, 0, 0), *s = make_native(key->s, dom_accessor, 1, 1);
+    g->this_val = s->this_val = v_str(key);
+    Prop *p = prop_add(o, key);
+    p->flags = P_ACCESSOR | P_HIDDEN;
+    p->get = g;
+    p->set = s;
+    return 1;
 }
 
 static int dom_set(JsObj *o, JsStr *key, Value v, int *handled) {
@@ -2175,9 +2378,9 @@ NATIVE(clear_timer) {
 
 /* Milliseconds until the next timer (-1: none). */
 static int js_next_timer(void) {
-    if (!timer_count) return -1;
-    u64 now = uptime_ms(), soonest = timers[0].due;
-    for (int i = 1; i < timer_count; i++) {
+    if (!timer_count && !refresh_due) return -1;
+    u64 now = uptime_ms(), soonest = refresh_due ? refresh_due : timers[0].due;
+    for (int i = 0; i < timer_count; i++) {
         if (timers[i].due < soonest) soonest = timers[i].due;
     }
     return soonest <= now ? 0 : (int)(soonest - now > 60000 ? 60000 : soonest - now);
@@ -2187,6 +2390,11 @@ static int js_next_timer(void) {
 static int js_run_timers(void) {
     u64 now = uptime_ms();
     int ran = 0;
+    if (refresh_due && now >= refresh_due && !js_navigate) { /* <meta http-equiv=refresh> */
+        refresh_due = 0;
+        js_navigate = copy_of(refresh_url, (int)strlen(refresh_url));
+        return 1;
+    }
     for (int pass = 0; pass < 64; pass++) {
         int found = -1;
         for (int i = 0; i < timer_count; i++) {
@@ -2432,19 +2640,165 @@ NATIVE(history_method) {
    not read files on this machine. */
 static int fetch_allowed(const char *url) {
     int page_web = !strncasecmp(current_url, "http://", 7) || !strncasecmp(current_url, "https://", 8);
-    int target_web = !strncasecmp(url, "http://", 7) || !strncasecmp(url, "https://", 8);
+    int target_web = !strncasecmp(url, "http://", 7) || !strncasecmp(url, "https://", 8) || !strncasecmp(url, "blob:", 5);
     return target_web || !page_web;
 }
 
 static JsObj *response_new(Fetched *f, const char *url, int failed);
 
+static int random_uuid(JsObj *self, Value this_v, Value *args, int argc, Value *ret);
+
+/* The bytes of an ArrayBuffer, typed array or DataView (or a string's). */
+static int bytes_of(Value v, JsStr **out) {
+    if (v.t == V_OBJ && v.u.o->cls == CL_BUFFER) {
+        *out = str_new(v.u.o->extra, v.u.o->extra_len);
+        return C_NORMAL;
+    }
+    if (v.t == V_OBJ && v.u.o->cls == CL_ARRAY && v.u.o->fn_kind) {
+        JsObj *a = v.u.o, *buf = typed_buffer_of(a);
+        int size = TYPED_BYTES[a->fn_kind];
+        *out = str_new((char *)buf->extra + a->magic, a->alen * size);
+        return C_NORMAL;
+    }
+    if (v.t == V_OBJ && v.u.o->proto == DataViewProto && v.u.o->target) {
+        *out = str_new((char *)v.u.o->target->extra + v.u.o->magic, v.u.o->extra_len);
+        return C_NORMAL;
+    }
+    return to_string(v, out);
+}
+
+/* (for the prelude) __rdxBytes(x): x's bytes as a string; __rdxBuffer(s): an ArrayBuffer of a string's bytes */
+NATIVE(rdx_bytes) {
+    UNUSED;
+    JsStr *s;
+    TRY(bytes_of(ARG(0), &s));
+    if ((self->magic & 0xFFFF) == 0) {
+        *ret = v_str(s);
+        return C_NORMAL;
+    }
+    JsObj *b = buffer_new(s->len);
+    if (b->extra_len == s->len && s->len) memcpy(b->extra, s->s, (size_t)s->len);
+    *ret = v_obj(b);
+    return C_NORMAL;
+}
+
+static unsigned crc32_of(const unsigned char *p, int n) {
+    unsigned c = 0xFFFFFFFFu;
+    for (int i = 0; i < n; i++) {
+        c ^= p[i];
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1)));
+    }
+    return ~c;
+}
+
+/* (for the prelude's CompressionStream) __rdxZip(bytes, format, 0 compress
+   / 1 decompress): the result's bytes, or null if they could not be
+   unpacked. Packing stores the data in "stored" deflate blocks: valid
+   gzip / zlib / deflate that any reader accepts, just not smaller. */
+NATIVE(rdx_zip) {
+    UNUSED;
+    JsStr *in, *format;
+    TRY(to_string(ARG(0), &in));
+    TRY(to_string(ARG(1), &format));
+    int gzip = !strcmp(format->s, "gzip"), zlib = !strcmp(format->s, "deflate");
+    const unsigned char *p = (const unsigned char *)in->s;
+    int n = in->len;
+    if (to_boolean(ARG(2))) {
+        unsigned char *out = NULL;
+        size_t out_len = 0;
+        int r = gzip ? gzip_decompress(p, (size_t)n, &out, &out_len, 0)
+                : zlib ? zlib_decompress(p, (size_t)n, &out, &out_len, 0)
+                       : inflate_raw(p, (size_t)n, &out, &out_len, 0);
+        if (r != 0) {
+            *ret = v_null();
+            return C_NORMAL;
+        }
+        *ret = v_str(str_new((const char *)out, (int)out_len));
+        free(out);
+        return C_NORMAL;
+    }
+    Buf b = {0};
+    if (gzip) buf_add(&b, "\x1f\x8b\x08\0\0\0\0\0\0\xff", 10);
+    if (zlib) buf_add(&b, "\x78\x01", 2);
+    int at = 0;
+    do {
+        int chunk = n - at > 65535 ? 65535 : n - at;
+        unsigned char head[5] = {(unsigned char)(at + chunk >= n), (unsigned char)chunk, (unsigned char)(chunk >> 8),
+                                 (unsigned char)~chunk, (unsigned char)(~chunk >> 8)};
+        buf_add(&b, (const char *)head, 5);
+        buf_add(&b, (const char *)p + at, chunk);
+        at += chunk;
+    } while (at < n);
+    if (gzip) {
+        unsigned tail[2] = {crc32_of(p, n), (unsigned)n};
+        buf_add(&b, (const char *)tail, 8);
+    }
+    if (zlib) {
+        unsigned a = 1, c = 0;
+        for (int i = 0; i < n; i++) {
+            a = (a + p[i]) % 65521;
+            c = (c + a) % 65521;
+        }
+        unsigned adler = (c << 16) | a;
+        unsigned char be[4] = {(unsigned char)(adler >> 24), (unsigned char)(adler >> 16), (unsigned char)(adler >> 8), (unsigned char)adler};
+        buf_add(&b, (const char *)be, 4);
+    }
+    *ret = v_str(b.p ? str_new(b.p, b.len) : S_empty);
+    free(b.p);
+    return C_NORMAL;
+}
+
+/* URL.createObjectURL(blob) (magic 0) / URL.revokeObjectURL(url) (1) */
+NATIVE(object_url) {
+    UNUSED;
+    if ((self->magic & 0xFFFF) == 1) {
+        JsStr *u;
+        TRY(to_string(ARG(0), &u));
+        blob_revoke(u->s);
+        *ret = v_undef();
+        return C_NORMAL;
+    }
+    Value text, type;
+    if (ARG(0).t != V_OBJ) return throw_type("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.", NULL, NULL);
+    TRY(get_value(ARG(0), intern_c("_text"), &text));
+    TRY(get_value(ARG(0), intern_c("type"), &type));
+    JsStr *data = S_empty, *t = S_empty;
+    if (text.t == V_STR) data = text.u.s;
+    if (type.t == V_STR) t = type.u.s;
+    /* blob:<the page's origin>/<a random id> */
+    char url[300] = "blob:";
+    const char *p = strstr(current_url, "://");
+    if (p && (!strncasecmp(current_url, "http", 4))) {
+        p += 3;
+        while (*p && *p != '/' && *p != '?' && *p != '#') p++;
+        size_t n = (size_t)(p - current_url);
+        if (n > 200) n = 200;
+        memcpy(url + 5, current_url, n);
+        url[5 + n] = 0;
+    } else {
+        strcat(url, "null");
+    }
+    Value id;
+    TRY(random_uuid(self, v_undef(), NULL, 0, &id));
+    strcat(url, "/");
+    if (id.t == V_STR) strncat_safe(url, id.u.s->s, 60);
+    blob_put(url, data->s, (size_t)data->len, t->s);
+    *ret = v_str(str_c(url));
+    return C_NORMAL;
+}
+
 NATIVE(response_body) {
     UNUSED;
-    /* magic 0 text, 1 json; this.__body has the text */
+    /* magic 0 text, 1 json, 2 arrayBuffer; this.__body has the text */
     Value body;
     TRY(get_value(this_v, intern_c("__body"), &body));
     JsObj *p = promise_new();
-    if ((self->magic & 0xFFFF) == 1) {
+    if ((self->magic & 0xFFFF) == 2) {
+        JsStr *s = body.t == V_STR ? body.u.s : S_empty;
+        JsObj *b = buffer_new(s->len);
+        if (b->extra_len == s->len && s->len) memcpy(b->extra, s->s, (size_t)s->len);
+        promise_resolve(p, v_obj(b));
+    } else if ((self->magic & 0xFFFF) == 1) {
         Value parsed;
         int code = json_parse(self, v_undef(), &body, 1, &parsed);
         if (code == C_NORMAL) promise_resolve(p, parsed);
@@ -2484,10 +2838,89 @@ static JsObj *response_new(Fetched *f, const char *url, int failed) {
     prop_set_raw(r, intern_c("headers"), v_obj(h), 0);
     define_method(r, "text", response_body, 0, 0);
     define_method(r, "json", response_body, 0, 1);
+    define_method(r, "arrayBuffer", response_body, 0, 2);
     return r;
 }
 
-/* fetch(url, {method, body}): done at once (the page waits), as a promise. */
+static JsObj *SearchParamsProto;
+
+/* A request header a script may set (not the ones the browser itself
+   vouches for: cookies, where the request comes from, ...). */
+static int header_allowed(const char *name) {
+    static const char *forbidden[] = {"cookie", "cookie2", "host", "content-length", "connection", "keep-alive", "referer",
+                                      "origin", "accept-encoding", "te", "trailer", "transfer-encoding", "upgrade", "via",
+                                      "date", "expect", "dnt", "content-type", NULL};
+    if (!name[0] || !strncasecmp(name, "proxy-", 6) || !strncasecmp(name, "sec-", 4)) return 0;
+    for (const char *p = name; *p; p++) {
+        if (*p == ':' || *p == '\r' || *p == '\n' || *p == ' ') return 0;
+    }
+    for (int i = 0; forbidden[i]; i++) {
+        if (same_text_nocase(name, forbidden[i])) return 0;
+    }
+    return 1;
+}
+
+/* Add "name: value" to a list of request headers (Content-Type goes to `type`). */
+static void add_request_header(char *headers, size_t max, char *type, size_t type_max, JsStr *name, JsStr *value) {
+    for (int i = 0; i < value->len; i++) {
+        if (value->s[i] == '\r' || value->s[i] == '\n') return;
+    }
+    if (same_text_nocase(name->s, "content-type")) {
+        if ((size_t)value->len < type_max) strcpy(type, value->s);
+        return;
+    }
+    if (!header_allowed(name->s) || strlen(headers) + (size_t)name->len + (size_t)value->len + 5 >= max) return;
+    strcat(headers, name->s);
+    strcat(headers, ": ");
+    strcat(headers, value->s);
+    strcat(headers, "\r\n");
+}
+
+/* The headers of fetch(url, {headers}): an object, or a list of pairs. */
+static int collect_headers(Value h, char *headers, size_t max, char *type, size_t type_max) {
+    if (h.t != V_OBJ) return C_NORMAL;
+    JsObj *o = h.u.o;
+    if (o->cls == CL_ARRAY) {
+        for (int i = 0; i < o->alen; i++) {
+            Value pair = o->arr[i], k, v;
+            if (pair.t != V_OBJ) continue;
+            TRY(get_index(pair, v_num(0), &k));
+            TRY(get_index(pair, v_num(1), &v));
+            JsStr *ks, *vs;
+            TRY(to_string(k, &ks));
+            TRY(to_string(v, &vs));
+            add_request_header(headers, max, type, type_max, ks, vs);
+        }
+        return C_NORMAL;
+    }
+    for (int i = 0; i < o->nprops; i++) {
+        Prop *pr = &o->props[i];
+        if (pr->flags & (P_HIDDEN | P_ACCESSOR)) continue;
+        JsStr *vs;
+        TRY(to_string(pr->v, &vs));
+        add_request_header(headers, max, type, type_max, pr->key, vs);
+    }
+    return C_NORMAL;
+}
+
+/* The body a script sends, and its type: text, or a URLSearchParams form. */
+static int request_body(Value b, JsStr **body, char *type, size_t type_max) {
+    *body = NULL;
+    if (is_nullish(b)) return C_NORMAL;
+    if (b.t == V_OBJ && b.u.o->proto == SearchParamsProto) {
+        if (!type[0]) strcpy(type, "application/x-www-form-urlencoded;charset=UTF-8");
+    } else if (!type[0] && type_max > 30) {
+        strcpy(type, "text/plain;charset=UTF-8");
+    }
+    return to_string(b, body);
+}
+
+static void method_name(Value m, char *method) {
+    if (m.t != V_STR || m.u.s->len <= 0 || m.u.s->len >= 15) return;
+    for (int i = 0; i <= m.u.s->len; i++) method[i] = m.u.s->s[i] >= 'a' && m.u.s->s[i] <= 'z' ? (char)(m.u.s->s[i] - 32) : m.u.s->s[i];
+}
+
+/* fetch(url, {method, body, headers}): done at once (the page waits), as a promise. */
 NATIVE(window_fetch) {
     UNUSED;
     JsStr *u;
@@ -2502,21 +2935,29 @@ NATIVE(window_fetch) {
         promise_settle(p, 2, v_obj(make_error(TypeErrorProto, "Failed to fetch (a web page may not read local files)")));
         return C_NORMAL;
     }
-    const char *post = NULL;
+    static char headers[4096];
+    char type[128] = "", method[16] = "GET";
+    headers[0] = 0;
     JsStr *body = NULL;
     if (ARG(1).t == V_OBJ) {
-        Value m, b;
+        Value m, b, h;
         TRY(get_value(ARG(1), intern_c("method"), &m));
         TRY(get_value(ARG(1), intern_c("body"), &b));
-        if (m.t == V_STR && !strncasecmp(m.u.s->s, "post", 4)) {
-            body = S_empty;
-            if (!is_nullish(b)) TRY(to_string(b, &body));
-            post = body->s;
-        }
+        TRY(get_value(ARG(1), intern_c("headers"), &h));
+        method_name(m, method);
+        TRY(collect_headers(h, headers, sizeof(headers), type, sizeof(type)));
+        if (strcmp(method, "GET") && strcmp(method, "HEAD")) TRY(request_body(b, &body, type, sizeof(type)));
     }
+    Request rq;
+    memset(&rq, 0, sizeof(rq));
+    rq.method = method;
+    rq.body = body ? body->s : NULL;
+    rq.body_len = body ? (size_t)body->len : 0;
+    rq.content_type = type[0] ? type : NULL;
+    rq.headers = headers;
     Fetched f;
     char error[400];
-    if (fetch_url(url, post, &f, error) != 0) {
+    if (fetch_request(url, &rq, &f, error) != 0) {
         promise_settle(p, 2, v_obj(make_error(TypeErrorProto, "Failed to fetch")));
         return C_NORMAL;
     }
@@ -2533,6 +2974,12 @@ NATIVE(xhr_ctor) {
     prop_set_raw(x, K_readyState, v_num(0), 0);
     prop_set_raw(x, K_status, v_num(0), 0);
     prop_set_raw(x, K_responseText, v_str(S_empty), 0);
+    /* (pages test for these to see what requests can do: cross-site with
+       cookies, timeouts, typed responses) */
+    prop_set_raw(x, intern_c("withCredentials"), v_bool(0), 0);
+    prop_set_raw(x, intern_c("timeout"), v_num(0), 0);
+    prop_set_raw(x, intern_c("responseType"), v_str(S_empty), 0);
+    prop_set_raw(x, intern_c("upload"), v_obj(new_object()), 0);
     *ret = v_obj(x);
     return C_NORMAL;
 }
@@ -2541,19 +2988,12 @@ NATIVE(xhr_fire) {
     UNUSED;
     /* self->target: the request */
     JsObj *x = self->target;
-    JsStr *names[3] = {K_onreadystatechange, K_onload, intern_c("onloadend")};
+    /* (each runs both the on... handler and the listeners) */
+    static const char *events[] = {"readystatechange", "load", "loadend"};
     for (int i = 0; i < 3; i++) {
-        Value h;
-        TRY(get_value(v_obj(x), names[i], &h));
-        if (is_callable(h)) {
-            JsObj *e = new_event(i == 0 ? "readystatechange" : i == 1 ? "load" : "loadend", 0, 0);
-            prop_set_raw(e, K_target, v_obj(x), 0);
-            Value ev = v_obj(e), r;
-            TRY(call_function(h.u.o, v_obj(x), &ev, 1, &r));
-        }
+        JsObj *e = new_event(events[i], 0, 0);
+        if (dispatch_event(x, e) < 0) return C_THROW;
     }
-    JsObj *e = new_event("load", 0, 0);
-    if (dispatch_event(x, e) < 0) return C_THROW;
     *ret = v_undef();
     return C_NORMAL;
 }
@@ -2565,9 +3005,26 @@ NATIVE(xhr_method) {
     JsObj *x = this_v.u.o;
     int mode = self->magic & 0xFFFF;
     *ret = v_undef();
+    if (mode == 2 && argc >= 2) { /* setRequestHeader(name, value) */
+        JsStr *name, *value;
+        TRY(to_string(ARG(0), &name));
+        TRY(to_string(ARG(1), &value));
+        Value list;
+        TRY(get_value(this_v, intern_c("__headers"), &list));
+        if (list.t != V_OBJ) {
+            list = v_obj(new_array(0));
+            prop_set_raw(x, intern_c("__headers"), list, P_HIDDEN);
+        }
+        JsObj *pair = new_array(0);
+        arr_push(pair, v_str(name));
+        arr_push(pair, v_str(value));
+        arr_push(list.u.o, v_obj(pair));
+        return C_NORMAL;
+    }
     if (mode == 0) {
         prop_set_raw(x, intern_c("__method"), ARG(0), P_HIDDEN);
         prop_set_raw(x, intern_c("__url"), ARG(1), P_HIDDEN);
+        prop_set_raw(x, intern_c("__headers"), v_undef(), P_HIDDEN);
         prop_set_raw(x, K_readyState, v_num(1), 0);
         return C_NORMAL;
     }
@@ -2583,16 +3040,25 @@ NATIVE(xhr_method) {
     TRY(to_string(uv, &u));
     char url[2048];
     resolve_url(base_url, u->s, url, sizeof(url));
-    const char *post = NULL;
+    static char headers[4096];
+    char type[128] = "", method[16] = "GET";
+    headers[0] = 0;
+    method_name(mv, method);
+    Value hv;
+    TRY(get_value(this_v, intern_c("__headers"), &hv));
+    TRY(collect_headers(hv, headers, sizeof(headers), type, sizeof(type)));
     JsStr *body = NULL;
-    if (mv.t == V_STR && !strncasecmp(mv.u.s->s, "post", 4)) {
-        body = S_empty;
-        if (!is_nullish(ARG(0))) TRY(to_string(ARG(0), &body));
-        post = body->s;
-    }
+    if (strcmp(method, "GET") && strcmp(method, "HEAD")) TRY(request_body(ARG(0), &body, type, sizeof(type)));
+    Request rq;
+    memset(&rq, 0, sizeof(rq));
+    rq.method = method;
+    rq.body = body ? body->s : NULL;
+    rq.body_len = body ? (size_t)body->len : 0;
+    rq.content_type = type[0] ? type : NULL;
+    rq.headers = headers;
     Fetched f;
     char error[400];
-    int failed = !fetch_allowed(url) || fetch_url(url, post, &f, error) != 0;
+    int failed = !fetch_allowed(url) || fetch_request(url, &rq, &f, error) != 0;
     prop_set_raw(x, K_readyState, v_num(4), 0);
     prop_set_raw(x, K_status, v_num(failed ? 0 : f.status), 0);
     prop_set_raw(x, K_statusText, v_str(intern_c(failed ? "" : "OK")), 0);
@@ -2786,6 +3252,11 @@ NATIVE(url_to_string) {
 NATIVE(observer_ctor) {
     UNUSED;
     JsObj *o = new_object();
+    if (native_new_target) { /* an instance of what `new` was given (so it has observe, disconnect ...) */
+        Value proto;
+        TRY(get_value(v_obj(native_new_target), S_prototype, &proto));
+        if (proto.t == V_OBJ) o->proto = proto.u.o;
+    }
     prop_set_raw(o, intern_c("__callback"), ARG(0), P_HIDDEN);
     prop_set_raw(o, intern_c("__kind"), v_num(self->magic & 0xFFFF), P_HIDDEN);
     *ret = v_obj(o);
@@ -2827,9 +3298,99 @@ static int script_runs(Node *n) {
 
 #define SCRIPT_DONE 3 /* img_state of a <script> that has run */
 
+/* What a page's scripts may use while it loads; beyond it, the rest are skipped. */
+#define PAGE_SCRIPT_MS 25000
+#define PAGE_SCRIPT_BYTES (24 * 1024 * 1024)
+#define SCRIPT_TREE_FACTOR 4             /* parsed (function bodies wait until called), script takes about this many times its size */
+#define MEMORY_RESERVE (48ull << 20)     /* kept free for laying out and drawing the page, and the stack */
+static u64 page_script_start;
+static size_t page_script_bytes;
+static int page_scripts_skipped;
+
+/* A page's scripts, fetched in parallel (then run in order). */
+static PrefetchSet *script_prefetch;
+
+static void prefetch_scripts(void) {
+    int count = 0;
+    char src[2048], url[2048];
+    for (Node *n = document; n; n = next_in_tree(n, document)) {
+        if (n->type == NODE_ELEMENT && is(n->tag, "script") && script_runs(n) && attr(n, "src", src, sizeof(src)) && src[0]) count++;
+    }
+    if (count < 2) return;
+    script_prefetch = prefetch_begin(count);
+    if (!script_prefetch) return;
+    for (Node *n = document; n; n = next_in_tree(n, document)) {
+        if (n->type != NODE_ELEMENT || !is(n->tag, "script") || !script_runs(n) || !attr(n, "src", src, sizeof(src)) || !src[0]) continue;
+        resolve_url(base_url, src, url, sizeof(url));
+        if (fetch_allowed(url)) prefetch_add(script_prefetch, url);
+    }
+    prefetch_go(script_prefetch);
+}
+
+static int script_budget_left(void) {
+    return uptime_ms() - page_script_start < PAGE_SCRIPT_MS && page_script_bytes < PAGE_SCRIPT_BYTES && !js_oom;
+}
+
+static int memory_low; /* a script was skipped: not enough memory to run it */
+
+/* BROWSER_TIMING: where the memory is */
+static void memory_report(const char *when) {
+    size_t objects = 0, strings = 0, envs = 0, n_obj = 0, props = 0, arrays = 0;
+    for (Gc *g = heap_list; g; g = g->next) {
+        size_t sz = (size_t)1 << 5;
+        while (sz < g->size + 16) sz <<= 1; /* (the allocator's block) */
+        if (g->kind == K_OBJ) {
+            JsObj *o = (JsObj *)g;
+            objects += sz;
+            n_obj++;
+            if (o->pcap) {
+                size_t p = 32;
+                while (p < sizeof(Prop) * (size_t)o->pcap + 16) p <<= 1;
+                props += p;
+            }
+            if (o->arr) arrays += sizeof(Value) * (size_t)o->alen;
+        } else if (g->kind == K_STR) {
+            strings += sz;
+        } else {
+            envs += sz;
+        }
+    }
+    printf("[memory] %s: heap %d KiB (%d KiB free blocks); objects %d KiB (%d of them) + their properties %d KiB + array items %d KiB, "
+           "strings %d KiB, scopes %d KiB, trees %d KiB, kept source %d KiB\n",
+           when, (int)(((char *)sbrk(0) - (char *)0x10040000000ull) / 1024), (int)(heap_free_bytes() / 1024), (int)(objects / 1024), (int)n_obj,
+           (int)(props / 1024), (int)(arrays / 1024), (int)(strings / 1024), (int)(envs / 1024), arena_chunks * 64, (int)(kept_bytes / 1024));
+}
+static u64 page_script_fetch_ms;
+static int page_script_fetches;
+
+/* Is there memory to run a script of `len` bytes, with some to spare? */
+static int memory_for_script(size_t len) {
+    sys_info si;
+    if (sysinfo(&si) != 0 || si.mem_total <= si.mem_used) return 1; /* (unknown: try) */
+    u64 free_bytes = si.mem_total - si.mem_used + heap_free_bytes() / 2; /* (half: free blocks are of fixed sizes) */
+    if (free_bytes >= (u64)len * SCRIPT_TREE_FACTOR + MEMORY_RESERVE) return 1;
+    js_gc_during(); /* short: collect garbage first (safe even with scripts on the stack), then look again */
+    if (sysinfo(&si) == 0 && si.mem_total > si.mem_used) {
+        free_bytes = si.mem_total - si.mem_used + heap_free_bytes() / 2;
+        if (free_bytes >= (u64)len * SCRIPT_TREE_FACTOR + MEMORY_RESERVE) return 1;
+    }
+    if (!memory_low && getenv("BROWSER_TIMING")) {
+        size_t in_free_lists = heap_free_bytes();
+        printf("[memory] skipping: %d KiB free; heap %d KiB (%d KiB of it free blocks), trees %d KiB, kept source %d KiB, js heap %d objects\n",
+               (int)(free_bytes / 1024), (int)(((char *)sbrk(0) - (char *)0x10040000000ull) / 1024), (int)(in_free_lists / 1024),
+               arena_chunks * 64, (int)(kept_bytes / 1024), (int)heap_live);
+    }
+    memory_low = 1;
+    return 0;
+}
+
 static void run_script_element(Node *n) {
     if (!js_enabled || n->img_state == SCRIPT_DONE || !script_runs(n)) return;
     n->img_state = SCRIPT_DONE;
+    if (!script_budget_left()) {
+        page_scripts_skipped++;
+        return;
+    }
     Node *saved = current_script;
     current_script = n;
     char src[2048];
@@ -2837,14 +3398,43 @@ static void run_script_element(Node *n) {
         char url[2048], error[400];
         resolve_url(base_url, src, url, sizeof(url));
         Fetched f;
-        if (fetch_allowed(url) && fetch_url(url, NULL, &f, error) == 0) {
-            if (f.status < 400 && js_run_script(f.body, (int)f.len, url) != 0) js_errors++;
+        u64 fetch_t0 = uptime_ms();
+        int taken = prefetch_take(script_prefetch, url, &f);
+        /* (fetched in the background, or now; one that failed there is tried again here) */
+        error[0] = 0;
+        int fetched_ok = taken == 1 || (taken != 1 && fetch_allowed(url) && fetch_url(url, NULL, &f, error) == 0);
+        page_script_fetch_ms += uptime_ms() - fetch_t0;
+        page_script_fetches++;
+        int ran = 0;
+        if (fetched_ok) {
+            page_script_bytes += f.len;
+            if (f.status >= 400) {
+                char msg[600] = "could not load a script (HTTP error) from ";
+                strncat_safe(msg, url, 500);
+                js_report(msg);
+            } else if (!memory_for_script(f.len)) {
+                page_scripts_skipped++;
+            } else {
+                ran = 1;
+                if (js_run_script(f.body, (int)f.len, url) != 0) js_errors++;
+            }
             free(f.body);
+        } else {
+            char msg[1000] = "could not load a script from ";
+            strncat_safe(msg, url, 500);
+            if (error[0]) {
+                strncat_safe(msg, ": ", 3);
+                strncat_safe(msg, error, 400);
+            }
+            js_report(msg);
+            js_errors++;
         }
-        JsObj *e = new_event("load", 0, 0);
+        JsObj *e = new_event(ran ? "load" : "error", 0, 0);
         dispatch_event(wrap(n), e);
     } else if (n->first && n->first->type == NODE_TEXT) {
-        if (js_run_script(n->first->text, n->first->text_len, "inline") != 0) js_errors++;
+        page_script_bytes += (size_t)n->first->text_len;
+        if (!memory_for_script((size_t)n->first->text_len)) page_scripts_skipped++;
+        else if (js_run_script(n->first->text, n->first->text_len, "inline") != 0) js_errors++;
     }
     current_script = saved;
     run_microtasks();
@@ -2878,13 +3468,18 @@ static void run_inserted_scripts(Node *root) {
 static Gc **gc_stack;
 static int gc_top, gc_cap;
 
+static int gc_overflow; /* the mark stack could not grow: this collection frees nothing */
+
 static void gc_push(Gc *g) {
-    if (!g || g->mark || g->perm == 1) return;
+    if (!g || g->mark || g->perm) return;
     g->mark = 1;
     if (gc_top == gc_cap) {
         int cap = gc_cap ? gc_cap * 2 : 4096;
         Gc **s = realloc(gc_stack, sizeof(Gc *) * (size_t)cap);
-        if (!s) return; /* (it stays marked: kept alive, its children may be swept... avoided by marking conservatively below) */
+        if (!s) {
+            gc_overflow = 1;
+            return;
+        }
         gc_stack = s;
         gc_cap = cap;
     }
@@ -2892,7 +3487,7 @@ static void gc_push(Gc *g) {
 }
 
 static void gc_value(Value v) {
-    if (v.t == V_STR) gc_push(&v.u.s->gc);
+    if (v.t == V_STR || v.t == V_BIG) gc_push(&v.u.s->gc);
     else if (v.t == V_OBJ) gc_push(&v.u.o->gc);
 }
 
@@ -2910,7 +3505,8 @@ static void gc_children(Gc *g) {
         gc_value(o->this_val);
         if (o->target) gc_push(&o->target->gc);
         if (o->home) gc_push(&o->home->gc);
-        for (int i = 0; i < o->nbound; i++) gc_value(o->bound[i]);
+        if (o->cls != CL_BUFFER) /* (a buffer's list of views is weak) */
+            for (int i = 0; i < o->nbound; i++) gc_value(o->bound[i]);
         if ((o->cls == CL_MAP || o->cls == CL_SET) && o->extra) {
             Value *e = o->extra;
             for (int i = 0; i < 2 * o->extra_len; i++) gc_value(e[i]);
@@ -2931,7 +3527,7 @@ static void gc_free(Gc *g) {
         free(o->arr);
         free(o->bound);
         if (o->cls == CL_REGEXP) regex_free(o->extra);
-        else if (o->cls == CL_MAP || o->cls == CL_SET) free(o->extra);
+        else if (o->cls == CL_MAP || o->cls == CL_SET || o->cls == CL_BUFFER) free(o->extra);
         if (o->node && o->cls == CL_NODE && o->node->js == o) o->node->js = NULL;
     } else if (g->kind == K_ENV) {
         Env *e = (Env *)g;
@@ -2948,10 +3544,10 @@ static void mark_nodes(Node *root) {
     }
 }
 
-/* Collect garbage. Only call when no script is running. */
-static void js_gc(void) {
-    if (!global_obj) return;
+/* Mark from the roots: the global scope, prototypes, timers, the page's nodes. */
+static void gc_mark_roots(void) {
     gc_top = 0;
+    gc_overflow = 0;
     gc_push(&global_obj->gc);
     gc_push(&global_env->gc);
     gc_push(&global_lex->gc);
@@ -2959,10 +3555,19 @@ static void js_gc(void) {
                       RangeErrorProto, SyntaxErrorProto, ReferenceErrorProto, DateProto, RegExpProto, MapProto, SetProto,
                       PromiseProto, NodeProto, EventProto, DocumentProto, StyleProto, ClassListProto, DatasetProto, StorageProto,
                       XhrProto, microtasks, location_obj, local_storage, session_storage, SearchParamsProto, UrlProto,
-                      TypedArrayProto, IteratorProto};
+                      TypedArrayProto, IteratorProto, SymbolProto, ArrayBufferProto, BigIntProto, DataViewProto, TextEncoderProto, TextDecoderProto};
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
         if (roots[i]) gc_push(&roots[i]->gc);
     }
+    for (int i = 0; i < 10; i++)
+        if (TypedProtos[i]) gc_push(&TypedProtos[i]->gc);
+    frames_js_mark();
+    JsObj *dom_roots[] = {ElementProto, HTMLElementProto, SVGElementProto, CharacterDataProto, TextProto, CommentProto, FragmentProto,
+                          ShadowRootProto, EventTargetProto};
+    for (size_t i = 0; i < sizeof(dom_roots) / sizeof(dom_roots[0]); i++)
+        if (dom_roots[i]) gc_push(&dom_roots[i]->gc);
+    for (int i = 0; i < IFACE_COUNT; i++)
+        if (tag_protos[i]) gc_push(&tag_protos[i]->gc);
     gc_value(js_exception);
     for (int i = 0; i < timer_count; i++) {
         gc_value(timers[i].fn);
@@ -2970,13 +3575,27 @@ static void js_gc(void) {
     }
     if (document) mark_nodes(document);
     for (int i = 0; i < orphan_count; i++) mark_nodes(orphans[i]);
+    if (native_new_target) gc_push(&native_new_target->gc);
+}
+
+/* Trace from what is marked, then free what is not. */
+static void gc_finish(void) {
     while (gc_top > 0) gc_children(gc_stack[--gc_top]);
-    /* sweep */
+    if (buffers_made && !gc_overflow) { /* buffers forget their views that are dying */
+        for (Gc *g = heap_list; g; g = g->next) {
+            JsObj *b = (JsObj *)g;
+            if (g->kind != K_OBJ || b->cls != CL_BUFFER || !g->mark) continue;
+            int n = 0;
+            for (int i = 0; i < b->nbound; i++)
+                if (b->bound[i].u.o->gc.mark || b->bound[i].u.o->gc.perm) b->bound[n++] = b->bound[i];
+            b->nbound = n;
+        }
+    }
     size_t live = 0;
     Gc **link = &heap_list;
     while (*link) {
         Gc *g = *link;
-        if (g->mark) {
+        if (g->mark || gc_overflow) {
             g->mark = 0;
             link = &g->next;
             live++;
@@ -2987,6 +3606,104 @@ static void js_gc(void) {
     }
     heap_live = live;
     heap_since_gc = 0;
+}
+
+/* Collect garbage. Only call when no script is running. */
+static void js_gc(void) {
+    if (!global_obj) return;
+    gc_mark_roots();
+    gc_finish();
+}
+
+/* ---- collecting while a script runs ----
+   Values the running code holds are on the C stack (and in registers):
+   any word there that points into a heap block keeps that block alive
+   (conservatively). */
+
+static char *js_stack_top;   /* the top of the stack (set by main) */
+static int gc_running;
+static Gc **gc_index;        /* every heap block, by address */
+static int gc_index_n, gc_index_cap;
+
+static void gc_sift(Gc **a, int n, int i) {
+    for (;;) {
+        int l = 2 * i + 1, r = l + 1, m = i;
+        if (l < n && a[l] > a[m]) m = l;
+        if (r < n && a[r] > a[m]) m = r;
+        if (m == i) return;
+        Gc *t = a[i];
+        a[i] = a[m];
+        a[m] = t;
+        i = m;
+    }
+}
+
+static int gc_build_index(void) {
+    int n = 0;
+    for (Gc *g = heap_list; g; g = g->next) n++;
+    if (n > gc_index_cap) {
+        Gc **p = realloc(gc_index, sizeof(Gc *) * (size_t)(n + 1024));
+        if (!p) return 0;
+        gc_index = p;
+        gc_index_cap = n + 1024;
+    }
+    n = 0;
+    for (Gc *g = heap_list; g; g = g->next) gc_index[n++] = g;
+    for (int i = n / 2 - 1; i >= 0; i--) gc_sift(gc_index, n, i); /* heap sort */
+    for (int end = n - 1; end > 0; end--) {
+        Gc *t = gc_index[0];
+        gc_index[0] = gc_index[end];
+        gc_index[end] = t;
+        gc_sift(gc_index, end, 0);
+    }
+    gc_index_n = n;
+    return 1;
+}
+
+static void gc_scan_range(const char *lo, const char *hi) {
+    if (!gc_index_n) return;
+    unsigned long long first = (unsigned long long)gc_index[0];
+    unsigned long long last = (unsigned long long)gc_index[gc_index_n - 1] + gc_index[gc_index_n - 1]->size;
+    for (const char *p = (const char *)(((unsigned long long)lo + 7) & ~7ull); p + 8 <= hi; p += 8) {
+        unsigned long long w = *(const unsigned long long *)p;
+        if (w < first || w >= last) continue;
+        int a = 0, b = gc_index_n - 1;
+        while (a < b) { /* the last block starting at or below w */
+            int m = (a + b + 1) / 2;
+            if ((unsigned long long)gc_index[m] <= w) a = m;
+            else b = m - 1;
+        }
+        Gc *g = gc_index[a];
+        if (w >= (unsigned long long)g && w < (unsigned long long)g + g->size) gc_push(g);
+    }
+}
+
+__attribute__((noinline)) static void js_gc_during(void) {
+    if (gc_running || !js_stack_top || !global_obj) {
+        heap_since_gc = 0; /* (not now; ask again after more allocation) */
+        return;
+    }
+    gc_running = 1;
+    /* the registers that may hold pointers, onto the stack */
+    unsigned long long regs[8 + 20] __attribute__((aligned(16)));
+    __asm__ volatile("mov %%rbx, 0(%0)\n\tmov %%rbp, 8(%0)\n\tmov %%rsi, 16(%0)\n\tmov %%rdi, 24(%0)\n\t"
+                     "mov %%r12, 32(%0)\n\tmov %%r13, 40(%0)\n\tmov %%r14, 48(%0)\n\tmov %%r15, 56(%0)\n\t"
+                     "movdqu %%xmm6, 64(%0)\n\tmovdqu %%xmm7, 80(%0)\n\tmovdqu %%xmm8, 96(%0)\n\tmovdqu %%xmm9, 112(%0)\n\t"
+                     "movdqu %%xmm10, 128(%0)\n\tmovdqu %%xmm11, 144(%0)\n\tmovdqu %%xmm12, 160(%0)\n\t"
+                     "movdqu %%xmm13, 176(%0)\n\tmovdqu %%xmm14, 192(%0)\n\tmovdqu %%xmm15, 208(%0)"
+                     :
+                     : "r"(regs)
+                     : "memory");
+    if (gc_build_index()) {
+        gc_mark_roots();
+        gc_scan_range((const char *)regs, js_stack_top);
+        for (int i = 0; i < gc_extra_n; i++) gc_scan_range(gc_extra_lo[i], gc_extra_hi[i]);
+        gc_finish();
+        if (getenv("BROWSER_TIMING")) printf("[gc] while a script runs: %d blocks alive\n", (int)heap_live);
+    } else {
+        heap_since_gc = 0;
+    }
+    gc_running = 0;
 }
 
 static int gc_runs;
@@ -3021,6 +3738,22 @@ static void define_dom_methods(void) {
     define_method(NodeProto, "remove", dom_remove, 0, 0);
     define_method(NodeProto, "cloneNode", dom_clone, 1, 0);
     define_method(NodeProto, "contains", dom_contains, 1, 0);
+    define_method(NodeProto, "compareDocumentPosition", dom_compare_position, 1, 0);
+    /* the window's event handler properties (pages test for them: "onsubmit" in window).
+       Not the touch ones: those would say this is a phone. */
+    static const char *window_events[] = {"onload", "onunload", "onbeforeunload", "onerror", "onresize", "onscroll", "onclick",
+                                          "ondblclick", "onsubmit", "onreset", "onchange", "oninput", "onfocus", "onblur",
+                                          "onkeydown", "onkeyup", "onkeypress", "onmousedown", "onmouseup", "onmousemove",
+                                          "onmouseover", "onmouseout", "onmouseenter", "onmouseleave", "onwheel", "onhashchange",
+                                          "onpopstate", "onmessage", "onstorage", "onpageshow", "onpagehide", "oncontextmenu",
+                                          "onanimationend", "ontransitionend", "onselect", "onabort", "onpointerdown",
+                                          "onpointerup", "onpointermove", NULL};
+    for (int i = 0; window_events[i]; i++) {
+        if (!own_prop(global_obj, intern_c(window_events[i]))) define_hidden(global_obj, window_events[i], v_null());
+    }
+    static const char *positions[] = {"DOCUMENT_POSITION_DISCONNECTED", "DOCUMENT_POSITION_PRECEDING", "DOCUMENT_POSITION_FOLLOWING",
+                                      "DOCUMENT_POSITION_CONTAINS", "DOCUMENT_POSITION_CONTAINED_BY", "DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC"};
+    for (int i = 0; i < 6; i++) define_hidden(NodeProto, positions[i], v_num(1 << i));
     define_method(NodeProto, "matches", dom_matches, 1, 0);
     define_method(NodeProto, "webkitMatchesSelector", dom_matches, 1, 0);
     define_method(NodeProto, "closest", dom_matches, 1, 1);
@@ -3045,7 +3778,7 @@ static void define_dom_methods(void) {
     define_method(NodeProto, "removeEventListener", event_listener, 2, 1);
     define_method(NodeProto, "dispatchEvent", dispatch_event_native, 1, 0);
     define_method(NodeProto, "createElement", dom_create_element, 1, 0);
-    define_method(NodeProto, "createElementNS", dom_create_element, 2, 0);
+    define_method(NodeProto, "createElementNS", dom_create_element, 2, 4);
     define_method(NodeProto, "createTextNode", dom_create_element, 1, 1);
     define_method(NodeProto, "createDocumentFragment", dom_create_element, 0, 2);
     define_method(NodeProto, "createComment", dom_create_element, 1, 3);
@@ -3084,10 +3817,31 @@ static void dom_interface(const char *name, JsObj *proto) {
     JsObj *f = make_native(name, noop, 0, 0);
     f->fn_kind = FN_NORMAL;
     prop_set_raw(f, S_prototype, v_obj(proto), P_HIDDEN);
+    if (proto != global_obj && !own_prop(proto, S_constructor)) define_hidden(proto, "constructor", v_obj(f));
     define_hidden(global_obj, name, v_obj(f));
 }
 
 /* Set up the scripting world for the page now in `document`. */
+/* crypto.randomUUID(): a random (version 4) UUID */
+NATIVE(random_uuid) {
+    UNUSED;
+    unsigned char b[16];
+    getrandom(b, sizeof(b));
+    b[6] = (unsigned char)((b[6] & 0x0F) | 0x40);
+    b[8] = (unsigned char)((b[8] & 0x3F) | 0x80);
+    static const char hex[] = "0123456789abcdef";
+    char text[37];
+    int k = 0;
+    for (int i = 0; i < 16; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) text[k++] = '-';
+        text[k++] = hex[b[i] >> 4];
+        text[k++] = hex[b[i] & 15];
+    }
+    text[k] = 0;
+    *ret = v_str(str_c(text));
+    return C_NORMAL;
+}
+
 static void js_page_start(void) {
     js_init_builtins();
     init_dom_names();
@@ -3131,6 +3885,8 @@ static void js_page_start(void) {
     define_getter(w, "location", window_location_get, window_location_set, 0);
     JsObj *nav = new_object();
     define_hidden(w, "navigator", v_obj(nav));
+    Prop *doc_prop = own_prop(w, intern_c("document"));
+    missing_document = doc_prop && doc_prop->v.t == V_OBJ ? doc_prop->v.u.o : NULL;
     prop_set_raw(nav, intern_c("userAgent"), v_str(intern_c("Mozilla/5.0 (RDX; x86_64) RDX-Browser/0.4")), 0);
     prop_set_raw(nav, intern_c("appName"), v_str(intern_c("Netscape")), 0);
     prop_set_raw(nav, intern_c("appVersion"), v_str(intern_c("5.0 (RDX)")), 0);
@@ -3202,11 +3958,16 @@ static void js_page_start(void) {
     define_method(w, "open", noop, 1, 0);
     define_method(w, "close", noop, 0, 0);
     define_method(w, "print", noop, 0, 0);
-    define_method(w, "postMessage", noop, 2, 0);
+    frames_js_init(w);
     JsObj *xhr = make_ctor("XMLHttpRequest", xhr_ctor, 0, 0, XhrProto);
     define_hidden(xhr, "DONE", v_num(4));
     make_ctor("URLSearchParams", search_params_ctor, 1, 0, SearchParamsProto);
-    make_ctor("URL", url_ctor, 2, 0, UrlProto);
+    JsObj *url_c = make_ctor("URL", url_ctor, 2, 0, UrlProto);
+    define_method(url_c, "createObjectURL", object_url, 1, 0);
+    define_method(url_c, "revokeObjectURL", object_url, 1, 1);
+    define_method(w, "__rdxBytes", rdx_bytes, 1, 0);
+    define_method(w, "__rdxBuffer", rdx_bytes, 1, 1);
+    define_method(w, "__rdxZip", rdx_zip, 3, 0);
     make_ctor("Event", event_ctor, 2, 0, EventProto);
     make_ctor("CustomEvent", event_ctor, 2, 0, EventProto);
     make_ctor("KeyboardEvent", event_ctor, 2, 0, EventProto);
@@ -3222,11 +3983,41 @@ static void js_page_start(void) {
     prop_set_raw(mo, S_prototype, v_obj(ObsProto), P_HIDDEN);
     JsObj *ro = make_ctor("ResizeObserver", observer_ctor, 1, 0, NULL);
     prop_set_raw(ro, S_prototype, v_obj(ObsProto), P_HIDDEN);
-    static const char *interfaces[] = {"Node", "Element", "HTMLElement", "HTMLDivElement", "HTMLInputElement", "HTMLAnchorElement",
-                                       "HTMLImageElement", "HTMLFormElement", "HTMLButtonElement", "HTMLSelectElement",
-                                       "HTMLTextAreaElement", "HTMLScriptElement", "HTMLCanvasElement", "Text", "CharacterData",
-                                       "EventTarget", "DocumentFragment", "SVGElement", "HTMLIFrameElement", "HTMLVideoElement", NULL};
-    for (int i = 0; interfaces[i]; i++) dom_interface(interfaces[i], NodeProto);
+    JsObj *po = make_ctor("PerformanceObserver", observer_ctor, 1, 0, NULL);
+    prop_set_raw(po, S_prototype, v_obj(ObsProto), P_HIDDEN);
+    define_hidden(po, "supportedEntryTypes", v_obj(new_array(0)));
+    EventTargetProto = obj_new_raw(CL_OBJECT, ObjectProto);
+    NodeProto->proto = EventTargetProto;
+    ElementProto = obj_new_raw(CL_OBJECT, NodeProto);
+    HTMLElementProto = obj_new_raw(CL_OBJECT, ElementProto);
+    SVGElementProto = obj_new_raw(CL_OBJECT, ElementProto);
+    CharacterDataProto = obj_new_raw(CL_OBJECT, NodeProto);
+    TextProto = obj_new_raw(CL_OBJECT, CharacterDataProto);
+    CommentProto = obj_new_raw(CL_OBJECT, CharacterDataProto);
+    FragmentProto = obj_new_raw(CL_OBJECT, NodeProto);
+    ShadowRootProto = obj_new_raw(CL_OBJECT, FragmentProto);
+    dom_interface("EventTarget", EventTargetProto);
+    dom_interface("Node", NodeProto);
+    dom_interface("Element", ElementProto);
+    dom_interface("HTMLElement", HTMLElementProto);
+    dom_interface("SVGElement", SVGElementProto);
+    dom_interface("SVGSVGElement", SVGElementProto);
+    dom_interface("CharacterData", CharacterDataProto);
+    dom_interface("Text", TextProto);
+    dom_interface("Comment", CommentProto);
+    dom_interface("DocumentFragment", FragmentProto);
+    dom_interface("ShadowRoot", ShadowRootProto);
+    define_method(ElementProto, "attachShadow", dom_attach_shadow, 1, 0);
+    define_hidden(ElementProto, "shadowRoot", v_null());
+    for (int i = 0; i < IFACE_COUNT; i++) {
+        tag_protos[i] = HTMLElementProto;
+        if (!strcmp(IFACE_TAGS[i][1], "HTMLElement")) continue;
+        for (int k = 0; k < i; k++) /* (one prototype per interface: h1..h6, td/th share) */
+            if (!strcmp(IFACE_TAGS[k][1], IFACE_TAGS[i][1])) tag_protos[i] = tag_protos[k];
+        if (tag_protos[i] != HTMLElementProto) continue;
+        tag_protos[i] = obj_new_raw(CL_OBJECT, HTMLElementProto);
+        dom_interface(IFACE_TAGS[i][1], tag_protos[i]);
+    }
     dom_interface("Document", DocumentProto);
     dom_interface("HTMLDocument", DocumentProto);
     dom_interface("Window", global_obj);
@@ -3237,10 +4028,17 @@ static void js_page_start(void) {
     define_method(ce, "whenDefined", promise_static_resolve, 1, 0);
     JsObj *crypto = new_object();
     define_hidden(w, "crypto", v_obj(crypto));
-    define_method(crypto, "randomUUID", symbol_ctor, 0, 0);
+    define_method(crypto, "randomUUID", random_uuid, 0, 0);
     define_method(crypto, "getRandomValues", get_random_values, 1, 0);
     current_script = NULL;
     page_loaded = 0;
+    /* the features written in JavaScript (web/prelude.js) */
+    missing_on = 0;
+    if (js_enabled) js_run_script(JS_PRELUDE, (int)sizeof(JS_PRELUDE) - 1, "the browser's prelude");
+    if (getenv("BROWSER_MISSING")) { /* everything made so far is the browser's own */
+        for (Gc *g = heap_list; g; g = g->next) g->builtin = 1;
+        missing_on = 1;
+    }
     js_errors = 0;
     dom_dirty = 0;
     free(js_navigate);
@@ -3263,6 +4061,7 @@ static void js_page_end(void) {
     local_storage = NULL; /* (kept per page only, since it lives in the heap) */
     global_obj = NULL;
     location_obj = NULL;
+    ElementProto = NULL; /* (the next page makes its own) */
     timer_count = 0;
     arena_free_all();
     /* free the nodes scripts took out of the page */
@@ -3286,6 +4085,12 @@ static void js_page_end(void) {
 /* Run the page's scripts in order, then DOMContentLoaded. */
 static void js_run_page_scripts(void) {
     if (!js_enabled) return;
+    page_script_start = uptime_ms();
+    page_script_bytes = 0;
+    page_scripts_skipped = 0;
+    memory_low = 0;
+    page_script_fetch_ms = 0;
+    page_script_fetches = 0;
     /* a snapshot of the <script> elements: scripts may add more (those run when inserted) */
     int count = 0;
     for (Node *d = document; d; d = next_in_tree(d, document)) count += d->type == NODE_ELEMENT && is(d->tag, "script");
@@ -3299,11 +4104,29 @@ static void js_run_page_scripts(void) {
             list[k++] = d;
         }
     }
+    prefetch_scripts();
     for (int i = 0; i < k; i++) {
         if (contains_node(document, list[i])) run_script_element(list[i]);
         if (js_navigate) break;
     }
+    prefetch_end(script_prefetch);
+    script_prefetch = NULL;
     free(list);
+    if (getenv("BROWSER_TIMING")) memory_report("after the page's scripts");
+    if (getenv("BROWSER_TIMING"))
+        printf("[timing] %d scripts fetched in %d ms, %d KiB of script\n", page_script_fetches, (int)page_script_fetch_ms, (int)(page_script_bytes / 1024));
+    if (getenv("BROWSER_TIMING"))
+        printf("[timing] connections: %d new (%d ms), %d reused; waiting for replies %d ms, unpacking %d ms\n", stat_conn_new, (int)stat_connect_ms, stat_conn_reused, (int)stat_wait_ms, (int)stat_unpack_ms);
+    if (page_scripts_skipped) {
+        char msg[120] = "the page has more script than RDX can run: ";
+        char n[12];
+        number_to_text(page_scripts_skipped, n);
+        strncat_safe(msg, n, 10);
+        strncat_safe(msg, " scripts were skipped", 30);
+        strncat_safe(msg, js_oom || memory_low ? " (not enough memory)" : uptime_ms() - page_script_start >= PAGE_SCRIPT_MS ? " (out of time)" : " (too much script)", 30);
+        js_report(msg);
+        js_errors++;
+    }
 }
 
 /* Dispatch an event from the browser (a click, a key...): returns 1 if a
@@ -3311,9 +4134,8 @@ static void js_run_page_scripts(void) {
 static int js_dispatch(Node *target, JsObj *event) {
     if (!js_enabled || !global_obj) return 0;
     char here;
-    js_stack_base = &here;
-    js_steps = 0;
-    js_abort = 0;
+    js_set_stack_base(&here);
+    js_start_run(1000);
     int r = dispatch_event(target ? wrap(target) : global_obj, event);
     if (r < 0) {
         describe_exception(js_last_error, sizeof(js_last_error));

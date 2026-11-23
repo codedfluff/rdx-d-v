@@ -485,6 +485,12 @@ static void chacha_tag(const u8 key[32], const u8 nonce[12], const u8 *aad, size
 
 /* ================================================================ AES-128 and GCM */
 
+static void strncpy_tls(char *d, const char *s, size_t n) {
+    size_t i = 0;
+    for (; i + 1 < n && s[i]; i++) d[i] = s[i];
+    d[i] = 0;
+}
+
 static u8 SBOX[256];
 static int sbox_ready;
 
@@ -504,6 +510,20 @@ static void make_sbox(void) {
     } while (p != 1);
     SBOX[0] = 0x63;
     sbox_ready = 1;
+}
+
+/* The one-time set-up, done now: before several threads make connections at once. */
+static char cipher_choice[16]; /* TLS_CIPHERS, read once by tls_prepare */
+static volatile int cipher_choice_read;
+
+void tls_prepare(void) {
+    if (!sbox_ready) make_sbox();
+    x509_prepare();
+    if (!cipher_choice_read) { /* (getenv's answer is a shared buffer: not to be read from several threads) */
+        const char *only = cipher_choice_read ? (cipher_choice[0] ? cipher_choice : NULL) : getenv("TLS_CIPHERS");
+        if (only) strncpy_tls(cipher_choice, only, sizeof(cipher_choice));
+        cipher_choice_read = 1;
+    }
 }
 
 static u8 xtime(u8 x) { return (u8)(x << 1 ^ ((x >> 7) * 0x1b)); }

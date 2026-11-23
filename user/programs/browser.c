@@ -20,17 +20,30 @@
 #include "inflate.h"
 #include "tls.h"
 
+/* The page code keeps its statics in the realm sections (web/realm.c):
+   every frame and worker has its own copy. The networking is shared. */
+#pragma clang section bss=".rlmb$m" data=".rlmd$m"
 #include "web/dom.c"
 #include "web/css.c"
 #include "web/cascade.c"
 #include "web/layout.c"
 #include "web/paint.c"
+#pragma clang section bss="" data=""
+#include "web/cookies.c"
 #include "web/fetch.c"
+#pragma clang section bss=".rlmb$m" data=".rlmd$m"
 #include "web/js_core.c"
 #include "web/js_parse.c"
+#include "web/js_bigint.c"
 #include "web/js_eval.c"
 #include "web/js_lib.c"
+#include "web/js_prelude.c"
 #include "web/js_dom.c"
+#include "web/svg.c"
+#pragma clang section bss="" data=""
+#include "web/realm.c"
+#pragma clang section bss=".rlmb$m" data=".rlmd$m"
+#include "web/js_frames.c"
 
 #define W 820
 #define H 580
@@ -50,20 +63,67 @@ static char status_text[200];
 static char page_security[256];
 static char *css_buffers[64];
 static int css_buffer_count;
-static int dumping;
+static int scroll; /* (each frame scrolls on its own) */
 
 /* ================================================================ loading a page */
 
 static void free_page(void) {
+    for (int i = 1; i < MAX_REALMS; i++) /* its frames and workers go with it */
+        if (realm_list[i].used && realm_list[i].parent == realm_list[realm_now].id) realm_destroy(i);
     js_page_end(); /* scripts' objects first: they point at nodes */
+    blobs_clear();
     if (document) free_tree(document);
     document = html_element = body_element = head_element = NULL;
     focused_node = NULL;
+    refresh_due = 0;
     for (int i = 0; i < css_buffer_count; i++) free(css_buffers[i]);
     css_buffer_count = 0;
-    rule_count = rule_order = 0;
+    free_rules();
     indexed_count = -1;
     page_title[0] = 0;
+}
+
+/* <meta http-equiv="refresh" content="3; url=..."> (not one inside
+   <noscript> when scripts run: that is for browsers without them). */
+static void find_meta_refresh(void) {
+    char kind[32], content[1024];
+    for (Node *n = document; n; n = next_in_tree(n, document)) {
+        if (n->type != NODE_ELEMENT || !is(n->tag, "meta")) continue;
+        if (!attr(n, "http-equiv", kind, sizeof(kind)) || strncasecmp(kind, "refresh", 8) || !attr(n, "content", content, sizeof(content))) continue;
+        int hidden = 0;
+        for (Node *a = n->parent; a; a = a->parent) {
+            if (a->type == NODE_ELEMENT && is(a->tag, "noscript")) hidden = js_enabled;
+        }
+        if (!hidden) {
+            schedule_refresh(content, base_url);
+            return;
+        }
+    }
+}
+
+/* page_title from the <title> (again after scripts, which may change it).
+   Returns whether it changed. */
+static int update_page_title(void) {
+    char was[sizeof(page_title)];
+    strcpy(was, page_title);
+    page_title[0] = 0;
+    Node *title = document ? find_element(document, "title") : NULL;
+    if (title) {
+        char text[256];
+        text_content(title, text, sizeof(text));
+        int k = 0, space = 0;
+        for (const char *p = text; *p && k < (int)sizeof(page_title) - 1; p++) {
+            if (is_space(*p)) {
+                space = k > 0;
+                continue;
+            }
+            if (space) page_title[k++] = ' ';
+            space = 0;
+            page_title[k++] = *p;
+        }
+        page_title[k] = 0;
+    }
+    return strcmp(was, page_title) != 0;
 }
 
 static void keep_css(char *text) {
@@ -89,6 +149,20 @@ static void load_stylesheets(void) {
     }
     int fetched = 0;
     char value[1024], media[128];
+    /* the linked ones, fetched all at once */
+    PrefetchSet *sheets = prefetch_begin(12);
+    for (Node *n = document; n && sheets; n = next_in_tree(n, document)) {
+        if (n->type != NODE_ELEMENT || !is(n->tag, "link")) continue;
+        media[0] = 0;
+        attr(n, "media", media, sizeof(media));
+        if (attr(n, "rel", value, sizeof(value)) && strstr(value, "stylesheet") && !strstr(value, "alternate") &&
+            media_applies(media, (int)strlen(media)) && attr(n, "href", value, sizeof(value)) && value[0]) {
+            char url[1024];
+            resolve_url(base_url, value, url, sizeof(url));
+            prefetch_add(sheets, url);
+        }
+    }
+    prefetch_go(sheets);
     for (Node *n = document; n; n = next_in_tree(n, document)) {
         if (n->type != NODE_ELEMENT) continue;
         media[0] = 0;
@@ -106,7 +180,8 @@ static void load_stylesheets(void) {
             resolve_url(base_url, value, url, sizeof(url));
             Fetched f;
             fetched++;
-            if (fetch_url(url, NULL, &f, error) == 0) {
+            int taken = prefetch_take(sheets, url, &f);
+            if (taken == 1 || (taken == 0 && fetch_url(url, NULL, &f, error) == 0)) {
                 if (f.len > 1024 * 1024) f.len = 1024 * 1024;
                 parse_css(f.body, (int)f.len, 1);
                 keep_css(f.body);
@@ -117,6 +192,7 @@ static void load_stylesheets(void) {
             strcpy(base_url, full);
         }
     }
+    prefetch_end(sheets);
 }
 
 /* Form controls start out as their attributes say. only_new: just those
@@ -156,9 +232,10 @@ static void relayout(void) {
     u64 t0 = uptime_ms();
     compute_styles();
     u64 t1 = uptime_ms();
-    layout_page(PAGE_W);
+    layout_page(layout_viewport_w ? layout_viewport_w : PAGE_W);
     cascade_ms = t1 - t0;
     layout_ms = uptime_ms() - t1;
+    frames_update();
 }
 
 static void error_page(const char *message, const char *url) {
@@ -198,15 +275,23 @@ static void load(const char *address, const char *post) {
     page_epoch++;
     static char url[1024];
     strcpy(url, address);
-    static char error[400];
+    static char error[400], fragment[512];
     error[0] = 0;
+    fragment[0] = 0;
+    const char *hash = strchr(address, '#');
+    if (hash) strncat_safe(fragment, hash, sizeof(fragment) - 1);
+    if (getenv("BROWSER_TIMING")) printf("[heap] start: %d KiB\n", (int)(((char *)sbrk(0) - (char *)0x10040000000ull) / 1024));
     free_page();
     Fetched f;
     u64 t0 = uptime_ms();
-    int failed = fetch_url(url, post, &f, error) != 0;
+    fetch_navigating = 1;
+    int failed = fetch_url(url, post, &f, error) != 0; /* (url loses the fragment, may follow redirects) */
+    fetch_navigating = 0;
     u64 t1 = uptime_ms();
-    strcpy(current_url, url);
     strcpy(base_url, url);
+    if (getenv("BROWSER_TIMING")) printf("[heap] fetched: %d KiB\n", (int)(((char *)sbrk(0) - (char *)0x10040000000ull) / 1024));
+    strcpy(current_url, url);
+    if (fragment[0] && strlen(current_url) + strlen(fragment) < sizeof(current_url)) strcat(current_url, fragment);
     if (failed) {
         error_page(error, url);
         strcpy(status_text, "Failed");
@@ -235,6 +320,7 @@ static void load(const char *address, const char *post) {
             strncat_safe(message, ". Use wget to save it.", 30);
             error_page(message, url);
         }
+        if (f.refresh[0]) schedule_refresh(f.refresh, url);
         free(f.body);
         char kib[24];
         number_text(kib, (f.len + 1023) / 1024);
@@ -243,26 +329,14 @@ static void load(const char *address, const char *post) {
         strncat_safe(status_text, " KiB, ", 8);
         strncat_safe(status_text, page_security, 180);
     }
-    Node *title = find_element(document, "title");
-    if (title) {
-        char text[256];
-        text_content(title, text, sizeof(text));
-        int k = 0, space = 0;
-        for (const char *p = text; *p && k < (int)sizeof(page_title) - 1; p++) {
-            if (is_space(*p)) {
-                space = k > 0;
-                continue;
-            }
-            if (space) page_title[k++] = ' ';
-            space = 0;
-            page_title[k++] = *p;
-        }
-        page_title[k] = 0;
-    }
+    update_page_title();
+    if (getenv("BROWSER_TIMING")) printf("[heap] parsed: %d KiB\n", (int)(((char *)sbrk(0) - (char *)0x10040000000ull) / 1024));
+    find_meta_refresh();
     load_stylesheets();
     init_controls();
     u64 t2 = uptime_ms();
     if (js_enabled && document) {
+    if (getenv("BROWSER_TIMING")) printf("[heap] stylesheets: %d KiB\n", (int)(((char *)sbrk(0) - (char *)0x10040000000ull) / 1024));
         js_page_start();
         dom_dirty = 1; /* the first question about layout lays the page out */
         js_run_page_scripts();
@@ -278,7 +352,9 @@ static void load(const char *address, const char *post) {
             strncat_safe(status_text, js_errors == 1 ? " script error" : " script errors", 16);
         }
     }
+    update_page_title();
     collect_links();
+    strncpy(realm_list[realm_now].url, current_url, sizeof(realm_list[realm_now].url) - 1);
     u64 t3 = uptime_ms();
     relayout();
     if (getenv("BROWSER_TIMING")) printf("[timing] scripts %llu ms\n", t3 - t2);
@@ -287,16 +363,60 @@ static void load(const char *address, const char *post) {
                t1 - t0, t2 - t1, cascade_ms, layout_ms, rule_count, node_count, item_count);
     if (getenv("BROWSER_TIMING"))
         printf("[timing] %ld compound tests, %ld keyless tries, %ld rules applied\n", stat_compound, stat_keyless, stat_applied);
+    cookies_save();
 }
 
 /* Fetch and decode the page's pictures. `each` is called after every one
    (to redraw); it returns nonzero to stop early. */
+static int load_images_from(int (*each)(void), PrefetchSet *pictures, unsigned page, unsigned dom, int *loaded_count);
+static u64 image_wait_ms, image_decode_ms;
+
 static int load_images(int (*each)(void)) {
     int loaded = 0;
     unsigned page = page_epoch, dom = dom_epoch;
+    static char src[1024], url[1024];
+    /* the pictures still to get, fetched several at once */
+    int wanted = 0;
+    for (Node *n = document; n; n = next_in_tree(n, document)) wanted += n->type == NODE_ELEMENT && !n->img_state && is(n->tag, "img");
+    PrefetchSet *pictures = wanted > 1 ? prefetch_begin(wanted < MAX_IMAGES ? wanted : MAX_IMAGES) : NULL;
+    for (Node *n = document; n && pictures; n = next_in_tree(n, document)) {
+        if (n->type != NODE_ELEMENT || n->img_state || !is(n->tag, "img") || n->style.display == D_NONE) continue;
+        if ((!attr(n, "src", src, sizeof(src)) || !src[0] || !strncasecmp(src, "data:", 5)) &&
+            (!attr(n, "data-src", src, sizeof(src)) || !src[0]))
+            continue;
+        resolve_url(base_url, src, url, sizeof(url));
+        prefetch_add(pictures, url);
+    }
+    u64 t0 = uptime_ms();
+    image_wait_ms = image_decode_ms = 0;
+    prefetch_go(pictures);
+    int stopped = load_images_from(each, pictures, page, dom, &loaded);
+    prefetch_end(pictures);
+    if (getenv("BROWSER_TIMING") && wanted)
+        printf("[timing] %d pictures in %d ms: waiting for them %d ms, decoding %d ms\n", wanted, (int)(uptime_ms() - t0), (int)image_wait_ms, (int)image_decode_ms);
+    return stopped;
+}
+
+static int load_images_from(int (*each)(void), PrefetchSet *pictures, unsigned page, unsigned dom, int *loaded_count) {
+    int loaded = *loaded_count;
     static char src[1024], url[1024], error[400];
     for (Node *n = document; n && loaded < MAX_IMAGES; n = next_in_tree(n, document)) {
-        if (n->type != NODE_ELEMENT || n->img_state || !is(n->tag, "img")) continue;
+        if (n->type != NODE_ELEMENT || n->img_state) continue;
+        if (is(n->tag, "svg")) { /* a drawing in the page: drawn at the size it was laid out */
+            n->img_state = 2;
+            if (n->style.display == D_NONE) continue;
+            image *img = malloc(sizeof(image));
+            int cw = n->w - frame_h(n, 0), ch = n->h - frame_v(n, 0);
+            if (img && svg_render_node(n, cw > 0 ? cw : 0, ch > 0 ? ch : 0, n->style.color, img) == 0) {
+                n->img = img;
+                svg_natural_size(n, &n->img_w, &n->img_h);
+                n->img_state = 1;
+            } else {
+                free(img);
+            }
+            continue;
+        }
+        if (!is(n->tag, "img")) continue;
         if (n->style.display == D_NONE) continue;
         if ((!attr(n, "src", src, sizeof(src)) || !src[0] || !strncasecmp(src, "data:", 5)) &&
             (!attr(n, "data-src", src, sizeof(src)) || !src[0])) {
@@ -306,10 +426,22 @@ static int load_images(int (*each)(void)) {
         resolve_url(base_url, src, url, sizeof(url));
         Fetched f;
         n->img_state = 2;
-        if (fetch_url(url, NULL, &f, error) == 0) {
+        u64 wait_t0 = uptime_ms();
+        int taken = prefetch_take(pictures, url, &f);
+        int got = taken == 1 || (taken == 0 && fetch_url(url, NULL, &f, error) == 0);
+        u64 decode_t0 = uptime_ms();
+        image_wait_ms += decode_t0 - wait_t0;
+        if (got) {
             image *img = malloc(sizeof(image));
-            char why[96];
-            if (img && f.len <= MAX_IMAGE_BYTES && image_decode((unsigned char *)f.body, f.len, img, why) == 0) {
+            char why[96] = "not a picture RDX can show";
+            int nw = 0, nh = 0, cw = n->w - frame_h(n, 0), ch = n->h - frame_v(n, 0);
+            if (img && f.len <= MAX_IMAGE_BYTES && looks_like_svg(f.body, f.len, f.type) &&
+                svg_render_text(f.body, (int)f.len, cw > 0 ? cw : 0, ch > 0 ? ch : 0, n->style.color, img, &nw, &nh) == 0) {
+                n->img = img; /* drawn at its laid-out size (or its own), sized for layout by what it asks for */
+                n->img_w = nw;
+                n->img_h = nh;
+                n->img_state = 1;
+            } else if (img && f.len <= MAX_IMAGE_BYTES && image_decode((unsigned char *)f.body, f.len, img, why) == 0) {
                 n->img = img;
                 n->img_w = img->width;
                 n->img_h = img->height;
@@ -319,6 +451,7 @@ static int load_images(int (*each)(void)) {
                 free(img);
             }
             free(f.body);
+            image_decode_ms += uptime_ms() - decode_t0;
         } else if (getenv("BROWSER_TIMING")) {
             printf("[image] %s: %s\n", url, error);
         }
@@ -481,25 +614,40 @@ static int activate(Node *n) {
     return 0;
 }
 
+#pragma clang section bss="" data=""
+static int dumping;
+#pragma clang section bss=".rlmb$m" data=".rlmd$m"
+
 /* ================================================================ --dump: the page as text */
 
 typedef struct {
     int y, x, index;
 } Placed;
 
+static void print_page_text(void);
+
 static int dump(const char *address) {
     dumping = 1;
+    realm_dumping = 1;
     if (getenv("BROWSER_CONSOLE")) console_echo = 1;
     if (getenv("BROWSER_TRACE")) js_trace_throws = 1;
     load(address, NULL);
     /* Let the page's timers run for a moment, and follow script redirects. */
     for (int hops = 0; hops < 4; hops++) {
         u64 start = uptime_ms();
-        for (int i = 0; i < 400 && !js_navigate; i++) {
-            int t = js_next_timer();
-            if (t < 0 || uptime_ms() - start + (u64)t > 4000) break;
+        int wait = getenv("BROWSER_WAIT") ? atoi(getenv("BROWSER_WAIT")) : 4000;
+        for (int i = 0; i < 4000 && !js_navigate; i++) {
+            int t = realms_next_timer();
+            if (t < 0 || uptime_ms() - start + (u64)t > (u64)wait) break;
             if (t > 0) sleep_ms((u64)t);
             js_run_timers();
+            if (dom_dirty) { /* (new frames start when the page is laid out) */
+                init_controls_mode(1);
+                collect_links();
+                relayout();
+                dom_dirty = 0;
+            }
+            realms_run_others();
             js_maybe_gc();
         }
         if (!js_navigate) break;
@@ -518,12 +666,38 @@ static int dump(const char *address) {
         relayout();
         dom_dirty = 0;
     }
+    update_page_title();
+    if (getenv("BROWSER_DOM") && html_element) { /* the page as it is now, scripts' changes included */
+        Buf b = {0};
+        serialize(html_element, &b, 0);
+        printf("[dom] %s\n", b.p ? b.p : "");
+        free(b.p);
+    }
     if (page_title[0]) printf("Title: %s\n", page_title);
     printf("Connection: %s\n\n", page_security[0] ? page_security : "none");
+    print_page_text();
+    for (int i = 1; i < MAX_REALMS; i++) { /* and what the frames show */
+        if (!realm_list[i].used || realm_list[i].kind != REALM_FRAME) continue;
+        printf("\n--- frame %s (%dx%d) ---\n", realm_list[i].url, realm_list[i].width, realm_list[i].height);
+        realm_switch(i);
+        if (getenv("BROWSER_DOM") && html_element) {
+            Buf b = {0};
+            serialize(html_element, &b, 0);
+            printf("[dom] %s\n", b.p ? b.p : "");
+            free(b.p);
+        }
+        print_page_text();
+        realm_switch(0);
+    }
+    return strcmp(status_text, "Failed") == 0;
+}
+
+/* The page's text items, in reading order. */
+static void print_page_text(void) {
     /* Text items, in reading order: by line (rows of 12 pixels), then left
        to right. */
     Placed *order = malloc(sizeof(Placed) * (size_t)(item_count + 1));
-    if (!order) return 1;
+    if (!order) return;
     int n = 0;
     for (int i = 0; i < item_count; i++) {
         Item *it = &items[i];
@@ -653,13 +827,12 @@ static int dump(const char *address) {
             printf("%4d. %s\n", i + 1, full);
         }
     }
-    return strcmp(status_text, "Failed") == 0;
 }
 
 /* ================================================================ the window */
 
+#pragma clang section bss="" data=""
 static gui_window *win;
-static int scroll;
 static char address[1024];
 static int editing, selected_all;
 static char *history[32];
@@ -679,6 +852,10 @@ static void start_editing(void) {
 }
 
 static void draw(void) {
+    if (realm_now) { /* in a frame: the window is drawn again soon */
+        frames_changed = 1;
+        return;
+    }
     canvas *c = &win->pixels;
     fill_rect(c, 0, 0, W, BAR, 0x2B3245);
     fill_rect(c, 6, 6, 26, BAR - 12, history_count ? 0x4A5878 : 0x353C52);
@@ -744,7 +921,84 @@ static int image_progress(void) {
     return 0;
 }
 
+/* The element a #fragment names (id, or <a name>). */
+static Node *fragment_target(const char *frag) {
+    char want[512];
+    int k = 0;
+    for (const char *p = frag; *p && k < 511; p++) { /* %xx escapes */
+        if (*p == '%' && hex_digit(p[1]) >= 0 && hex_digit(p[2]) >= 0) {
+            want[k++] = (char)(hex_digit(p[1]) * 16 + hex_digit(p[2]));
+            p += 2;
+        } else {
+            want[k++] = *p;
+        }
+    }
+    want[k] = 0;
+    if (!want[0]) return NULL;
+    char v[512];
+    for (Node *n = document; n; n = next_in_tree(n, document)) {
+        if (n->type != NODE_ELEMENT) continue;
+        if (attr(n, "id", v, sizeof(v)) && !strcmp(v, want)) return n;
+        if (is(n->tag, "a") && attr(n, "name", v, sizeof(v)) && !strcmp(v, want)) return n;
+    }
+    return NULL;
+}
+
+static int max_scroll(void);
+
+/* Scroll so that the #fragment's element is at the top. */
+static void scroll_to_fragment(const char *url) {
+    const char *hash = strchr(url, '#');
+    Node *n = hash ? fragment_target(hash + 1) : NULL;
+    if (!n) return;
+    /* an element with no box of its own (an empty anchor): the next one with a box */
+    for (Node *m = n; m && !(n->w || n->h); m = next_in_tree(m, document)) {
+        if (m->type == NODE_ELEMENT && (m->w || m->h)) {
+            n = m;
+            break;
+        }
+    }
+    scroll = n->y > 4 ? n->y - 4 : 0;
+    if (scroll > max_scroll()) scroll = max_scroll();
+    page_scroll_y = scroll;
+}
+
+/* Is `url` the page already showing (apart from its #fragment)? */
+static int same_page(const char *url) {
+    const char *a = strchr(url, '#'), *b = strchr(current_url, '#');
+    size_t la = a ? (size_t)(a - url) : strlen(url), lb = b ? (size_t)(b - current_url) : strlen(current_url);
+    return la == lb && !strncmp(url, current_url, la) && document;
+}
+
+/* A frame goes to another page. */
+static void frame_go(const char *url, const char *post) {
+    static char target[2048], body[8192];
+    strncpy(target, url, sizeof(target) - 1);
+    if (post) strncpy(body, post, sizeof(body) - 1);
+    load(target, post ? body : NULL);
+    load_images(NULL);
+    page_loaded = 1;
+    js_fire(NULL, "load", 0, 0);
+    relayout();
+    frames_changed = 1;
+}
+
 static void go(const char *url, int remember, const char *post) {
+    if (realm_now) {
+        frame_go(url, post);
+        return;
+    }
+    if (!post && !dumping && strchr(url, '#') && same_page(url)) { /* a place in this page: just scroll there */
+        if (remember && history_count < 32) {
+            history[history_count] = copy_of(current_url, (int)strlen(current_url));
+            if (history[history_count]) history_count++;
+        }
+        strncpy(current_url, url, sizeof(current_url) - 1);
+        current_url[sizeof(current_url) - 1] = 0;
+        scroll_to_fragment(url);
+        draw();
+        return;
+    }
     navigate_requested = 1;
     if (remember && current_url[0] && history_count < 32) {
         history[history_count] = copy_of(current_url, (int)strlen(current_url));
@@ -762,6 +1016,8 @@ static void go(const char *url, int remember, const char *post) {
     scroll = 0;
     navigate_requested = 0;
     if (dumping) return;
+    scroll_to_fragment(current_url);
+    int fragment_scroll = scroll;
     set_window_title();
     draw();
     char saved_status[200];
@@ -771,13 +1027,41 @@ static void go(const char *url, int remember, const char *post) {
         page_loaded = 1;
         js_fire(NULL, "load", 0, 0);
         relayout();
+        /* pictures moved things down: the #place again, unless the user scrolled meanwhile */
+        if (scroll == fragment_scroll) scroll_to_fragment(current_url);
         draw();
         after_js();
     }
 }
 
+/* The same in a frame (or worker). */
+static void frame_after_js(void) {
+    run_microtasks();
+    if (js_navigate) {
+        char *url = js_navigate;
+        js_navigate = NULL;
+        if (strncmp(url, "rdx-back:", 9) && document) frame_go(url, NULL);
+        free(url);
+        return;
+    }
+    if (dom_dirty && document) {
+        init_controls_mode(1);
+        collect_links();
+        relayout();
+        dom_dirty = 0;
+        load_images(NULL);
+        relayout();
+        frames_changed = 1;
+    }
+    js_maybe_gc();
+}
+
 /* After scripts ran (an event, a timer): do what they asked for. */
 static void after_js(void) {
+    if (realm_now) {
+        frame_after_js();
+        return;
+    }
     if (js_navigate) {
         char *url = js_navigate;
         js_navigate = NULL;
@@ -793,6 +1077,7 @@ static void after_js(void) {
         redraw = 1;
     }
     if (dom_dirty) {
+        if (update_page_title()) set_window_title();
         init_controls_mode(1);
         collect_links();
         relayout();
@@ -996,6 +1281,26 @@ static void key(int k) {
     }
 }
 
+static int is_checkbox(Node *n) {
+    char type[16] = "";
+    return n && n->type == NODE_ELEMENT && is(n->tag, "input") && attr(n, "type", type, sizeof(type)) && !strcasecmp_word(type, "checkbox");
+}
+
+/* A checkbox clicked (directly, or through its label): as in browsers, it
+   changes before the click event, back again if a script cancels it,
+   and input and change follow. */
+static void checkbox_clicked(Node *box, int already_toggled, int prevented) {
+    if (!already_toggled) box->checked = !box->checked;
+    if (prevented) {
+        box->checked = !box->checked;
+        return;
+    }
+    js_fire(box, "input", 1, 0);
+    js_fire(box, "change", 1, 0);
+}
+
+static JsObj *mouse_event(const char *type, int bubbles, Node *t, int x, int vy, int buttons);
+
 static Node *control_for_label(Node *label) {
     char id[64], other[64];
     if (attr(label, "for", id, sizeof(id))) {
@@ -1033,6 +1338,18 @@ static void click(int x, int y) {
         scroll_by(vy < thumb_top ? -(track - 40) : track - 40);
         return;
     }
+    click_page(x, vy);
+    if (frames_changed) {
+        frames_changed = 0;
+        draw();
+    }
+}
+
+/* A click at (x, vy) in the page's view (in the running realm). */
+static int click_page(int x, int vy) {
+    for (Node *f = node_at(x, vy + scroll); f; f = f->parent) { /* in a frame: its page's */
+        if (f->type == NODE_ELEMENT && is(f->tag, "iframe") && frame_click(f, x, vy + scroll)) return 1;
+    }
     int i = item_at(x, vy + scroll);
     Node *target = i >= 0 ? items[i].node : NULL;
     if (i < 0 || items[i].kind == IT_RECT) { /* not on text: the innermost box there */
@@ -1041,23 +1358,50 @@ static void click(int x, int y) {
     }
     static char href[2048];
     href[0] = 0;
+    Node *toggled = NULL;
     if (i >= 0 && items[i].link >= 0) resolve_url(base_url, links[items[i].link], href, sizeof(href));
     /* Scripts first: they may handle the click themselves. */
     if (js_enabled && global_obj) {
         Node *t = target ? target : body_element;
-        js_fire(t, "mousedown", 1, 1);
-        js_fire(t, "mouseup", 1, 1);
-        JsObj *e = new_event("click", 1, 1);
-        prop_set_raw(e, intern_c("clientX"), v_num(x), 0);
-        prop_set_raw(e, intern_c("clientY"), v_num(vy), 0);
-        prop_set_raw(e, intern_c("pageX"), v_num(x), 0);
-        prop_set_raw(e, intern_c("pageY"), v_num(vy + scroll), 0);
-        prop_set_raw(e, intern_c("button"), v_num(0), 0);
-        prop_set_raw(e, intern_c("which"), v_num(1), 0);
-        int prevented = js_dispatch(t, e);
+        if (is_checkbox(t)) { /* (changed before the click is seen) */
+            t->checked = !t->checked;
+            toggled = t;
+        }
+        static const char *const before[] = {"pointerover", "pointerenter", "mouseover", "mouseenter", "pointermove", "mousemove",
+                                             "pointerdown", "mousedown", "focus", "pointerup", "mouseup"};
+        int prevented = 0;
+        for (int k = 0; k < 12; k++) { /* the events a real click makes, then the click */
+            JsObj *e = new_event(k < 11 ? before[k] : "click", k < 11 ? strcmp(before[k], "mouseenter") && strcmp(before[k], "pointerenter") && strcmp(before[k], "focus") : 1, 1);
+            prop_set_raw(e, intern_c("clientX"), v_num(x), 0);
+            prop_set_raw(e, intern_c("clientY"), v_num(vy), 0);
+            prop_set_raw(e, intern_c("pageX"), v_num(x), 0);
+            prop_set_raw(e, intern_c("pageY"), v_num(vy + scroll), 0);
+            prop_set_raw(e, intern_c("screenX"), v_num(x + 112), 0);
+            prop_set_raw(e, intern_c("screenY"), v_num(vy + 146), 0);
+            prop_set_raw(e, intern_c("offsetX"), v_num(t && t->w ? x - t->x : 0), 0);
+            prop_set_raw(e, intern_c("offsetY"), v_num(t && t->h ? vy + scroll - t->y : 0), 0);
+            prop_set_raw(e, intern_c("button"), v_num(0), 0);
+            prop_set_raw(e, intern_c("buttons"), v_num(k >= 6 && k < 9 ? 1 : 0), 0);
+            prop_set_raw(e, intern_c("which"), v_num(1), 0);
+            prop_set_raw(e, intern_c("detail"), v_num(1), 0);
+            prop_set_raw(e, intern_c("pointerId"), v_num(1), 0);
+            prop_set_raw(e, intern_c("pointerType"), v_str(intern_c("mouse")), 0);
+            prop_set_raw(e, intern_c("isPrimary"), v_bool(1), 0);
+            int p = js_dispatch(t, e);
+            if (k == 11) prevented = p;
+            if (js_navigate) break;
+        }
+        if (toggled) {
+            focused_node = toggled;
+            checkbox_clicked(toggled, 1, prevented);
+            after_js();
+            relayout();
+            draw();
+            return 1;
+        }
         if (prevented || js_navigate) {
             after_js();
-            return;
+            return 1;
         }
         if (dom_dirty) after_js(); /* (the clicked node is still there: scripts hold it) */
     }
@@ -1067,21 +1411,31 @@ static void click(int x, int y) {
         if (is(n->tag, "input") || is(n->tag, "select") || is(n->tag, "textarea") || is(n->tag, "button")) {
             focused_node = n;
             if (!is_text_control(n) && activate(n)) {
-                if (navigate_requested) return;
+                if (navigate_requested) return 1;
                 relayout();
             }
             draw();
-            return;
+            return 1;
         }
         if (is(n->tag, "label")) {
             Node *control = control_for_label(n);
+            if (control && is_checkbox(control) && js_enabled && global_obj) { /* the label clicks its checkbox */
+                focused_node = control;
+                control->checked = !control->checked;
+                int p = js_dispatch(control, mouse_event("click", 1, control, x, vy, 0));
+                checkbox_clicked(control, 1, p);
+                after_js();
+                relayout();
+                draw();
+                return 1;
+            }
             if (control) {
                 focused_node = control;
                 if (!is_text_control(control)) activate(control);
-                if (navigate_requested) return;
+                if (navigate_requested) return 1;
                 relayout();
                 draw();
-                return;
+                return 1;
             }
         }
     }
@@ -1093,21 +1447,37 @@ static void click(int x, int y) {
                 run_microtasks();
                 after_js();
             }
-            return;
+            return 1;
         }
-        if (!strncasecmp(url, "mailto:", 7)) return;
+        if (!strncasecmp(url, "mailto:", 7)) return 1;
         if (!strncasecmp(url, "rdx-proceed:", 12)) { /* the user chose to open an unverified site */
             allow_insecure(url + 12);
             go(url + 12, 0, NULL);
-            return;
+            return 1;
         }
         go(url, 1, NULL);
-        return;
+        return 1;
     }
     if (focused_node) {
         focused_node = NULL;
         draw();
     }
+    return 1;
+}
+
+static JsObj *mouse_event(const char *type, int bubbles, Node *t, int x, int vy, int buttons) {
+    JsObj *e = new_event(type, bubbles, 1);
+    prop_set_raw(e, intern_c("clientX"), v_num(x), 0);
+    prop_set_raw(e, intern_c("clientY"), v_num(vy), 0);
+    prop_set_raw(e, intern_c("pageX"), v_num(x), 0);
+    prop_set_raw(e, intern_c("pageY"), v_num(vy + scroll), 0);
+    prop_set_raw(e, intern_c("offsetX"), v_num(t && t->w ? x - t->x : 0), 0);
+    prop_set_raw(e, intern_c("offsetY"), v_num(t && t->h ? vy + scroll - t->y : 0), 0);
+    prop_set_raw(e, intern_c("button"), v_num(0), 0);
+    prop_set_raw(e, intern_c("buttons"), v_num(buttons), 0);
+    prop_set_raw(e, intern_c("which"), v_num(1), 0);
+    prop_set_raw(e, intern_c("detail"), v_num(1), 0);
+    return e;
 }
 
 static int last_buttons;
@@ -1122,7 +1492,12 @@ static void handle(gui_message *m) {
 }
 
 int main(int argc, char **argv) {
+    char stack_top;
+    realm_boot(&stack_top); /* (first: it keeps the page code's statics as they start) */
     GUI_PROGRAM();
+    js_stack_top = &stack_top; /* for collecting garbage while scripts run */
+    if (getenv("BROWSER_CONSOLE")) console_echo = 1;
+    if (getenv("BROWSER_TRACE")) js_trace_throws = 1;
     if (getenv("BROWSER_NOJS")) js_enabled = 0; /* scripts off */
     if (argc > 2 && strcmp(argv[1], "--dump") == 0) return dump(argv[2]);
     if (gui_connect() < 0) {
@@ -1135,7 +1510,7 @@ int main(int argc, char **argv) {
     go(argc > 1 ? argv[1] : HOME, 0, NULL);
     gui_message m;
     for (;;) {
-        int got = gui_next(&m, js_next_timer());
+        int got = gui_next(&m, realms_next_timer());
         if (got < 0) return 0;
         if (got > 0) {
             if (m.type == MSG_CLOSE) break;
@@ -1143,7 +1518,13 @@ int main(int argc, char **argv) {
         }
         js_run_timers();
         after_js();
+        realms_run_others();
+        if (frames_changed) {
+            frames_changed = 0;
+            draw();
+        }
     }
+    cookies_save();
     gui_window_close(win);
     return 0;
 }

@@ -8,28 +8,33 @@ enum {
     N_HOLE, N_NEWTARGET, N_TAGGED,
     /* statements */
     N_VAR, N_DECL, N_EXPR, N_BLOCK, N_IF, N_FOR, N_FORIN, N_WHILE, N_DOWHILE, N_RETURN, N_BREAK, N_CONTINUE,
-    N_THROW, N_TRY, N_SWITCH, N_CASE, N_FUNCDECL, N_CLASSDECL, N_EMPTY, N_LABEL
+    N_THROW, N_TRY, N_SWITCH, N_CASE, N_FUNCDECL, N_CLASSDECL, N_EMPTY, N_LABEL,
+    /* a function body not parsed yet: num = where its { is in the source,
+       op = just past its }, line = its line, cache = the source */
+    N_LAZY
 };
 
 /* flags */
 enum {
     F_ARROW = 1, F_EXPR_BODY = 2, F_ASYNC = 4, F_METHOD = 8, F_GETTER = 16, F_SETTER = 32, F_STATIC = 64,
     F_COMPUTED = 128, F_SHORTHAND = 256, F_SPREAD = 512, F_OPTIONAL = 1024, F_PREFIX = 2048, F_FOR_OF = 4096,
-    F_FIELD = 8192, F_USES_ARGS = 16384, F_LEXICAL = 32768, F_CTOR = 65536, F_GENERATOR = 131072, F_CHAIN = 262144
+    F_FIELD = 8192, F_USES_ARGS = 16384, F_LEXICAL = 32768, F_CTOR = 65536, F_GENERATOR = 131072, F_CHAIN = 262144,
+    /* a lazy body (N_LAZY) starts "use strict" / mentions `arguments` */
+    F_LAZY_STRICT = 524288, F_LAZY_ARGS = 1048576
 };
 
-struct Ast {
-    unsigned char type;
-    int flags;
+struct Ast { /* (88 bytes: big scripts make hundreds of thousands) */
+    unsigned type : 8;
+    unsigned flags : 24;
     int op;      /* operator (punctuator code), or 'v' / 'l' / 'c' for var / let / const */
     int line;
+    int cache_len;
     Ast *a, *b, *c, *d;
     Ast *list;   /* first child of a list */
     Ast *next;   /* next in the list this node is in */
     double num;
     JsStr *str;
     void *cache;   /* function: hoisted names; regex: compiled program */
-    int cache_len;
 };
 
 /* Punctuators are packed as up to four characters. */
@@ -40,7 +45,9 @@ struct Ast {
 
 static int memchr_safe(const char *s, int n, char c);
 
-enum { T_EOF, T_NUM, T_STR, T_IDENT, T_PUNCT, T_REGEX, T_TPL_FULL, T_TPL_HEAD, T_TPL_MID, T_TPL_TAIL, T_PRIVATE };
+enum { T_EOF, T_NUM, T_STR, T_IDENT, T_PUNCT, T_REGEX, T_TPL_FULL, T_TPL_HEAD, T_TPL_MID, T_TPL_TAIL, T_PRIVATE, T_BIG };
+
+static JsStr *bigint_literal(const char *text, int len); /* (js_bigint.c) */
 
 typedef struct {
     int type;
@@ -66,7 +73,8 @@ typedef struct {
 
 static Lexer L;
 static int parse_failed;
-static char parse_error[200];
+static char parse_error[300];
+static void syntax_error(const char *what);
 
 /* Syntax trees live in an arena that is freed with the page. */
 typedef struct Arena {
@@ -75,9 +83,10 @@ typedef struct Arena {
     char data[65536 - 32];
 } Arena;
 static Arena *ast_arena;
+static int arena_chunks; /* (64 KiB each) */
 
 static void *arena_alloc(int size) {
-    size = (size + 15) & ~15;
+    size = (size + 7) & ~7;
     if (!ast_arena || ast_arena->used + size > (int)sizeof(ast_arena->data)) {
         Arena *a = malloc(sizeof(Arena));
         if (!a) {
@@ -89,6 +98,7 @@ static void *arena_alloc(int size) {
         a->next = ast_arena;
         a->used = 0;
         ast_arena = a;
+        arena_chunks++;
     }
     void *p = ast_arena->data + ast_arena->used;
     ast_arena->used += size;
@@ -96,10 +106,27 @@ static void *arena_alloc(int size) {
     return p;
 }
 
+/* Scripts' source text, kept while their syntax trees live: function
+   bodies are parsed only when first called (most of a big page's code
+   never is, and a parsed tree takes about 20 times the source's size). */
+typedef struct KeptSource {
+    struct KeptSource *next;
+    char text[];
+} KeptSource;
+static KeptSource *kept_sources;
+static size_t kept_bytes;
+
 static void arena_free_all(void) {
+    kept_bytes = 0;
+    while (kept_sources) {
+        KeptSource *next = kept_sources->next;
+        free(kept_sources);
+        kept_sources = next;
+    }
     while (ast_arena) {
         Arena *next = ast_arena->next;
         free(ast_arena);
+        arena_chunks--;
         ast_arena = next;
     }
 }
@@ -109,6 +136,19 @@ static Ast *node(int type) {
     n->type = (unsigned char)type;
     n->line = L.tok.line;
     return n;
+}
+
+static char *parse_stack_base;
+static char *js_stack_base; /* (js_eval.c: where scripts began on the stack) */
+
+/* Too deep to go on safely? (deeply nested code would exhaust the stack) */
+static int parse_too_deep(void) {
+    char here;
+    if (parse_stack_base && parse_stack_base - &here > 6500000) { /* (of the 8 MiB the main stack may grow to) */
+        syntax_error("the code is nested too deeply");
+        return 1;
+    }
+    return 0;
 }
 
 static void syntax_error(const char *what) {
@@ -126,7 +166,13 @@ static void syntax_error(const char *what) {
     strncat_safe(parse_error, what, 120);
     strncat_safe(parse_error, " (line ", 8);
     strncat_safe(parse_error, line, 12);
-    strncat_safe(parse_error, ")", 2);
+    strncat_safe(parse_error, ", near: ", 9);
+    /* the code around the problem, on one line */
+    char near[64];
+    int from = L.tok.start - 30 > 0 ? L.tok.start - 30 : 0, k2 = 0;
+    for (int i = from; i < L.len && i < from + 60 && k2 < 63; i++) near[k2++] = L.src[i] == '\n' || L.src[i] == '\r' || L.src[i] == '\t' ? ' ' : L.src[i];
+    near[k2] = 0;
+    strncat_safe(parse_error, near, 64);
 }
 
 /* ---------------------------------------------------------------- the lexer */
@@ -339,6 +385,12 @@ static void next_token(void) {
             if (L.src[L.pos] != '_' && L.src[L.pos] != 'n' && k < 127) text[k++] = L.src[L.pos];
             L.pos++;
         }
+        if (L.src[L.pos - 1] == 'n') { /* a BigInt: 123n, 0x1fn */
+            t->str = bigint_literal(text, k);
+            t->type = T_BIG;
+            L.regex_ok = 0;
+            return;
+        }
         /* legacy octal 0777 */
         if (k > 1 && text[0] == '0' && text[1] >= '0' && text[1] <= '7') {
             double v = 0;
@@ -508,6 +560,7 @@ static Ast *parse_statement(void);
 static Ast *parse_function(int is_expr, int flags);
 static Ast *parse_class(int is_expr);
 static Ast *parse_block_body(void);
+static void parse_function_body(Ast *fn);
 
 /* Append to a list kept as (first, last). */
 static void list_add(Ast **first, Ast **last, Ast *n) {
@@ -645,21 +698,103 @@ static Ast *parse_array_literal(void) {
     return a;
 }
 
+/* Whether the ( at a source position starts an arrow function's
+   parameters, remembered: finding out means reading ahead to its ), and
+   without this, code nested in many parentheses (as bundles are) would be
+   read again for each of them. */
+static int *arrow_memo_pos;          /* position + 1; 0: empty */
+static unsigned char *arrow_memo_val; /* 1 no, 2 yes */
+static int arrow_memo_cap, arrow_memo_n;
+
+static void arrow_memo_clear(void) {
+    free(arrow_memo_pos);
+    free(arrow_memo_val);
+    arrow_memo_pos = NULL;
+    arrow_memo_val = NULL;
+    arrow_memo_cap = arrow_memo_n = 0;
+}
+
+static int arrow_memo_get(int pos) {
+    if (!arrow_memo_cap) return 0;
+    unsigned h = ((unsigned)pos * 2654435761u) & (unsigned)(arrow_memo_cap - 1);
+    while (arrow_memo_pos[h]) {
+        if (arrow_memo_pos[h] == pos + 1) return arrow_memo_val[h];
+        h = (h + 1) & (unsigned)(arrow_memo_cap - 1);
+    }
+    return 0;
+}
+
+static void arrow_memo_put(int pos, int val) {
+    if ((arrow_memo_n + 1) * 2 > arrow_memo_cap) {
+        int cap = arrow_memo_cap ? arrow_memo_cap * 2 : 1024;
+        int *np = malloc(sizeof(int) * (size_t)cap);
+        unsigned char *nv = malloc((size_t)cap);
+        if (np) memset(np, 0, sizeof(int) * (size_t)cap);
+        if (nv) memset(nv, 0, (size_t)cap);
+        if (!np || !nv) {
+            free(np);
+            free(nv);
+            return; /* (then it is just found out again) */
+        }
+        for (int i = 0; i < arrow_memo_cap; i++) {
+            if (!arrow_memo_pos[i]) continue;
+            unsigned h = ((unsigned)(arrow_memo_pos[i] - 1) * 2654435761u) & (unsigned)(cap - 1);
+            while (np[h]) h = (h + 1) & (unsigned)(cap - 1);
+            np[h] = arrow_memo_pos[i];
+            nv[h] = arrow_memo_val[i];
+        }
+        free(arrow_memo_pos);
+        free(arrow_memo_val);
+        arrow_memo_pos = np;
+        arrow_memo_val = nv;
+        arrow_memo_cap = cap;
+    }
+    unsigned h = ((unsigned)pos * 2654435761u) & (unsigned)(arrow_memo_cap - 1);
+    while (arrow_memo_pos[h]) {
+        if (arrow_memo_pos[h] == pos + 1) {
+            arrow_memo_val[h] = (unsigned char)val;
+            return;
+        }
+        h = (h + 1) & (unsigned)(arrow_memo_cap - 1);
+    }
+    arrow_memo_pos[h] = pos + 1;
+    arrow_memo_val[h] = (unsigned char)val;
+    arrow_memo_n++;
+}
+
 /* Is the ( here the start of an arrow function's parameters? */
 static int arrow_ahead(void) {
+    int first = L.tok.start;
+    int known = arrow_memo_get(first);
+    if (known) return known == 2;
     Saved s;
     save_state(&s);
-    int depth = 0, result = 0;
+    enum { DEPTH = 512 };
+    int starts[DEPTH];
+    unsigned char paren[DEPTH];
+    int depth = 0, result = 0, closed = -1; /* closed: where the ( just closed began */
     for (;;) {
-        if (L.tok.type == T_EOF) break;
-        if (is_p('(') || is_p('[') || is_p('{')) depth++;
-        if (is_p(')') || is_p(']') || is_p('}')) {
-            depth--;
-            if (depth == 0) {
-                next_token();
-                result = is_p(P2('=', '>')) && !L.tok.newline_before;
+        if (closed >= 0) { /* the token after a (...) */
+            int yes = is_p(P2('=', '>')) && !L.tok.newline_before;
+            arrow_memo_put(closed, yes ? 2 : 1);
+            if (closed == first) {
+                result = yes;
                 break;
             }
+            closed = -1;
+        }
+        if (L.tok.type == T_EOF) break;
+        if (is_p('(') || is_p('[') || is_p('{')) {
+            if (depth < DEPTH) {
+                starts[depth] = L.tok.start;
+                paren[depth] = is_p('(');
+            }
+            depth++;
+        } else if (is_p(')') || is_p(']') || is_p('}')) {
+            depth--;
+            if (depth < 0) break;
+            if (depth < DEPTH && paren[depth]) closed = starts[depth];
+            else if (depth == 0) break;
         }
         next_token();
     }
@@ -690,11 +825,12 @@ static Ast *parse_arguments(void) {
 /* Arrow function: parameters (already as a list) and a body. */
 static Ast *parse_arrow_body(Ast *params, int flags) {
     Ast *f = node(N_FUNC);
+    f->cache_len = L.tok.start + 1; /* where it starts (for messages) */
     f->flags = F_ARROW | flags;
     f->list = params;
     expect(P2('=', '>'), "=>");
     if (is_p('{')) {
-        f->a = parse_block_body();
+        parse_function_body(f);
     } else {
         f->flags |= F_EXPR_BODY;
         f->a = parse_assign(0);
@@ -725,6 +861,13 @@ static Ast *parse_primary(void) {
     if (t.type == T_NUM) {
         Ast *n = node(N_NUM);
         n->num = t.num;
+        next_token();
+        return n;
+    }
+    if (t.type == T_BIG) { /* an N_NUM holding a BigInt (op 'n') */
+        Ast *n = node(N_NUM);
+        n->op = 'n';
+        n->str = t.str;
         next_token();
         return n;
     }
@@ -898,6 +1041,7 @@ static Ast *parse_call_member(void) {
             e = m;
         } else if (is_p('(')) {
             Ast *c = node(N_CALL);
+            c->cache_len = L.tok.start + 1; /* where its ( is: for error messages */
             c->a = e;
             if (in_optional) c->flags |= F_CHAIN;
             c->list = parse_arguments();
@@ -1030,7 +1174,7 @@ static int is_assign_op(int p) {
 }
 
 static Ast *parse_assign(int no_in) {
-    if (parse_failed) return node(N_EMPTY);
+    if (parse_failed || parse_too_deep()) return node(N_EMPTY);
     if (is_word("yield")) {
         syntax_error("generators (yield) are not supported");
         return node(N_EMPTY);
@@ -1074,9 +1218,89 @@ static Ast *parse_block_body(void) {
     return b;
 }
 
+#define LAZY_MIN_BYTES 256
+static int lazy_bodies;       /* parse_script set this: bodies may be left for later */
+static int stat_lazy_made, stat_lazy_small, stat_lazy_parsed;
+static JsStr *S_arguments_word;
+
+/* A function's { body }: parsed now, or (if it is big) only skimmed to its
+   end and parsed when the function is first called. Sets fn->a. */
+static void parse_function_body(Ast *fn) {
+    if (!lazy_bodies || !is_p('{') || parse_failed) {
+        fn->a = parse_block_body();
+        return;
+    }
+    if (!S_arguments_word) S_arguments_word = intern_c("arguments");
+    Saved s;
+    save_state(&s);
+    int start = L.tok.start, line = L.tok.line, depth = 0, strict = 0, args = 0, first = 1;
+    for (;;) {
+        if (L.tok.type == T_EOF || parse_failed) break;
+        if (is_p('{')) depth++;
+        else if (is_p('}') && --depth == 0) break;
+        next_token();
+        if (first) { /* the body's first statement: a "use strict" directive? */
+            strict = L.tok.type == T_STR && L.tok.str && L.tok.str->len == 10 && !memcmp(L.tok.str->s, "use strict", 10);
+            first = 0;
+        }
+        if (L.tok.type == T_IDENT && L.tok.str == S_arguments_word) args = 1;
+    }
+    int end = L.tok.start + 1;
+    if (L.tok.type == T_EOF || parse_failed || end - start < LAZY_MIN_BYTES) { /* small (or broken): parse it now */
+        int failed = parse_failed;
+        restore_state(&s);
+        parse_failed = failed && parse_failed;
+        stat_lazy_small++;
+        fn->a = parse_block_body();
+        return;
+    }
+    stat_lazy_made++;
+    next_token(); /* } */
+    Ast *lazy = node(N_LAZY);
+    lazy->num = start;
+    lazy->op = end;
+    lazy->line = line;
+    lazy->cache = (void *)L.src;
+    fn->a = lazy;
+    if (strict) fn->flags |= F_LAZY_STRICT;
+    if (args) fn->flags |= F_LAZY_ARGS;
+}
+
+/* Parse a lazy body now (the function is being called). 0, or -1 with
+   the reason in parse_error. */
+static int parse_lazy_body(Ast *fn) {
+    Ast *lazy = fn->a;
+    stat_lazy_parsed++;
+    Lexer saved_lexer = L;
+    int saved_failed = parse_failed;
+    char *saved_base = parse_stack_base;
+    char base;
+    parse_stack_base = js_stack_base && js_stack_base > &base ? js_stack_base : &base; /* (measured from where scripts began) */
+    memset(&L, 0, sizeof(L));
+    L.src = lazy->cache;
+    L.len = lazy->op;
+    L.pos = (int)lazy->num;
+    L.line = lazy->line;
+    L.regex_ok = 1;
+    parse_failed = 0;
+    parse_error[0] = 0;
+    arrow_memo_clear();
+    lazy_bodies = 1;
+    next_token();
+    Ast *body = parse_block_body();
+    arrow_memo_clear();
+    int ok = !parse_failed;
+    if (ok) fn->a = body;
+    L = saved_lexer;
+    parse_failed = saved_failed;
+    parse_stack_base = saved_base;
+    return ok ? 0 : -1;
+}
+
 /* function [name] (params) { body }; with is_expr, the name is optional. */
 static Ast *parse_function(int is_expr, int flags) {
     Ast *f = node(N_FUNC);
+    f->cache_len = L.tok.start + 1; /* where it starts (for messages) */
     f->flags = flags;
     if (!(flags & F_METHOD)) {
         next_token(); /* function */
@@ -1096,7 +1320,7 @@ static Ast *parse_function(int is_expr, int flags) {
         return f;
     }
     f->list = parse_paren_params();
-    f->a = parse_block_body();
+    parse_function_body(f);
     return f;
 }
 
@@ -1201,7 +1425,7 @@ static int lexical_start(void) {
 }
 
 static Ast *parse_statement(void) {
-    if (parse_failed) return NULL;
+    if (parse_failed || parse_too_deep()) return NULL;
     if (L.tok.type == T_PUNCT) {
         if (is_p('{')) return parse_block_body();
         if (eat(';')) return node(N_EMPTY);
@@ -1415,6 +1639,21 @@ static Ast *parse_statement(void) {
 
 /* Parse a whole script. NULL (with parse_error set) if it has a syntax error. */
 static Ast *parse_script(const char *src, int len) {
+    char base;
+    parse_stack_base = js_stack_base && js_stack_base > &base ? js_stack_base : &base; /* (eval runs inside scripts) */
+    arrow_memo_clear();
+    /* the source is kept (bodies are parsed later from it) */
+    lazy_bodies = 0;
+    KeptSource *kept = len >= 4096 ? malloc(sizeof(KeptSource) + (size_t)len + 1) : NULL;
+    if (kept) {
+        memcpy(kept->text, src, (size_t)len);
+        kept->text[len] = 0;
+        kept->next = kept_sources;
+        kept_sources = kept;
+        kept_bytes += (size_t)len;
+        src = kept->text;
+        lazy_bodies = 1;
+    }
     memset(&L, 0, sizeof(L));
     L.src = src;
     L.len = len;
@@ -1426,5 +1665,6 @@ static Ast *parse_script(const char *src, int len) {
     Ast *program = node(N_BLOCK), *first = NULL, *last = NULL;
     while (L.tok.type != T_EOF && !parse_failed) list_add(&first, &last, parse_statement());
     program->list = first;
+    arrow_memo_clear();
     return parse_failed ? NULL : program;
 }

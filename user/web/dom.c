@@ -28,6 +28,42 @@ static char *copy_of(const char *s, int n) {
 }
 
 /* Append at most `most` bytes of `src` to `dst`. */
+/* (the runtime has no strcat / strncpy / strrchr / memchr / strcspn) */
+static char *web_strcat(char *d, const char *s) {
+    strcpy(d + strlen(d), s);
+    return d;
+}
+static char *web_strncpy(char *d, const char *s, size_t n) {
+    size_t i = 0;
+    for (; i < n && s[i]; i++) d[i] = s[i];
+    for (; i < n; i++) d[i] = 0;
+    return d;
+}
+static char *web_strrchr(const char *s, int c) {
+    const char *last = NULL;
+    for (; *s; s++) {
+        if (*s == (char)c) last = s;
+    }
+    return (char *)last;
+}
+static void *web_memchr(const void *p, int c, size_t n) {
+    const unsigned char *b = p;
+    for (size_t i = 0; i < n; i++) {
+        if (b[i] == (unsigned char)c) return (void *)(b + i);
+    }
+    return NULL;
+}
+static size_t web_strcspn(const char *s, const char *reject) {
+    size_t n = 0;
+    while (s[n] && !strchr(reject, s[n])) n++;
+    return n;
+}
+#define strcat web_strcat
+#define strncpy web_strncpy
+#define strrchr web_strrchr
+#define memchr web_memchr
+#define strcspn web_strcspn
+
 static void strncat_safe(char *dst, const char *src, size_t most) {
     size_t at = strlen(dst);
     for (size_t i = 0; src[i] && i < most; i++) dst[at++] = src[i];
@@ -54,6 +90,8 @@ typedef struct {
     int indent;                     /* text-indent, px */
     /* not inherited */
     unsigned char display, position, floating, clear, box_sizing, overflow_hidden, clip_rect;
+    unsigned char masked; /* a mask-image we cannot apply: its background stays unpainted */
+    unsigned char caption_bottom; /* caption-side: bottom */
     unsigned background;
     unsigned char has_background;
     int margin[4];                  /* px, AUTO for auto */
@@ -104,6 +142,8 @@ struct Node {
     unsigned tag_key, id_key, class_keys[8];
     unsigned char class_count;
     unsigned long long ancestors[4]; /* a filter of the keys of all its ancestors */
+    char *css_vars;          /* its CSS custom properties: "--name\0value\0" pairs */
+    int css_vars_len;
 };
 
 static Node *document;     /* the root (#document) */
@@ -167,6 +207,7 @@ static void free_tree(Node *n) {
     free(n->attrs);
     free(n->text);
     free(n->value);
+    free(n->css_vars);
     if (n->img) {
         image_free((image *)n->img);
         free(n->img);
@@ -525,6 +566,7 @@ static void parse_html(const char *html, int len) {
             j++;
         }
         int attrs_len = j - attrs_start;
+        int self_closing = j > attrs_start && html[j - 1] == '/'; /* <path ... /> */
         while (attrs_len > 0 && (is_space(html[attrs_start + attrs_len - 1]) || html[attrs_start + attrs_len - 1] == '/')) attrs_len--;
         i = j < len ? j + 1 : len;
 
@@ -613,7 +655,8 @@ static void parse_html(const char *html, int len) {
             i = k < len ? k + 1 : len;
             continue;
         }
-        if (!in_list(name, VOID_TAGS)) current = e;
+        /* In SVG, <x/> is complete; in HTML the slash means nothing. */
+        if (!in_list(name, VOID_TAGS) && !(self_closing && open_element(e, "svg", NULL))) current = e;
     }
 }
 

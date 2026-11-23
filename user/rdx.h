@@ -19,6 +19,7 @@ int getchar(void);                              /* wait for one key (or byte of 
 int isatty(int fd);                             /* is this descriptor the console, not a pipe or file? */
 int pollchar(void);                             /* a key if one is waiting, else -1 */
 void sleep_ms(u64 ms);
+size_t heap_free_bytes(void);                   /* bytes in the allocator's free blocks */
 u64 uptime_ms(void);                            /* milliseconds since boot */
 int getpid(void);
 void *sbrk(i64 increment);                      /* grow the heap; NULL on failure */

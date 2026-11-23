@@ -82,7 +82,12 @@ const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
 
-const RECV_CAPACITY: usize = 64 * 1024;
+/// How much we accept before the application reads it. More than 64 KiB
+/// needs window scaling (RFC 7323): without it, a download can go no faster
+/// than 64 KiB per round trip.
+const RECV_CAPACITY: usize = 1024 * 1024;
+/// The window scale we offer: windows we advertise count in units of 2^5.
+const OUR_SHIFT: u8 = 5;
 const SEND_CAPACITY: usize = 64 * 1024;
 /// Most data we keep in flight at once, whatever window the peer offers.
 const MAX_IN_FLIGHT: usize = 32 * 1024;
@@ -146,6 +151,13 @@ struct Tcp {
     /// update"): otherwise, after we have said "full", it waits on its own
     /// slow timer before trying again.
     advertised: core::cell::Cell<usize>,
+    /// Whether our SYN offers window scaling (an incoming connection's
+    /// answer does only if the peer's SYN offered it).
+    offer_scale: bool,
+    /// Agreed in the handshake: the shift for the windows we advertise, and
+    /// for the ones the peer advertises (both 0 without scaling).
+    rcv_shift: u8,
+    snd_shift: u8,
 }
 
 impl Tcp {
@@ -173,6 +185,9 @@ impl Tcp {
             listener: None,
             orphaned_at: None,
             advertised: core::cell::Cell::new(RECV_CAPACITY),
+            offer_scale: true,
+            rcv_shift: 0,
+            snd_shift: 0,
         }
     }
 
@@ -183,7 +198,8 @@ impl Tcp {
     /// Build one segment and queue it. `sequence` is where it starts.
     fn emit(&self, local: Ip, flags: u8, sequence: u32, data: &[u8], out: &mut Vec<Outgoing>) {
         let with_mss = flags & TCP_SYN != 0;
-        let header = if with_mss { 24 } else { 20 };
+        let with_scale = with_mss && self.offer_scale;
+        let header = if with_scale { 28 } else if with_mss { 24 } else { 20 };
         let mut s = vec![0u8; header];
         s[0..2].copy_from_slice(&self.local_port.to_be_bytes());
         s[2..4].copy_from_slice(&self.remote_port.to_be_bytes());
@@ -193,13 +209,22 @@ impl Tcp {
         }
         s[12] = ((header / 4) as u8) << 4;
         s[13] = flags;
-        let window = (RECV_CAPACITY - self.recv_buf.len()).min(65535) as u16;
+        // (the window in a SYN is never scaled)
+        let room = RECV_CAPACITY - self.recv_buf.len();
+        let shift = if flags & TCP_SYN != 0 { 0 } else { self.rcv_shift };
+        let window = (room >> shift).min(65535) as u16;
         s[14..16].copy_from_slice(&window.to_be_bytes());
-        self.advertised.set(window as usize);
+        self.advertised.set((window as usize) << shift);
         if with_mss {
             s[20] = 2; // option: maximum segment size
             s[21] = 4;
             s[22..24].copy_from_slice(&(OUR_MSS as u16).to_be_bytes());
+        }
+        if with_scale {
+            s[24] = 1; // no-op (padding)
+            s[25] = 3; // option: window scale
+            s[26] = 3;
+            s[27] = OUR_SHIFT;
         }
         s.extend_from_slice(data);
         // The checksum also covers a "pseudo header" of the IP addresses.
@@ -298,10 +323,13 @@ impl Tcp {
         flags: u8,
         window: usize,
         mss: Option<usize>,
+        scale: Option<u8>,
         data: &[u8],
         out: &mut Vec<Outgoing>,
     ) -> bool {
         let mut just_established = false;
+        // (windows in SYN segments are never scaled)
+        let window = if flags & TCP_SYN != 0 { window } else { window << self.snd_shift };
         if flags & TCP_RST != 0 {
             // During connect, only a reset that answers our SYN counts.
             if self.state != TcpState::SynSent || (flags & TCP_ACK != 0 && acknowledged == self.iss.wrapping_add(1)) {
@@ -318,6 +346,11 @@ impl Tcp {
                     self.snd_nxt = acknowledged;
                     self.snd_wnd = window;
                     self.peer_mss = mss.unwrap_or(536);
+                    // Scaling applies only if both SYNs offered it.
+                    if let (Some(theirs), true) = (scale, self.offer_scale) {
+                        self.snd_shift = theirs.min(14);
+                        self.rcv_shift = OUR_SHIFT;
+                    }
                     self.state = TcpState::Established;
                     self.retries = 0;
                     self.emit(local, TCP_ACK, self.snd_nxt, &[], out);
@@ -797,19 +830,29 @@ impl Net {
             return;
         }
         let data = &segment[header..];
-        // The only option we care about: the peer's maximum segment size.
+        // The options we care about: the peer's maximum segment size and
+        // window scale (both only in SYNs).
         let mut mss = None;
+        let mut scale = None;
         let mut i = 20;
-        while i + 1 < header {
+        while i < header {
             match segment[i] {
                 0 => break,
                 1 => i += 1,
+                _ if i + 1 >= header => break,
                 2 if segment[i + 1] == 4 && i + 3 < header => {
                     mss = Some(u16::from_be_bytes([segment[i + 2], segment[i + 3]]) as usize);
                     i += 4;
                 }
+                3 if segment[i + 1] == 3 && i + 2 < header => {
+                    scale = Some(segment[i + 2]);
+                    i += 3;
+                }
                 _ => i += (segment[i + 1] as usize).max(2),
             }
+        }
+        if flags & TCP_SYN == 0 {
+            scale = None;
         }
 
         let (local, now) = (self.ip, arch::ticks());
@@ -820,7 +863,7 @@ impl Net {
         if let Some(index) = existing {
             let id = self.sockets[index].id;
             let Kind::Tcp(tcp) = &mut self.sockets[index].kind else { return };
-            let established = tcp.input(local, now, sequence, acknowledged, flags, window, mss, data, out);
+            let established = tcp.input(local, now, sequence, acknowledged, flags, window, mss, scale, data, out);
             tcp.output(local, now, out);
             let listener = tcp.listener;
             if established {
@@ -845,6 +888,11 @@ impl Net {
             tcp.rcv_nxt = sequence.wrapping_add(1);
             tcp.peer_mss = mss.unwrap_or(536);
             tcp.snd_wnd = window;
+            tcp.offer_scale = scale.is_some();
+            if let Some(theirs) = scale {
+                tcp.snd_shift = theirs.min(14);
+                tcp.rcv_shift = OUR_SHIFT;
+            }
             tcp.listener = Some(listener);
             tcp.output(local, now, out); // sends the SYN+ACK
             let id = self.new_id();

@@ -1,4 +1,5 @@
 <html><head><title>JS test</title>
+<style>:root{--accent:#00ff00;--other:var(--accent)} .vbox{--local:rgb(0,0,255)} .vbox .a{color:var(--accent)} .vbox .b{color:var(--local)} .vbox .c{color:var(--missing,#ff0000)} .vbox .d{color:var(--other)}</style>
 <script>
 var results = [];
 function ok(name, cond) { results.push((cond ? "PASS " : "FAIL ") + name); }
@@ -9,6 +10,7 @@ function ok(name, cond) { results.push((cond ? "PASS " : "FAIL ") + name); }
 <p id="out">not yet</p>
 <div id="hidden-by-js">THIS SHOULD BE HIDDEN</div>
 <noscript>NOSCRIPT CONTENT</noscript>
+<div class="vbox"><span class="a">a</span><span class="b">b</span><span class="c">c</span><span class="d">d</span></div>
 <form id="f"><input id="name" name="who" value="ada"><button id="go">Go</button></form>
 <script>
 // language
@@ -33,12 +35,56 @@ ok("regex groups", "2024-03-05".match(/(?<y>\d{4})-(?<m>\d\d)/).groups.m === "03
 ok("json", JSON.stringify({a: [1, "x", null], b: true}) === '{"a":[1,"x",null],"b":true}' && JSON.parse('{"k":[1,2,{"z":3}]}').k[2].z === 3);
 ok("array methods", [3, 1, 2].sort().join("") === "123" && [1, 2, 3, 4].filter(x => x % 2).map(x => x * 10).reduce((s, x) => s + x, 0) === 40);
 ok("split", "a1b2c".split(/\d/).join() === "a,b,c" && "abc".split("").length === 3 && "abc".split(/(?:)/).join("-") === "a-b-c" && "a, b".split(/(,)\s*/).length === 3);
+ok("css variables", (function () { var v = document.querySelector(".vbox"); function c(k) { return getComputedStyle(v.querySelector("." + k)).color; } return c("a") === "rgb(0, 255, 0)" && c("b") === "rgb(0, 0, 255)" && c("c") === "rgb(255, 0, 0)" && c("d") === "rgb(0, 255, 0)"; })());
 ok("map and set", new Map([["a", 1]]).get("a") === 1 && new Set([1, 1, 2]).size === 2);
 ok("optional chaining", ({}).missing?.deep === undefined && (null ?? "dflt") === "dflt");
 ok("labels", (function () { var n = 0; outer: for (var i = 0; i < 5; i++) { for (var j = 0; j < 5; j++) { if (j == 2) continue outer; if (i == 3) break outer; n++; } } return n; })() === 6);
 ok("getters/setters", (function () { var o = { _v: 1, get v() { return this._v * 2; }, set v(x) { this._v = x; } }; o.v = 5; return o.v === 10; })());
 ok("date", new Date(0).toISOString() === "1970-01-01T00:00:00.000Z" && new Date(2024, 1, 29).getDate() === 29);
 ok("typeof", typeof undeclaredThing === "undefined" && typeof function(){} === "function" && typeof null === "object");
+ok("symbols", (function () {
+  var s = Symbol("tag"), o = { a: 1 };
+  o[s] = 2;
+  var thrown = false;
+  try { "" + s; } catch (e) { thrown = e instanceof TypeError; }
+  return typeof s === "symbol" && typeof Symbol.iterator === "symbol" && s !== Symbol("tag") && Symbol.for("k") === Symbol.for("k")
+    && String(s) === "Symbol(tag)" && s.toString() === "Symbol(tag)" && s.description === "tag" && o[s] === 2
+    && Object.keys(o).join() === "a" && JSON.stringify(o) === '{"a":1}' && Object.getOwnPropertySymbols(o)[0] === s
+    && thrown && Object.prototype.toString.call(s) === "[object Symbol]" && Symbol.keyFor(Symbol.for("k")) === "k";
+})());
+ok("bigint", (function () {
+  var big = 2n ** 100n, m = 1000000007n, x = 1n, e = 65537n, b = 123456789n;
+  while (e > 0n) { if (e & 1n) x = x * b % m; b = b * b % m; e >>= 1n; }
+  var thrown = false;
+  try { 1n + 1; } catch (err) { thrown = err instanceof TypeError; }
+  return typeof big === "bigint" && String(big) === "1267650600228229401496703205376" && big.toString(16) === "10000000000000000000000000"
+    && -7n / 2n === -3n && -7n % 2n === -1n && (-5n >> 1n) === -3n && (-1n & 0xffn) === 255n && (~5n) === -6n
+    && BigInt("0x1f") === 31n && BigInt(" -42 ") === -42n && BigInt(2 ** 53) === 9007199254740992n && Number(12345678901234567890n) === 12345678901234567000
+    && BigInt.asUintN(8, -1n) === 255n && BigInt.asIntN(8, 255n) === -1n && 10n > 9 && 2n == 2 && "3" == 3n && 1n < 1.5
+    && x === 560583526n && thrown && !0n && JSON.stringify({ a: String(1n) }) === '{"a":"1"}' && Object.prototype.toString.call(1n) === "[object BigInt]";
+})());
+ok("array buffers", (function () {
+  var buf = new ArrayBuffer(8), dv = new DataView(buf), bytes = new Uint8Array(buf), words = new Uint32Array(buf, 4, 1);
+  dv.setUint16(0, 0x1234);
+  dv.setUint32(4, 0xdeadbeef, true);
+  bytes[2] = 7;
+  var sub = bytes.subarray(2, 4);
+  sub[1] = 9;
+  dv.setFloat64(0, 1.5);
+  var f = new Float64Array(1);
+  new DataView(f.buffer).setFloat64(0, 2.5, true);
+  dv.setBigUint64(0, 0x0102030405060708n);
+  return buf.byteLength === 8 && words[0] === 0x08070605 && dv.getUint8(1) === 2 && dv.getUint32(4, true) === 0x08070605
+    && bytes[7] === 8 && f[0] === 2.5 && dv.getBigUint64(0) === 0x0102030405060708n && dv.getInt8(0) === 1
+    && ArrayBuffer.isView(dv) && !ArrayBuffer.isView(buf) && buf.slice(4).byteLength === 4 && new Uint8Array(buf.slice(6))[1] === 8
+    && new Uint8Array([3, 1, 2]).sort().join() === "1,2,3" && new Int8Array([200])[0] === -56;
+})());
+var streamResult = "pending";
+new Blob(["hello stream"]).stream().pipeThrough(new CompressionStream("gzip")).pipeThrough(new DecompressionStream("gzip"))
+  .pipeThrough(new TextDecoderStream()).getReader().read().then(function (r) { streamResult = r.value; }, function (e) { streamResult = String(e); });
+ok("new Function", new Function("a", "b", "return a * b")(6, 7) === 42 && Function("return this")() === window);
+ok("named function expressions", (function () { var f = 3; var r = (function f(n) { return n ? f(n - 1) + 1 : 0; })(4); return r === 4 && f === 3; })());
+ok("named call errors", (function () { var o = {}; try { o.missing.go(); } catch (e) {} try { (0, o.nothing)(); } catch (e) { return e.message.indexOf("o.nothing is not a function") === 0; } })());
 // DOM
 var title = document.getElementById("title");
 ok("getElementById", title && title.textContent === "Scripts" && title.tagName === "H1");
@@ -68,6 +114,7 @@ document.addEventListener("DOMContentLoaded", function () {
   results.push("PASS DOMContentLoaded");
   setTimeout(function () {
     ok("event loop order", order.join() === "sync,promise,timeout");
+    ok("streams " + streamResult, streamResult === "hello stream");
     var p = document.createElement("pre");
     p.id = "results";
     p.textContent = results.join("\n");

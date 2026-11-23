@@ -60,3 +60,4 @@ int ecdh_shared(int bits, unsigned char *out, const unsigned char *priv, const u
    (65 or 97 bytes). Same schemes as above. 0 if right. */
 int x509_check_raw(int kind, const unsigned char *key, size_t key_len, const unsigned char *key2, size_t key2_len,
                    int scheme, const unsigned char *data, size_t data_len, const unsigned char *sig, size_t sig_len);
+void x509_prepare(void); /* load the trusted roots (once, before using threads) */

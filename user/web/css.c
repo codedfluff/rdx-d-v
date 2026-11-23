@@ -9,8 +9,9 @@ enum { A_LEFT, A_CENTER, A_RIGHT };
 enum { J_START, J_CENTER, J_END, J_BETWEEN, J_AROUND, J_EVENLY };
 enum { AL_STRETCH, AL_START, AL_CENTER, AL_END, AL_AUTO = 255 };
 #define AUTO (-30000)
-#define VIEW_W 800 /* the page width, for vw units and @media */
-#define VIEW_H 560
+static int layout_viewport_w, layout_viewport_h; /* a frame's size (0 in the window: the usual) */
+#define VIEW_W (layout_viewport_w ? layout_viewport_w : 800) /* the page width, for vw units and @media */
+#define VIEW_H (layout_viewport_h ? layout_viewport_h : 560)
 
 static int is_block_level(int d) {
     return d == D_BLOCK || d == D_LIST_ITEM || d == D_FLEX || d == D_GRID || d == D_TABLE || d == D_TABLE_ROW ||
@@ -261,6 +262,8 @@ typedef struct {
     unsigned char color_set[4];
 } Borders;
 
+#define BORDER_INVISIBLE 0x01000000u /* a border colour: transparent */
+
 static void border_part(Borders *b, int side, const char *v, int font) {
     char parts[6][64];
     int n = split_value(v, parts, 6);
@@ -276,8 +279,9 @@ static void border_part(Borders *b, int side, const char *v, int font) {
         else if (!strcasecmp_word(p, "thin")) b->width[side] = 1;
         else if (!strcasecmp_word(p, "medium")) b->width[side] = 3;
         else if (!strcasecmp_word(p, "thick")) b->width[side] = 5;
-        else if (parse_color(p, &c) == 1) {
-            b->color[side] = c;
+        else if ((ok = parse_color(p, &c)) != 0) {
+            /* transparent: the border takes its room but is not drawn */
+            b->color[side] = ok == 2 ? BORDER_INVISIBLE : c;
             b->color_set[side] = 1;
         } else {
             Len l = parse_len(p, font, &ok);

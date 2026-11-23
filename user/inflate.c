@@ -157,8 +157,14 @@ static int stored(State *s) {
 
 static int fixed(State *s) {
     static Huffman lencode, distcode;
-    static int ready;
+    static volatile int ready;
+    static mutex_t building; /* (several threads may unpack at once: the tables are built once) */
     if (!ready) {
+        mutex_lock(&building);
+        if (ready) {
+            mutex_unlock(&building);
+            return codes(s, &lencode, &distcode);
+        }
         short lengths[288];
         int symbol = 0;
         for (; symbol < 144; symbol++) lengths[symbol] = 8;
@@ -168,7 +174,9 @@ static int fixed(State *s) {
         construct(&lencode, lengths, 288);
         for (symbol = 0; symbol < 30; symbol++) lengths[symbol] = 5;
         construct(&distcode, lengths, 30);
+        __sync_synchronize();
         ready = 1;
+        mutex_unlock(&building);
     }
     return codes(s, &lencode, &distcode);
 }

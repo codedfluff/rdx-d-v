@@ -607,6 +607,21 @@ fn handle_exception(frame: *mut Frame) -> *mut Frame {
         return frame;
     }
 
+    // A program's main stack grows on demand: a user-mode fault on a page
+    // not mapped yet, just below what is, within its limit, gets a page.
+    if f.vector == 14 && f.cs & 3 == 3 && f.error & 1 == 0 {
+        let address = read_cr2();
+        let lowest = crate::exec::STACK_TOP - crate::exec::STACK_MAX;
+        if (lowest..crate::exec::STACK_TOP).contains(&address) {
+            if let Some(process) = sched::current_process() {
+                let page = address & !(crate::memory::PAGE - 1);
+                if crate::memory::map_user_page(process.space, page, true).is_some() {
+                    return frame; // run the instruction again
+                }
+            }
+        }
+    }
+
     // A fault inside an ordinary task kills that task, not the kernel.
     if f.vector != 8 && f.vector != 18 {
         if let Some((id, next)) = sched::kill_current(frame) {

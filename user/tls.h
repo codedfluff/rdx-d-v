@@ -70,3 +70,4 @@ void aead_seal(int cipher, const unsigned char *key, const unsigned char nonce[1
                size_t aad_len, unsigned char *data, size_t len, unsigned char tag[16]);
 int aead_open(int cipher, const unsigned char *key, const unsigned char nonce[12], const unsigned char *aad,
               size_t aad_len, unsigned char *data, size_t len, const unsigned char tag[16]);
+void tls_prepare(void); /* one-time set-up; call before making connections from several threads */

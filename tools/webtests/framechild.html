@@ -1,0 +1,13 @@
+<html><head><title>Child</title></head>
+<body style="background:#dfe">
+<p id="msg">CHILD STATIC TEXT</p>
+<script>
+document.getElementById("msg").textContent = "CHILD SCRIPT RAN, width " + innerWidth + ", top is me: " + (window.top === window);
+window.addEventListener("message", function (e) {
+  console.log("child got " + e.data.ask + " " + e.data.list.join() + " " + e.data.when.getTime() + " " + typeof e.data.big + " " + e.data.bytes[1] + " from " + e.origin);
+  document.getElementById("msg").textContent = "CHILD GOT: " + e.data.ask;
+  e.source.postMessage({ text: "hi parent", n: e.data.list.length }, e.origin);
+});
+</script>
+<a href="framechild2.html">next page in the frame</a>
+</body></html>

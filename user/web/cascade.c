@@ -34,7 +34,6 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
     unsigned color;
     int ok;
     while (is_space(*v)) v++;
-    if (strstr(v, "var(")) return; /* custom properties are not supported */
     int font = s->size;
     switch (name[0]) {
     case 'a':
@@ -106,6 +105,8 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         } else if (!strcmp(name, "clip") || !strcmp(name, "clip-path")) {
             /* The "visually hidden" idiom: rect(0 0 0 0), rect(1px, 1px, 1px, 1px), inset(50%). */
             s->clip_rect = (strstr(v, "rect(") && !strstr(v, "auto")) || strstr(v, "inset(50%") != NULL;
+        } else if (!strcmp(name, "caption-side")) {
+            s->caption_bottom = word_is(v, "bottom");
         } else if (!strcmp(name, "cursor")) {
             s->cursor_pointer = word_is(v, "pointer");
         } else if (!strcmp(name, "column-gap")) {
@@ -257,6 +258,10 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         else if (!strcmp(name, "list-style") || !strcmp(name, "list-style-type")) s->list_none = strstr(v, "none") != NULL;
         return;
     case 'm':
+        if (!strcmp(name, "mask-image") || !strcmp(name, "mask")) {
+            s->masked = strstr(v, "url(") != NULL || strstr(v, "gradient(") != NULL;
+            return;
+        }
         if (!strcmp(name, "margin")) set_sides(s->margin_len, v, font);
         else if (!strncmp(name, "margin-", 7)) {
             const char *side = name + 7;
@@ -348,15 +353,100 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
 
 /* Apply "a: b; c: d" declarations. Pass 0: the normal ones; pass 1: only
    those marked !important. */
+/* ---- custom properties: --name: value, used as var(--name, fallback) ---- */
+
+static Node *var_scope;   /* the element whose style is being worked out */
+static char *vars_buf;    /* custom properties being collected for it */
+static int vars_len, vars_cap;
+
+static void vars_add(const char *name, const char *value) {
+    int nl = (int)strlen(name) + 1, vl = (int)strlen(value) + 1;
+    if (!grow((void **)&vars_buf, &vars_cap, vars_len + nl + vl, 1)) return;
+    memcpy(vars_buf + vars_len, name, (size_t)nl);
+    memcpy(vars_buf + vars_len + nl, value, (size_t)vl);
+    vars_len += nl + vl;
+}
+
+/* The value of custom property `name` for element e: its own, or the
+   nearest ancestor's (the last definition wins). */
+static const char *lookup_var(Node *e, const char *name, int len) {
+    for (Node *n = e; n; n = n->parent) {
+        const char *found = NULL;
+        for (int i = 0; i < n->css_vars_len;) {
+            const char *k = n->css_vars + i;
+            int kl = (int)strlen(k);
+            const char *v = k + kl + 1;
+            if (kl == len && !memcmp(k, name, (size_t)len)) found = v;
+            i += kl + 1 + (int)strlen(v) + 1;
+        }
+        if (found) return found;
+    }
+    return NULL;
+}
+
+/* Copy `in` to `out` with every var(...) replaced. 0 if one cannot be
+   resolved (then the declaration is ignored, as browsers do). */
+static int resolve_vars(const char *in, char *out, int max, int depth) {
+    int k = 0;
+    if (depth > 8) return 0;
+    for (const char *p = in; *p;) {
+        if (strncmp(p, "var(", 4) != 0) {
+            if (k < max - 1) out[k++] = *p;
+            p++;
+            continue;
+        }
+        p += 4;
+        while (is_space(*p)) p++;
+        const char *name = p;
+        while (*p && *p != ',' && *p != ')' && !is_space(*p)) p++;
+        char lname[96];
+        int nl = (int)(p - name) < 95 ? (int)(p - name) : 95;
+        for (int i = 0; i < nl; i++) lname[i] = (char)tolower((unsigned char)name[i]);
+        lname[nl] = 0;
+        while (is_space(*p)) p++;
+        const char *fallback = NULL;
+        int fl = 0;
+        if (*p == ',') {
+            p++;
+            fallback = p;
+            int d = 0;
+            while (*p && (d || *p != ')')) {
+                if (*p == '(') d++;
+                if (*p == ')') d--;
+                p++;
+            }
+            fl = (int)(p - fallback);
+        }
+        if (*p == ')') p++;
+        const char *v = lookup_var(var_scope, lname, nl);
+        char sub[512];
+        if (v) {
+            if (!resolve_vars(v, sub, sizeof(sub), depth + 1)) return 0;
+        } else if (fallback) {
+            char fb[512];
+            int n = fl < 511 ? fl : 511;
+            memcpy(fb, fallback, (size_t)n);
+            fb[n] = 0;
+            if (!resolve_vars(fb, sub, sizeof(sub), depth + 1)) return 0;
+        } else {
+            return 0;
+        }
+        for (const char *q = sub; *q && k < max - 1; q++) out[k++] = *q;
+    }
+    out[k] = 0;
+    return 1;
+}
+
+/* pass 0: normal declarations; 1: !important ones; 2: collect custom properties. */
 static void apply_all(Style *s, Borders *b, const char *decls, int pass, int parent_size) {
     const char *p = decls;
     while (*p) {
         while (is_space(*p) || *p == ';') p++;
         if (!*p) break;
-        char name[40];
+        char name[96];
         int n = 0;
         while (*p && *p != ':' && *p != ';' && *p != '{' && *p != '}') {
-            if (!is_space(*p) && n < 39) name[n++] = (char)tolower((unsigned char)*p);
+            if (!is_space(*p) && n < 95) name[n++] = (char)tolower((unsigned char)*p);
             p++;
         }
         name[n] = 0;
@@ -399,7 +489,23 @@ static void apply_all(Style *s, Borders *b, const char *decls, int pass, int par
             *bang = 0;
             important = 1;
         }
-        if (important == pass && name[0] != '-') apply(s, b, name, value, parent_size);
+        if (pass == 2) {
+            if (name[0] == '-' && name[1] == '-') {
+                const char *v = value;
+                while (is_space(*v)) v++;
+                vars_add(name, v);
+            }
+            continue;
+        }
+        if (!strncmp(name, "-webkit-mask", 12)) memmove(name, name + 8, strlen(name + 8) + 1); /* -webkit-mask-image -> mask-image */
+        if (important != pass || name[0] == '-') continue;
+        if (strstr(value, "var(")) {
+            char resolved[512];
+            if (!resolve_vars(value, resolved, sizeof(resolved), 0)) continue;
+            apply(s, b, name, resolved, parent_size);
+        } else {
+            apply(s, b, name, value, parent_size);
+        }
     }
 }
 
@@ -433,7 +539,6 @@ typedef struct {
 } Compound;
 
 typedef struct {
-    Compound parts[MAX_PARTS];
     int part_count;
     unsigned need[MAX_PARTS]; /* keys the subject's ancestors must have */
     int need_count;
@@ -442,10 +547,46 @@ typedef struct {
     const char *decls;
     const char *sel; /* the selector text (for CSS_DEBUG) */
     int sel_len;
+    Compound parts[MAX_PARTS]; /* (last: a stored rule keeps only part_count of them) */
 } Rule;
 
-static Rule *rules;
+/* The page's rules: each stored at its own size, in big chunks freed with the page. */
+static Rule **rules;
 static int rule_count, rule_cap, rule_order;
+
+typedef struct RuleChunk {
+    struct RuleChunk *next;
+    size_t used;
+    char data[256 * 1024 - 64];
+} RuleChunk;
+static RuleChunk *rule_chunks;
+
+static Rule *rule_store(const Rule *r) {
+    size_t size = (__builtin_offsetof(Rule, parts) + sizeof(Compound) * (size_t)r->part_count + 15) & ~(size_t)15;
+    if (!rule_chunks || rule_chunks->used + size > sizeof(rule_chunks->data)) {
+        RuleChunk *c = malloc(sizeof(RuleChunk));
+        if (!c) return NULL;
+        c->next = rule_chunks;
+        c->used = 0;
+        rule_chunks = c;
+    }
+    Rule *out = (Rule *)(rule_chunks->data + rule_chunks->used);
+    rule_chunks->used += size;
+    memcpy(out, r, size);
+    return out;
+}
+
+static void free_rules(void) {
+    while (rule_chunks) {
+        RuleChunk *next = rule_chunks->next;
+        free(rule_chunks);
+        rule_chunks = next;
+    }
+    free(rules);
+    rules = NULL;
+    rule_cap = 0;
+    rule_count = rule_order = 0;
+}
 
 static unsigned fingerprint(char kind, const char *name) {
     unsigned h = 2166136261u;
@@ -706,8 +847,9 @@ static void add_rule(const char *selector, int n, const char *decls, int origin)
     r.origin = origin;
     r.order = rule_order++;
     r.decls = decls;
-    if (!grow((void **)&rules, &rule_cap, rule_count + 1, sizeof(Rule))) return;
-    rules[rule_count++] = r;
+    if (!grow((void **)&rules, &rule_cap, rule_count + 1, sizeof(Rule *))) return;
+    Rule *stored = rule_store(&r);
+    if (stored) rules[rule_count++] = stored;
 }
 
 static int has_class(const Node *n, const char *name) {
@@ -1116,7 +1258,7 @@ static void index_rules(void) {
     keyless_head = -1;
     if (!grow((void **)&rule_next, &rule_next_cap, rule_count + 1, sizeof(int))) return;
     for (int i = rule_count - 1; i >= 0; i--) {
-        int *head = rules[i].key ? &bucket_head[rules[i].key & (BUCKETS - 1)] : &keyless_head;
+        int *head = rules[i]->key ? &bucket_head[rules[i]->key & (BUCKETS - 1)] : &keyless_head;
         rule_next[i] = *head;
         *head = i;
     }
@@ -1175,18 +1317,18 @@ static void compute_style(Node *e) {
         for (int q = 0; q < k && !dup; q++) dup = keys[q] == keys[k];
         if (dup) continue;
         for (int i = bucket_head[keys[k] & (BUCKETS - 1)]; i >= 0 && n < 1024; i = rule_next[i]) {
-            if (rules[i].key == keys[k] && ancestors_possible(&rules[i], e) && matches_from(&rules[i], rules[i].part_count - 1, e))
+            if (rules[i]->key == keys[k] && ancestors_possible(rules[i], e) && matches_from(rules[i], rules[i]->part_count - 1, e))
                 matched[n++] = i;
         }
     }
     for (int i = keyless_head; i >= 0 && n < 1024; i = rule_next[i]) {
         stat_keyless++;
-        if (ancestors_possible(&rules[i], e) && matches_from(&rules[i], rules[i].part_count - 1, e)) matched[n++] = i;
+        if (ancestors_possible(rules[i], e) && matches_from(rules[i], rules[i]->part_count - 1, e)) matched[n++] = i;
     }
     for (int i = 1; i < n; i++) {
         int r = matched[i], j = i;
         while (j > 0) {
-            const Rule *a = &rules[matched[j - 1]], *c = &rules[r];
+            const Rule *a = rules[matched[j - 1]], *c = rules[r];
             int later = a->origin != c->origin ? a->origin > c->origin
                         : a->specificity != c->specificity ? a->specificity > c->specificity
                                                            : a->order > c->order;
@@ -1199,7 +1341,7 @@ static void compute_style(Node *e) {
     stat_applied += n;
     if (css_debug_tag[0] && is(e->tag, css_debug_tag)) { /* CSS_DEBUG=tag: show the rules that match it */
         for (int i = 0; i < n; i++) {
-            const Rule *r = &rules[matched[i]];
+            const Rule *r = rules[matched[i]];
             char sel[100], dec[100];
             int sl = r->sel_len < 99 ? r->sel_len : 99, dl = 0;
             memcpy(sel, r->sel, (size_t)sl);
@@ -1210,14 +1352,31 @@ static void compute_style(Node *e) {
         }
     }
     int first_page = 0;
-    while (first_page < n && rules[matched[first_page]].origin == 0) first_page++;
-    for (int i = 0; i < first_page; i++) apply_all(s, &b, rules[matched[i]].decls, 0, p->size);
-    presentational(e, s, &b, p);
-    for (int i = first_page; i < n; i++) apply_all(s, &b, rules[matched[i]].decls, 0, p->size);
+    while (first_page < n && rules[matched[first_page]]->origin == 0) first_page++;
     static char inline_style[2048];
     int has_inline = attr(e, "style", inline_style, sizeof(inline_style));
+    /* custom properties first: they may be used by any declaration */
+    var_scope = e;
+    vars_len = 0;
+    for (int i = 0; i < n; i++) {
+        if (strstr(rules[matched[i]]->decls, "--")) apply_all(s, &b, rules[matched[i]]->decls, 2, p->size);
+    }
+    if (has_inline && strstr(inline_style, "--")) apply_all(s, &b, inline_style, 2, p->size);
+    free(e->css_vars);
+    e->css_vars = NULL;
+    e->css_vars_len = 0;
+    if (vars_len) {
+        e->css_vars = malloc((size_t)vars_len);
+        if (e->css_vars) {
+            memcpy(e->css_vars, vars_buf, (size_t)vars_len);
+            e->css_vars_len = vars_len;
+        }
+    }
+    for (int i = 0; i < first_page; i++) apply_all(s, &b, rules[matched[i]]->decls, 0, p->size);
+    presentational(e, s, &b, p);
+    for (int i = first_page; i < n; i++) apply_all(s, &b, rules[matched[i]]->decls, 0, p->size);
     if (has_inline) apply_all(s, &b, inline_style, 0, p->size);
-    for (int i = first_page; i < n; i++) apply_all(s, &b, rules[matched[i]].decls, 1, p->size);
+    for (int i = first_page; i < n; i++) apply_all(s, &b, rules[matched[i]]->decls, 1, p->size);
     if (has_inline) apply_all(s, &b, inline_style, 1, p->size);
 
     for (int i = 0; i < 4; i++) {

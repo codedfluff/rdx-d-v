@@ -665,7 +665,7 @@ static int ecdsa_verify(const Curve *C, const u8 *point, size_t point_len, const
     return cmp_limbs(x, r, nl) == 0 ? 0 : -1;
 }
 
-int ecdh_keypair(int bits, unsigned char *priv, unsigned char *pub) {
+static int ecdh_keypair_locked(int bits, unsigned char *priv, unsigned char *pub) {
     Curve *C = curve_for(bits);
     if (!C) return -1;
     int b = C->bytes;
@@ -689,7 +689,7 @@ int ecdh_keypair(int bits, unsigned char *priv, unsigned char *pub) {
     return 0;
 }
 
-int ecdh_shared(int bits, unsigned char *out, const unsigned char *priv, const unsigned char *peer, size_t peer_len) {
+static int ecdh_shared_locked(int bits, unsigned char *out, const unsigned char *priv, const unsigned char *peer, size_t peer_len) {
     Curve *C = curve_for(bits);
     Point Q, P;
     if (!C || load_point(&Q, peer, peer_len, C) != 0) return -1;
@@ -948,7 +948,7 @@ static int scheme_parts(int scheme, char *kind, int *hash, int *pss) {
     return -1;
 }
 
-int x509_check_signature(const unsigned char *cert, size_t cert_len, int scheme, const unsigned char *data, size_t data_len,
+static int x509_check_signature_locked(const unsigned char *cert, size_t cert_len, int scheme, const unsigned char *data, size_t data_len,
                          const unsigned char *sig, size_t sig_len) {
     Cert c;
     char kind;
@@ -957,7 +957,7 @@ int x509_check_signature(const unsigned char *cert, size_t cert_len, int scheme,
     return check_with_key(&c, kind, hash, pss, data, data_len, sig, sig_len);
 }
 
-int x509_check_raw(int kind, const unsigned char *key, size_t key_len, const unsigned char *key2, size_t key2_len, int scheme,
+static int x509_check_raw_locked(int kind, const unsigned char *key, size_t key_len, const unsigned char *key2, size_t key2_len, int scheme,
                    const unsigned char *data, size_t data_len, const unsigned char *sig, size_t sig_len) {
     Cert c;
     char k;
@@ -990,6 +990,11 @@ static int b64_value(int c) {
     if (c == '/') return 63;
     return -1;
 }
+
+static void load_roots(void);
+
+/* Load the trusted roots now (before several threads may verify at once). */
+void x509_prepare(void) { load_roots(); }
 
 static void load_roots(void) {
     if (roots_loaded) return;
@@ -1138,7 +1143,7 @@ static void say(char *error, const char *a, const char *b, const char *c) {
 
 static int same_span(Span a, Span b) { return a.len == b.len && memcmp(a.p, b.p, a.len) == 0; }
 
-int x509_check_chain(const unsigned char *const *certs, const size_t *lens, int count, const char *host, char *who, size_t who_max,
+static int x509_check_chain_locked(const unsigned char *const *certs, const size_t *lens, int count, const char *host, char *who, size_t who_max,
                      char *error) {
     Cert chain[8], cur;
     char text[96], date[16];
@@ -1243,4 +1248,52 @@ void x509_describe(const unsigned char *cert, size_t len, char *out, size_t max)
     append(out, max, until);
     append(out, max, c.key_kind == 'r' ? ", RSA key" : c.key_kind == 'e' ? (c.curve == 256 ? ", P-256 key" : ", P-384 key") : ", unknown key");
     if (c.is_ca) append(out, max, ", authority");
+}
+
+/* ---------------------------------------------------------------- one at a time
+   The arithmetic above keeps working state in static variables (big RSA
+   buffers, curves set up on first use). Programs that make secure
+   connections from several threads at once (the browser fetches a page's
+   parts in parallel) must not run two of these together: the public entry
+   points take turns. */
+
+static mutex_t crypto_lock;
+
+int ecdh_keypair(int bits, unsigned char *priv, unsigned char *pub) {
+    mutex_lock(&crypto_lock);
+    int r = ecdh_keypair_locked(bits, priv, pub);
+    mutex_unlock(&crypto_lock);
+    return r;
+}
+
+int ecdh_shared(int bits, unsigned char *out, const unsigned char *priv, const unsigned char *peer, size_t peer_len) {
+    mutex_lock(&crypto_lock);
+    int r = ecdh_shared_locked(bits, out, priv, peer, peer_len);
+    mutex_unlock(&crypto_lock);
+    return r;
+}
+
+int x509_check_signature(const unsigned char *cert, size_t cert_len, int scheme, const unsigned char *data, size_t data_len,
+                         const unsigned char *sig, size_t sig_len) {
+    mutex_lock(&crypto_lock);
+    int r = x509_check_signature_locked(cert, cert_len, scheme, data, data_len, sig, sig_len);
+    mutex_unlock(&crypto_lock);
+    return r;
+}
+
+int x509_check_raw(int kind, const unsigned char *key, size_t key_len, const unsigned char *key2, size_t key2_len, int scheme,
+                   const unsigned char *data, size_t data_len, const unsigned char *sig, size_t sig_len) {
+    mutex_lock(&crypto_lock);
+    int r = x509_check_raw_locked(kind, key, key_len, key2, key2_len, scheme, data, data_len, sig, sig_len);
+    mutex_unlock(&crypto_lock);
+    return r;
+}
+
+int x509_check_chain(const unsigned char *const *certs, const size_t *lens, int count, const char *host, char *who, size_t who_max,
+                     char *error) {
+    mutex_lock(&crypto_lock);
+    load_roots();
+    int r = x509_check_chain_locked(certs, lens, count, host, who, who_max, error);
+    mutex_unlock(&crypto_lock);
+    return r;
 }

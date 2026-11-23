@@ -3,6 +3,12 @@
 use alloc::vec::Vec;
 
 use crate::arch::{inl, outl};
+use crate::sync::IrqLock;
+
+/// Configuration access is two steps (address, then data) through ports
+/// every CPU shares: one access at a time, or drivers starting on different
+/// CPUs read each other's registers.
+static CONFIG: IrqLock<()> = IrqLock::new(());
 
 #[derive(Clone, Copy)]
 pub struct Device {
@@ -21,11 +27,13 @@ impl Device {
     }
 
     pub fn read(&self, offset: u8) -> u32 {
+        let _held = CONFIG.lock();
         outl(0xCF8, self.address(offset));
         inl(0xCFC)
     }
 
     pub fn write(&self, offset: u8, value: u32) {
+        let _held = CONFIG.lock();
         outl(0xCF8, self.address(offset));
         outl(0xCFC, value);
     }

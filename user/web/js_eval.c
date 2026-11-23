@@ -7,10 +7,26 @@ enum { C_NORMAL, C_RETURN, C_BREAK, C_CONTINUE, C_THROW };
 static Value js_exception;      /* what was thrown */
 static int js_abort;            /* stop everything (time limit, out of memory): not catchable */
 static long js_steps, js_step_limit = 20000000;
+/* The functions running, innermost last (for messages about a script
+   that ran too long: where it was). */
+#define JS_FRAMES 64
+static Ast *js_frames[JS_FRAMES];
+static int js_frame_depth;
+
+static int js_exec_line, js_call_pos; /* the line of the statement running, where the last call was (for messages) */
+static u64 js_deadline;          /* uptime (ms) when the running script must stop; 0: none */
+
+/* Start a run of script code allowed `ms` milliseconds. */
+static void js_start_run(int ms) {
+    js_steps = 0;
+    js_abort = 0;
+    js_deadline = uptime_ms() + (u64)ms;
+}
 static char *js_stack_base;
 static JsStr *jump_label;       /* the label of a break / continue in flight */
 static int optional_short;      /* an optional chain met null or undefined */
 static JsObj *native_new_target; /* set while a built-in runs as a constructor */
+static int native_call_line, native_call_pos; /* where the last built-in was called from */
 
 typedef struct {
     Env *env;        /* the current scope */
@@ -97,6 +113,14 @@ static int throw_error(JsObj *proto, const char *msg) {
     return C_THROW;
 }
 
+/* Where the stack was when script code was entered: limits are measured
+   from here. Code entered again from inside a script (an inserted
+   <script>, an event a script fired, a body parsed on first call) must not
+   move it deeper, or the limits would stop protecting the real stack. */
+static void js_set_stack_base(char *here) {
+    if (!js_stack_base || here > js_stack_base) js_stack_base = here;
+}
+
 static int throw_type(const char *a, const char *b, const char *c) {
     Buf m = {0};
     buf_c(&m, a);
@@ -127,6 +151,8 @@ static int to_boolean(Value v) {
     case V_NUM: return !(v.u.n == 0 || is_nan(v.u.n));
     case V_STR: return v.u.s->len > 0;
     case V_OBJ: return 1;
+    case V_SYM: return 1;
+    case V_BIG: return !big_is_zero(v.u.s);
     }
     return 0;
 }
@@ -164,6 +190,8 @@ static int to_number(Value v, double *out) {
     case V_BOOL: *out = v.u.b; return C_NORMAL;
     case V_NUM: *out = v.u.n; return C_NORMAL;
     case V_STR: *out = str_to_number(v.u.s); return C_NORMAL;
+    case V_SYM: return throw_type("Cannot convert a Symbol value to a number", NULL, NULL);
+    case V_BIG: return throw_type("Cannot convert a BigInt value to a number", NULL, NULL);
     }
     Value p;
     TRY(to_primitive(v, 'n', &p));
@@ -183,6 +211,8 @@ static int to_string(Value v, JsStr **out) {
     case V_BOOL: *out = v.u.b ? S_true : S_false; return C_NORMAL;
     case V_NUM: *out = number_str(v.u.n); return C_NORMAL;
     case V_STR: *out = v.u.s; return C_NORMAL;
+    case V_SYM: return throw_type("Cannot convert a Symbol value to a string", NULL, NULL);
+    case V_BIG: *out = big_text(v.u.s, 10); return C_NORMAL;
     }
     Value p;
     TRY(to_primitive(v, 's', &p));
@@ -191,6 +221,10 @@ static int to_string(Value v, JsStr **out) {
 
 /* A property key from any value. */
 static int to_key(Value v, JsStr **out) {
+    if (v.t == V_SYM) {
+        *out = v.u.s;
+        return C_NORMAL;
+    }
     if (v.t == V_NUM && v.u.n >= 0 && v.u.n < 1e9 && v.u.n == js_trunc(v.u.n)) {
         char text[16];
         number_to_text(v.u.n, text);
@@ -210,6 +244,8 @@ static JsStr *type_of(Value v) {
     case V_BOOL: return S_boolean;
     case V_NUM: return S_number;
     case V_STR: return S_string;
+    case V_SYM: return intern_c("symbol");
+    case V_BIG: return intern_c("bigint");
     }
     return v.u.o->cls == CL_FUNCTION ? S_function : S_object;
 }
@@ -221,6 +257,8 @@ static int strict_equals(Value a, Value b) {
     case V_BOOL: return a.u.b == b.u.b;
     case V_NUM: return a.u.n == b.u.n;
     case V_STR: return str_eq(a.u.s, b.u.s);
+    case V_SYM: return a.u.s == b.u.s;
+    case V_BIG: return str_eq(a.u.s, b.u.s);
     }
     return a.u.o == b.u.o;
 }
@@ -261,6 +299,28 @@ static int loose_equals(Value a, Value b, int *result) {
             b = v_num(b.u.b);
             continue;
         }
+        if (a.t == V_SYM || b.t == V_SYM) break;
+        if (a.t == V_BIG && b.t == V_STR) {
+            Big t = {0};
+            int ok = big_from_text(&t, b.u.s->s, b.u.s->len, 0);
+            *result = ok && str_eq(a.u.s, big_store(&t));
+            big_free(&t);
+            return C_NORMAL;
+        }
+        if (a.t == V_STR && b.t == V_BIG) {
+            Value x = a;
+            a = b;
+            b = x;
+            continue;
+        }
+        if (a.t == V_BIG && b.t == V_NUM) {
+            *result = big_compare_number(a.u.s, b.u.n) == 0;
+            return C_NORMAL;
+        }
+        if (a.t == V_NUM && b.t == V_BIG) {
+            *result = big_compare_number(b.u.s, a.u.n) == 0;
+            return C_NORMAL;
+        }
         if (a.t == V_OBJ) {
             TRY(to_primitive(a, 'n', &a));
             continue;
@@ -272,12 +332,21 @@ static int loose_equals(Value a, Value b, int *result) {
         *result = 0;
         return C_NORMAL;
     }
+    *result = 0; /* (a symbol equals only itself) */
+    return C_NORMAL;
 }
 
 /* ---------------------------------------------------------------- properties */
 
+static JsObj *SymbolProto, *BigIntProto;
+
+/* Is a property key a symbol's? (those are left out of keys, for...in, JSON) */
+static int is_symbol_key(const JsStr *k) { return k->len >= 2 && k->s[0] == '@' && k->s[1] == '@'; }
+
 static JsObj *proto_of_primitive(Value v) {
     switch (v.t) {
+    case V_SYM: return SymbolProto;
+    case V_BIG: return BigIntProto;
     case V_STR: return StringProto;
     case V_NUM: return NumberProto;
     case V_BOOL: return BooleanProto;
@@ -303,12 +372,136 @@ static double typed_coerce(int kind, double d) {
     return d;
 }
 
+/* ArrayBuffers (CL_BUFFER) hold bytes: extra, extra_len of them. A typed
+   array made over one is a view of it: target is the buffer and magic the
+   byte offset, and the buffer lists its views in bound/nbound (extra_cap
+   slots; the collector drops views that died). A view keeps its elements
+   in arr like any array, so reading is as quick as ever; writing an
+   element writes its bytes too and refreshes the other views over them. */
+static const int TYPED_BYTES[12] = {0, 1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8};
+static int buffers_made; /* (the collector has views to prune) */
+
+static double typed_decode(int kind, const unsigned char *p) {
+    switch (kind) {
+    case 1: return (signed char)p[0];
+    case 2: case 3: return p[0];
+    case 4: { short v; memcpy(&v, p, 2); return v; }
+    case 5: { unsigned short v; memcpy(&v, p, 2); return v; }
+    case 6: { int v; memcpy(&v, p, 4); return v; }
+    case 7: { unsigned v; memcpy(&v, p, 4); return v; }
+    case 8: { float v; memcpy(&v, p, 4); return v; }
+    }
+    double v;
+    memcpy(&v, p, 8);
+    return v;
+}
+
+/* d already coerced to the kind */
+static void typed_encode(int kind, double d, unsigned char *p) {
+    switch (kind) {
+    case 1: case 2: case 3: p[0] = (unsigned char)(int)d; return;
+    case 4: case 5: { unsigned short v = (unsigned short)(int)d; memcpy(p, &v, 2); return; }
+    case 6: { int v = (int)d; memcpy(p, &v, 4); return; }
+    case 7: { unsigned v = (unsigned)d; memcpy(p, &v, 4); return; }
+    case 8: { float v = (float)d; memcpy(p, &v, 4); return; }
+    }
+    memcpy(p, &d, 8);
+}
+
+static int is_view(JsObj *a) { return a->cls == CL_ARRAY && a->fn_kind && a->target && a->target->cls == CL_BUFFER; }
+
+/* Bytes [from, to) of a buffer changed: re-read them into its views. */
+static void buffer_changed(JsObj *buf, int from, int to, JsObj *except) {
+    const unsigned char *bytes = buf->extra;
+    for (int i = 0; i < buf->nbound; i++) {
+        JsObj *v = buf->bound[i].u.o;
+        if (v == except || !v->fn_kind) continue;
+        int size = TYPED_BYTES[v->fn_kind], off = v->magic;
+        int end = off + v->alen * size;
+        if (to <= off || from >= end) continue;
+        int first = from > off ? (from - off) / size : 0;
+        int last = (to - off + size - 1) / size;
+        if (last > v->alen) last = v->alen;
+        for (int k = first; k < last; k++) {
+            if (off + (k + 1) * size > buf->extra_len) break;
+            v->arr[k] = v_num(typed_decode(v->fn_kind, bytes + off + k * size));
+        }
+    }
+}
+
+/* Elements [from, to) of view a changed: write their bytes, tell the others. */
+static void view_wrote(JsObj *a, int from, int to) {
+    JsObj *buf = a->target;
+    int size = TYPED_BYTES[a->fn_kind];
+    if (to > a->alen) to = a->alen;
+    for (int k = from; k < to; k++) {
+        int at = a->magic + k * size;
+        if (at + size > buf->extra_len) break;
+        double d = a->arr[k].t == V_NUM ? a->arr[k].u.n : js_nan();
+        d = typed_coerce(a->fn_kind, d);
+        a->arr[k] = v_num(d);
+        typed_encode(a->fn_kind, d, (unsigned char *)buf->extra + at);
+    }
+    buffer_changed(buf, a->magic + from * size, a->magic + to * size, a);
+}
+
+/* after a built-in rewrote a typed array's elements in place */
+static void typed_touched(Value v) {
+    if (v.t == V_OBJ && is_view(v.u.o)) view_wrote(v.u.o, 0, v.u.o->alen);
+}
+
 static int typed_put(JsObj *a, int index, Value v) {
     if (index < 0 || index >= a->alen) return C_NORMAL; /* fixed length */
     double d;
     TRY(to_number(v, &d));
     a->arr[index] = v_num(typed_coerce(a->fn_kind, d));
+    if (is_view(a)) view_wrote(a, index, index + 1);
     return C_NORMAL;
+}
+
+/* BROWSER_MISSING: report (once each) properties scripts look for and do
+   not find on the browser's own objects (window, navigator, prototypes,
+   elements): features the browser lacks. */
+static int missing_on;
+static JsObj *missing_document;
+static char *missing_seen[1024];
+static int missing_count;
+
+static void note_missing(JsObj *o, JsStr *key, const char *how) {
+    if (!missing_on || is_symbol_key(key) || key->index >= 0) return;
+    int element = o->cls == CL_NODE && o->node && o != missing_document;
+    if (!o->gc.builtin && !element) return;
+    char what[96] = "";
+    if (o == global_obj) strcpy(what, "window");
+    else if (o == missing_document) strcpy(what, "document");
+    else if (element) strcpy(what, "an element");
+    else {
+        Prop *own = own_prop(o, S_constructor), *n = NULL;
+        if (o->cls == CL_FUNCTION) n = own_prop(o, S_name);
+        else if (own && own->v.t == V_OBJ) n = own_prop(own->v.u.o, S_name);
+        if (n && n->v.t == V_STR) {
+            strncat_safe(what, n->v.u.s->s, 60);
+            if (o->cls != CL_FUNCTION) strncat_safe(what, ".prototype", 12);
+        } else {
+            for (JsObj *p = o->proto; p && !n; p = p->proto) {
+                Prop *c = own_prop(p, S_constructor);
+                if (c && c->v.t == V_OBJ) n = own_prop(c->v.u.o, S_name);
+            }
+            strcpy(what, "a built-in ");
+            strncat_safe(what, n && n->v.t == V_STR ? n->v.u.s->s : "object", 60);
+        }
+    }
+    char line[200] = "";
+    strncat_safe(line, what, 96);
+    strncat_safe(line, ".", 2);
+    strncat_safe(line, key->s, 90);
+    for (int i = 0; i < missing_count; i++)
+        if (!strcmp(missing_seen[i], line)) return;
+    if (missing_count < 1024) {
+        missing_seen[missing_count] = malloc(strlen(line) + 1);
+        if (missing_seen[missing_count]) strcpy(missing_seen[missing_count++], line);
+    }
+    printf("[missing] %s (%s)\n", line, how);
 }
 
 static int get_from(JsObj *o, JsStr *key, Value receiver, Value *out) {
@@ -375,6 +568,7 @@ static int get_from(JsObj *o, JsStr *key, Value receiver, Value *out) {
             return C_NORMAL;
         }
     }
+    if (missing_on) note_missing(o, key, "read");
     *out = v_undef();
     return C_NORMAL;
 }
@@ -413,7 +607,13 @@ static int get_index(Value obj, Value key, Value *out) {
     if (is_nullish(obj)) {
         JsStr *k;
         if (to_string(key, &k) != C_NORMAL) k = S_empty;
-        return throw_type("Cannot read properties of ", obj.t == V_NULL ? "null (reading '" : "undefined (reading '", k->len < 60 ? k->s : "...'");
+        Buf m = {0};
+        buf_c(&m, obj.t == V_NULL ? "null (reading '" : "undefined (reading '");
+        buf_add(&m, k->s, k->len < 60 ? k->len : 60);
+        buf_c(&m, "')");
+        int r = throw_type("Cannot read properties of ", m.p, NULL);
+        free(m.p);
+        return r;
     }
     JsStr *k;
     TRY(to_key(key, &k));
@@ -446,12 +646,12 @@ static int put_value(Value obj, JsStr *key, Value v) {
             double d;
             TRY(to_number(v, &d));
             if (d < 0 || d != js_trunc(d) || d > 4294967295.0) return throw_error(RangeErrorProto, "Invalid array length");
-            arr_set_len(o, (int)d);
+            if (d <= 2147483647.0) arr_set_len(o, (int)d);
             return C_NORMAL;
         }
-        if (key->index >= 0) {
+        if (key->index >= 0 && key->index < o->alen + SPARSE_GAP) {
             if (key->index >= o->alen) arr_set_len(o, key->index + 1);
-            if (!js_oom) o->arr[key->index] = v;
+            if (!js_oom && key->index < o->alen) o->arr[key->index] = v;
             return C_NORMAL;
         }
     }
@@ -486,11 +686,11 @@ static int put_index(Value obj, Value key, Value v) {
     if (obj.t == V_OBJ && key.t == V_NUM && obj.u.o->cls == CL_ARRAY) {
         double d = key.u.n;
         if (obj.u.o->fn_kind) return d == js_trunc(d) && d >= 0 && d < 2147483647.0 ? typed_put(obj.u.o, (int)d, v) : C_NORMAL;
-        if (d >= 0 && d == js_trunc(d) && d < 50000000) {
+        if (d >= 0 && d == js_trunc(d) && d < obj.u.o->alen + SPARSE_GAP) {
             JsObj *a = obj.u.o;
             int i = (int)d;
             if (i >= a->alen) arr_set_len(a, i + 1);
-            if (!js_oom) a->arr[i] = v;
+            if (!js_oom && i < a->alen) a->arr[i] = v;
             return C_NORMAL;
         }
     }
@@ -499,7 +699,10 @@ static int put_index(Value obj, Value key, Value v) {
     return put_value(obj, k, v);
 }
 
+static void function_own_props(JsObj *f);
+
 static int has_property(JsObj *o, JsStr *key) {
+    if (o && o->cls == CL_FUNCTION && (key == S_prototype || key == S_name || key == S_length)) function_own_props(o);
     for (JsObj *p = o; p; p = p->proto) {
         if ((p->cls == CL_ARRAY || p->cls == CL_ARGUMENTS) && (key == S_length || (key->index >= 0 && key->index < p->alen))) return 1;
         if (own_prop(p, key)) return 1;
@@ -510,6 +713,7 @@ static int has_property(JsObj *o, JsStr *key) {
             if (handled && v.t != V_UNDEF) return 1;
         }
     }
+    if (missing_on) note_missing(o, key, "tested with in");
     return 0;
 }
 
@@ -528,6 +732,18 @@ static JsObj *make_function_proto(JsObj *f) {
     prop_set_raw(p, S_constructor, v_obj(f), P_HIDDEN);
     prop_set_raw(f, S_prototype, v_obj(p), P_HIDDEN);
     return p;
+}
+
+/* A function's length, name and prototype are made when first read (most
+   functions never are). Anything looking at its own properties as such
+   ("prototype" in f, hasOwnProperty, getOwnPropertyNames ...) makes them
+   real first. */
+static void function_own_props(JsObj *f) {
+    if (!f || f->cls != CL_FUNCTION || own_prop(f, S_length)) return;
+    Value v;
+    if (get_value(v_obj(f), S_length, &v) == C_NORMAL) prop_set_raw(f, S_length, v, P_HIDDEN | P_READONLY);
+    if (!own_prop(f, S_name) && get_value(v_obj(f), S_name, &v) == C_NORMAL) prop_set_raw(f, S_name, v, P_HIDDEN | P_READONLY);
+    if (f->fn && (f->fn_kind == FN_NORMAL || f->fn_kind >= FN_CLASS) && !own_prop(f, S_prototype)) make_function_proto(f);
 }
 
 static JsObj *make_native(const char *name, Native fn, int nargs, int magic) {
@@ -597,6 +813,10 @@ static void scan_uses_arguments(Ast *n, FnInfo *info) {
         return;
     }
     if (n->type == N_FUNC && !(n->flags & F_ARROW)) return;
+    if (n->type == N_FUNC && (n->flags & F_LAZY_ARGS)) { /* an arrow function's unparsed body uses it */
+        info->uses_arguments = 1;
+        return;
+    }
     if (n->type == N_CLASS) return;
     scan_uses_arguments(n->a, info);
     scan_uses_arguments(n->b, info);
@@ -651,7 +871,8 @@ static JsObj *make_closure(Ast *fn, Frame *f) {
     o->fn = fn;
     o->scope = f->env;
     o->fn_kind = (fn->flags & F_ARROW) ? FN_ARROW : (fn->flags & F_METHOD) ? FN_METHOD : FN_NORMAL;
-    o->strict = (unsigned char)(f->strict || function_info(fn)->strict);
+    int lazy = fn->a && fn->a->type == N_LAZY; /* (not parsed yet: its strictness was noted when skimmed) */
+    o->strict = (unsigned char)(f->strict || (lazy ? (fn->flags & F_LAZY_STRICT) != 0 : function_info(fn)->strict));
     if (fn->flags & F_ARROW) {
         o->this_val = f->this_v;
         o->home = f->home;
@@ -673,20 +894,50 @@ static int check_limits(void) {
         js_exception = v_str(str_c("the script ran out of memory"));
         return C_THROW;
     }
-    if (++js_steps > js_step_limit) {
+    if (++js_steps > js_step_limit || ((js_steps & 1023) == 0 && js_deadline && uptime_ms() > js_deadline)) {
         js_abort = 1;
-        js_exception = v_str(str_c("the script ran too long and was stopped"));
+        char text[140] = "the script ran too long and was stopped (at line ";
+        char t[16];
+        number_to_text(js_exec_line, t);
+        strncat_safe(text, t, 12);
+        strncat_safe(text, ", last call at character ", 26);
+        number_to_text(js_call_pos, t);
+        strncat_safe(text, t, 12);
+        strncat_safe(text, ")", 2);
+        if (getenv("BROWSER_TRACE")) { /* the functions it was in, innermost first */
+            printf("[stack] functions running (where each starts):");
+            int top = js_frame_depth < JS_FRAMES ? js_frame_depth : JS_FRAMES;
+            for (int i = top - 1; i >= 0 && i >= top - 12; i--) {
+                Ast *fn = js_frames[i];
+                printf(" %d", fn && fn->cache_len > 0 ? fn->cache_len - 1 : -1);
+            }
+            printf("\n");
+        }
+        js_exception = v_str(str_c(text));
         return C_THROW;
     }
     return C_NORMAL;
 }
 
 /* Run a JavaScript function's body. */
+static int run_function_body(JsObj *fo, Value this_v, Value *args, int argc, JsObj *new_target, Value *ret);
+
 static int run_function(JsObj *fo, Value this_v, Value *args, int argc, JsObj *new_target, Value *ret) {
+    if (js_frame_depth < JS_FRAMES) js_frames[js_frame_depth] = fo->fn;
+    js_frame_depth++;
+    int r = run_function_body(fo, this_v, args, argc, new_target, ret);
+    js_frame_depth--;
+    return r;
+}
+
+static int run_function_body(JsObj *fo, Value this_v, Value *args, int argc, JsObj *new_target, Value *ret) {
     char here;
-    if (js_stack_base - &here > 600000) return throw_error(RangeErrorProto, "Maximum call stack size exceeded");
+    if (js_stack_base - &here > 6000000) return throw_error(RangeErrorProto, "Maximum call stack size exceeded");
     TRY(check_limits());
     Ast *fn = fo->fn;
+    if (fn->a && fn->a->type == N_LAZY && parse_lazy_body(fn) != 0) { /* first call: parse the body now */
+        return throw_error(SyntaxErrorProto, parse_error);
+    }
     FnInfo *info = function_info(fn);
     Env *env = env_new(fo->scope);
     Frame fr;
@@ -711,6 +962,8 @@ static int run_function(JsObj *fo, Value this_v, Value *args, int argc, JsObj *n
         JsObj *a = obj_new_raw(CL_ARGUMENTS, ObjectProto);
         arr_reserve(a, argc);
         for (int i = 0; i < argc; i++) arr_push(a, args[i]);
+        Prop *values = own_prop(ArrayProto, S_iterator); /* (arguments is iterable, like an array) */
+        if (values) prop_set_raw(a, S_iterator, values->v, P_HIDDEN);
         env_define(env, S_arguments, v_obj(a), 0);
     }
     for (int i = 0; i < info->nvars; i++) env_define(env, info->vars[i], v_undef(), 0);
@@ -732,8 +985,23 @@ static int run_function(JsObj *fo, Value this_v, Value *args, int argc, JsObj *n
     return C_NORMAL;
 }
 
+/* Too deep in the C stack to call anything more? (built-in functions can
+   call each other in a cycle without passing through run_function) */
+static int stack_exhausted(void) {
+    char here;
+    return js_stack_base && js_stack_base - &here > 6100000;
+}
+
 static int call_function(JsObj *fo, Value this_v, Value *args, int argc, Value *ret) {
     if (!fo || fo->cls != CL_FUNCTION) return throw_type("not a function", NULL, NULL);
+    if (stack_exhausted()) {
+        if (js_trace_throws) {
+            Prop *p = own_prop(fo, S_name);
+            printf("[deep] calling %s %s\n", fo->native ? "built-in" : "function",
+                   p && p->v.t == V_STR ? p->v.u.s->s : fo->fn && fo->fn->str ? fo->fn->str->s : "(anonymous)");
+        }
+        return throw_error(RangeErrorProto, "Maximum call stack size exceeded");
+    }
     if (fo->native) {
         JsObj *saved = native_new_target;
         native_new_target = NULL;
@@ -748,8 +1016,9 @@ static int call_function(JsObj *fo, Value this_v, Value *args, int argc, Value *
         if (!all) return throw_error(RangeErrorProto, "out of memory");
         for (int i = 0; i < fo->nbound; i++) all[i] = fo->bound[i];
         for (int i = 0; i < argc; i++) all[fo->nbound + i] = args[i];
+        if (all != small) gc_extra_add(all, sizeof(Value) * (size_t)total);
         int r = call_function(fo->target, fo->this_val, all, total, ret);
-        if (all != small) free(all);
+        free_args(all, small);
         return r;
     }
     if (fo->fn_kind == FN_CLASS || fo->fn_kind == FN_DERIVED) return throw_type("Class constructor cannot be invoked without 'new'", NULL, NULL);
@@ -828,6 +1097,7 @@ static void name_function(Value v, JsStr *name) {
 static int iterate_to_array(Value v, JsObj **out) {
     JsObj *a = new_array(0);
     *out = a;
+    if (stack_exhausted()) return throw_error(RangeErrorProto, "Maximum call stack size exceeded");
     if (v.t == V_STR) {
         const unsigned char *s = (const unsigned char *)v.u.s->s;
         for (int i = 0; i < v.u.s->len;) {
@@ -920,7 +1190,7 @@ static void enumerable_keys(JsObj *o, JsObj *out, int own_only) {
             for (int i = 0; i < p->this_val.u.s->len; i++) arr_push(out, v_str(number_str(i)));
         }
         for (int i = 0; i < p->nprops; i++) {
-            if (p->props[i].flags & P_HIDDEN) continue;
+            if ((p->props[i].flags & P_HIDDEN) || is_symbol_key(p->props[i].key)) continue;
             /* skip names already seen (shadowed) */
             int seen = 0;
             for (int k = 0; k < out->alen && !seen; k++) seen = out->arr[k].t == V_STR && out->arr[k].u.s == p->props[i].key;
@@ -1150,6 +1420,7 @@ static int eval_class(Ast *c, Frame *f, Value *out) {
 static int construct(JsObj *fo, Value *args, int argc, JsObj *new_target, Value *out) {
     if (!fo || fo->cls != CL_FUNCTION || fo->fn_kind == FN_ARROW || fo->fn_kind == FN_METHOD)
         return throw_type("not a constructor", NULL, NULL);
+    if (stack_exhausted()) return throw_error(RangeErrorProto, "Maximum call stack size exceeded");
     if (fo->target && !fo->fn && !fo->native) return construct(fo->target, args, argc, new_target, out);
     Value proto_v;
     TRY(get_value(v_obj(new_target), S_prototype, &proto_v));
@@ -1230,9 +1501,14 @@ static int eval_args(Ast *list, Frame *f, Value **out, int *count, Value *small,
                 if (n == cap) {
                     cap *= 2;
                     Value *bigger = malloc(sizeof(Value) * (size_t)cap);
-                    if (!bigger) return throw_error(RangeErrorProto, "out of memory");
+                    if (!bigger) {
+                        free_args(args, small);
+                        return throw_error(RangeErrorProto, "out of memory");
+                    }
+                    memset(bigger, 0, sizeof(Value) * (size_t)cap);
                     memcpy(bigger, args, sizeof(Value) * (size_t)n);
-                    if (args != small) free(args);
+                    free_args(args, small);
+                    gc_extra_add(bigger, sizeof(Value) * (size_t)cap);
                     args = bigger;
                 }
                 args[n++] = items->arr[i];
@@ -1242,14 +1518,19 @@ static int eval_args(Ast *list, Frame *f, Value **out, int *count, Value *small,
         if (n == cap) {
             cap *= 2;
             Value *bigger = malloc(sizeof(Value) * (size_t)cap);
-            if (!bigger) return throw_error(RangeErrorProto, "out of memory");
+            if (!bigger) {
+                free_args(args, small);
+                return throw_error(RangeErrorProto, "out of memory");
+            }
+            memset(bigger, 0, sizeof(Value) * (size_t)cap);
             memcpy(bigger, args, sizeof(Value) * (size_t)n);
-            if (args != small) free(args);
+            free_args(args, small);
+            gc_extra_add(bigger, sizeof(Value) * (size_t)cap);
             args = bigger;
         }
         int r = eval(a, f, &args[n]);
         if (r != C_NORMAL) {
-            if (args != small) free(args);
+            free_args(args, small);
             return r;
         }
         n++;
@@ -1259,7 +1540,70 @@ static int eval_args(Ast *list, Frame *f, Value **out, int *count, Value *small,
     return C_NORMAL;
 }
 
+/* ", line 12" for an error message */
+static void add_line(Buf *b, int line) {
+    if (line <= 0) return;
+    char t[16];
+    number_to_text(line, t);
+    buf_c(b, ", line ");
+    buf_c(b, t);
+}
+
+/* Source-like text for the thing being called, for error messages:
+   "a.b.c", "x[...]", "(0, r.default)" -> "r.default", "f(...)". */
+static void describe_callee(Ast *n, Buf *b, int depth) {
+    if (!n || depth > 6 || b->len > 80) {
+        buf_c(b, "...");
+        return;
+    }
+    switch (n->type) {
+    case N_IDENT: buf_add(b, n->str->s, n->str->len); return;
+    case N_THIS: buf_c(b, "this"); return;
+    case N_MEMBER:
+        describe_callee(n->a, b, depth + 1);
+        buf_ch(b, '.');
+        buf_add(b, n->str->s, n->str->len);
+        return;
+    case N_INDEX:
+        describe_callee(n->a, b, depth + 1);
+        if (n->b && n->b->type == N_STR) {
+            buf_c(b, "[\"");
+            buf_add(b, n->b->str->s, n->b->str->len < 40 ? n->b->str->len : 40);
+            buf_c(b, "\"]");
+        } else {
+            buf_c(b, "[...]");
+        }
+        return;
+    case N_SEQ: describe_callee(n->b, b, depth + 1); return;
+    case N_CALL:
+        describe_callee(n->a, b, depth + 1);
+        buf_c(b, "(...)");
+        return;
+    case N_FUNC: buf_c(b, "a function expression"); return;
+    default: buf_c(b, "expression"); return;
+    }
+}
+
+/* BigInt op BigInt */
+static int big_binary(int op, Value a, Value b, Value *out) {
+    if (a.t != V_BIG || b.t != V_BIG) return throw_type("Cannot mix BigInt and other types, use explicit conversions", NULL, NULL);
+    if (op == P3('>', '>', '>')) return throw_type("BigInts have no unsigned right shift, use >> instead", NULL, NULL);
+    const char *error = NULL;
+    JsStr *r = big_arith(op, a.u.s, b.u.s, &error);
+    if (!r) return throw_error(RangeErrorProto, error ? error : "BigInt operation failed");
+    *out = v_big(r);
+    return C_NORMAL;
+}
+
 static int arith(int op, Value a, Value b, Value *out) {
+    if (a.t == V_NUM && b.t == V_NUM) { /* (the common case, quickly) */
+        double x = a.u.n, y = b.u.n;
+        switch (op) {
+        case '+': *out = v_num(x + y); return C_NORMAL;
+        case '-': *out = v_num(x - y); return C_NORMAL;
+        case '*': *out = v_num(x * y); return C_NORMAL;
+        }
+    }
     if (op == '+') {
         Value pa, pb;
         TRY(to_primitive(a, 'n', &pa));
@@ -1271,12 +1615,16 @@ static int arith(int op, Value a, Value b, Value *out) {
             *out = v_str(str_concat(sa, sb));
             return C_NORMAL;
         }
+        if (pa.t == V_BIG || pb.t == V_BIG) return big_binary(op, pa, pb, out);
         double x, y;
         TRY(to_number(pa, &x));
         TRY(to_number(pb, &y));
         *out = v_num(x + y);
         return C_NORMAL;
     }
+    if (a.t == V_OBJ) TRY(to_primitive(a, 'n', &a));
+    if (b.t == V_OBJ) TRY(to_primitive(b, 'n', &b));
+    if (a.t == V_BIG || b.t == V_BIG) return big_binary(op, a, b, out);
     double x, y;
     TRY(to_number(a, &x));
     TRY(to_number(b, &y));
@@ -1304,6 +1652,35 @@ static int less_than(Value a, Value b, int *result) {
     TRY(to_primitive(b, 'n', &pb));
     if (pa.t == V_STR && pb.t == V_STR) {
         *result = str_cmp(pa.u.s, pb.u.s) < 0;
+        return C_NORMAL;
+    }
+    if (pa.t == V_BIG || pb.t == V_BIG) {
+        for (int i = 0; i < 2; i++) { /* a string side is read as a BigInt */
+            Value *p = i ? &pb : &pa;
+            if (p->t == V_STR) {
+                Big t = {0};
+                if (!big_from_text(&t, p->u.s->s, p->u.s->len, 0)) {
+                    big_free(&t);
+                    *result = -1;
+                    return C_NORMAL;
+                }
+                *p = v_big(big_store(&t));
+            }
+        }
+        if (pa.t == V_BIG && pb.t == V_BIG) {
+            *result = big_compare(pa.u.s, pb.u.s) < 0;
+            return C_NORMAL;
+        }
+        double d;
+        if (pa.t == V_BIG) {
+            TRY(to_number(pb, &d));
+            int c = big_compare_number(pa.u.s, d);
+            *result = c == 2 ? -1 : c < 0;
+        } else {
+            TRY(to_number(pa, &d));
+            int c = big_compare_number(pb.u.s, d);
+            *result = c == 2 ? -1 : c > 0;
+        }
         return C_NORMAL;
     }
     double x, y;
@@ -1430,13 +1807,13 @@ static int eval_object(Ast *n, Frame *f, Value *out) {
 
 static int eval_call(Ast *n, Frame *f, Value *out) {
     Ast *callee = n->a;
-    Value fn, this_v = v_undef();
+    Value fn, this_v = v_undef(), called_key = v_undef();
     if (callee->type == N_SUPER) {
         Value small[8], *args;
         int argc;
         TRY(eval_args(n->list, f, &args, &argc, small, 8));
         int r = call_super(f, args, argc);
-        if (args != small) free(args);
+        free_args(args, small);
         *out = v_undef();
         return r;
     }
@@ -1466,11 +1843,25 @@ static int eval_call(Ast *n, Frame *f, Value *out) {
                 *out = v_undef();
                 return C_NORMAL;
             }
+            if (is_nullish(this_v)) { /* a.b.c() with a.b undefined: say which */
+                Buf m = {0};
+                buf_c(&m, this_v.t == V_NULL ? "null (calling '" : "undefined (calling '");
+                if (callee->type == N_MEMBER) buf_add(&m, callee->str->s, callee->str->len < 60 ? callee->str->len : 60);
+                else buf_c(&m, "[...]");
+                buf_c(&m, "' of ");
+                describe_callee(callee->a, &m, 0);
+                buf_ch(&m, ')');
+                add_line(&m, n->line);
+                int r = throw_type("Cannot read properties of ", m.p, NULL);
+                free(m.p);
+                return r;
+            }
             if (callee->type == N_MEMBER) {
                 TRY(get_value(this_v, callee->str, &fn));
             } else {
                 Value k;
                 TRY(eval(callee->b, f, &k));
+                called_key = k;
                 TRY(get_index(this_v, k, &fn));
             }
         }
@@ -1490,20 +1881,97 @@ static int eval_call(Ast *n, Frame *f, Value *out) {
         return C_NORMAL;
     }
     if (!is_callable(fn)) {
-        const char *what = callee->type == N_IDENT ? callee->str->s : callee->type == N_MEMBER ? callee->str->s : "expression";
-        return throw_type(what, " is not a function", NULL);
+        Buf what = {0};
+        describe_callee(callee, &what, 0);
+        buf_c(&what, " is not a function");
+        if (fn.t == V_UNDEF || fn.t == V_NULL) buf_c(&what, fn.t == V_UNDEF ? " (it is undefined)" : " (it is null)");
+        if (called_key.t == V_STR && called_key.u.s->len < 60) { /* x[k](): which k */
+            buf_c(&what, " (calling '");
+            buf_add(&what, called_key.u.s->s, called_key.u.s->len);
+            buf_c(&what, "'");
+            if (js_trace_throws && this_v.t == V_OBJ) {
+                Prop *cp = NULL;
+                for (JsObj *p = this_v.u.o; p && !cp; p = p->proto) cp = own_prop(p, S_constructor);
+                Prop *np = cp && cp->v.t == V_OBJ ? own_prop(cp->v.u.o, S_name) : NULL;
+                if (np && np->v.t == V_STR) {
+                    buf_c(&what, " on a ");
+                    buf_add(&what, np->v.u.s->s, np->v.u.s->len);
+                }
+            }
+            buf_ch(&what, ')');
+        }
+        add_line(&what, n->line);
+        if (n->cache_len > 0) {
+            char t[16];
+            number_to_text(n->cache_len - 1, t);
+            buf_c(&what, ", character ");
+            buf_c(&what, t);
+        }
+        int r = throw_type(what.p, NULL, NULL);
+        free(what.p);
+        return r;
     }
     Value small[8], *args;
     int argc;
     TRY(eval_args(n->list, f, &args, &argc, small, 8));
+    js_call_pos = n->cache_len - 1;
+    if (fn.u.o->native) { /* (for built-ins' error messages: where they were called from) */
+        native_call_line = n->line;
+        native_call_pos = n->cache_len - 1;
+    }
     int r = call_function(fn.u.o, this_v, args, argc, out);
-    if (args != small) free(args);
+    free_args(args, small);
     return r;
 }
 
+/* (Cases of eval with big locals live in functions of their own: eval's
+   own stack frame is paid for at every level of every expression.) */
+
+/* a, b, c, ...: a left-leaning chain, walked without recursion */
+__attribute__((noinline)) static int eval_seq(Ast *n, Frame *f, Value *out) {
+    Ast *chain[256];
+    int k = 0;
+    Ast *x = n;
+    while (x->type == N_SEQ && k < 256) {
+        chain[k++] = x;
+        x = x->a;
+    }
+    Value ignored;
+    TRY(eval(x, f, &ignored));
+    for (int i = k - 1; i > 0; i--) TRY(eval(chain[i]->b, f, &ignored));
+    return eval(chain[0]->b, f, out);
+}
+
+__attribute__((noinline)) static int eval_tagged(Ast *n, Frame *f, Value *out) {
+    Value tag;
+    TRY(eval(n->a, f, &tag));
+    JsObj *strings = new_array(0);
+    Value args[9];
+    int argc = 1;
+    int i = 0;
+    for (Ast *p = n->b->list; p; p = p->next, i++) {
+        if (i % 2 == 0) arr_push(strings, v_str(p->str));
+        else if (argc < 9) TRY(eval(p, f, &args[argc++]));
+    }
+    prop_set_raw(strings, intern_c("raw"), v_obj(strings), P_HIDDEN);
+    args[0] = v_obj(strings);
+    if (!is_callable(tag)) return throw_type("tag is not a function", NULL, NULL);
+    return call_function(tag.u.o, v_undef(), args, argc, out);
+}
+
+__attribute__((noinline)) static int eval_regex(Ast *n, Value *out) {
+    char error[120];
+    JsObj *re = regexp_new(n->str, n->a->str, error);
+    if (!re) return throw_error(SyntaxErrorProto, error);
+    *out = v_obj(re);
+    return C_NORMAL;
+}
+
 static int eval(Ast *n, Frame *f, Value *out) {
+    char here;
+    if (js_stack_base - &here > 6300000) return throw_error(RangeErrorProto, "Maximum call stack size exceeded (expression too deeply nested)");
     switch (n->type) {
-    case N_NUM: *out = v_num(n->num); return C_NORMAL;
+    case N_NUM: *out = n->op == 'n' ? v_big(n->str) : v_num(n->num); return C_NORMAL;
     case N_STR: *out = v_str(n->str); return C_NORMAL;
     case N_IDENT:
         if (n->op == 'k') {
@@ -1534,30 +2002,8 @@ static int eval(Ast *n, Frame *f, Value *out) {
         *out = v_str(buf_done(&b));
         return C_NORMAL;
     }
-    case N_TAGGED: {
-        Value tag;
-        TRY(eval(n->a, f, &tag));
-        JsObj *strings = new_array(0);
-        Value small[9], args[9];
-        int argc = 1;
-        int i = 0;
-        for (Ast *p = n->b->list; p; p = p->next, i++) {
-            if (i % 2 == 0) arr_push(strings, v_str(p->str));
-            else if (argc < 9) TRY(eval(p, f, &args[argc++]));
-        }
-        prop_set_raw(strings, intern_c("raw"), v_obj(strings), P_HIDDEN);
-        args[0] = v_obj(strings);
-        (void)small;
-        if (!is_callable(tag)) return throw_type("tag is not a function", NULL, NULL);
-        return call_function(tag.u.o, v_undef(), args, argc, out);
-    }
-    case N_REGEX: {
-        char error[120];
-        JsObj *re = regexp_new(n->str, n->a->str, error);
-        if (!re) return throw_error(SyntaxErrorProto, error);
-        *out = v_obj(re);
-        return C_NORMAL;
-    }
+    case N_TAGGED: return eval_tagged(n, f, out);
+    case N_REGEX: return eval_regex(n, out);
     case N_ARRAY: {
         JsObj *a = new_array(0);
         for (Ast *e = n->list; e; e = e->next) {
@@ -1579,6 +2025,18 @@ static int eval(Ast *n, Frame *f, Value *out) {
     }
     case N_OBJECT: return eval_object(n, f, out);
     case N_FUNC: {
+        if (n->str && !(n->flags & (F_ARROW | F_METHOD))) {
+            /* function name() {...} as an expression: inside, `name` is the
+               function itself, in a scope of its own (it shadows any outer
+               `name`, and is not visible outside) */
+            Env *named = env_new(f->env);
+            Frame inner = *f;
+            inner.env = named;
+            JsObj *fn = make_closure(n, &inner);
+            env_define(named, n->str, v_obj(fn), 0);
+            *out = v_obj(fn);
+            return C_NORMAL;
+        }
         JsObj *fn = make_closure(n, f);
         *out = v_obj(fn);
         return C_NORMAL;
@@ -1612,13 +2070,37 @@ static int eval(Ast *n, Frame *f, Value *out) {
             return C_NORMAL;
         }
         if (n->type == N_MEMBER) {
-            if (is_nullish(obj))
-                return throw_type("Cannot read properties of ", obj.t == V_NULL ? "null (reading '" : "undefined (reading '",
-                                  n->str->len < 60 ? n->str->s : "...");
+            if (is_nullish(obj)) { /* "Cannot read properties of undefined (reading 'x' of a.b)" */
+                Buf m = {0};
+                buf_c(&m, obj.t == V_NULL ? "null (reading '" : "undefined (reading '");
+                buf_add(&m, n->str->s, n->str->len < 60 ? n->str->len : 60);
+                buf_c(&m, "' of ");
+                describe_callee(n->a, &m, 0);
+                buf_ch(&m, ')');
+                add_line(&m, n->line);
+                int r = throw_type("Cannot read properties of ", m.p, NULL);
+                free(m.p);
+                return r;
+            }
             return get_value(obj, n->str, out);
         }
         Value key;
         TRY(eval(n->b, f, &key));
+        if (is_nullish(obj)) { /* "Cannot read properties of undefined (reading 'x' of a.b)" */
+            JsStr *k;
+            if (key.t == V_SYM) k = key.u.s;
+            else if (to_string(key, &k) != C_NORMAL) k = S_empty;
+            Buf m = {0};
+            buf_c(&m, obj.t == V_NULL ? "null (reading '" : "undefined (reading '");
+            buf_add(&m, k->s, k->len < 60 ? k->len : 60);
+            buf_c(&m, "' of ");
+            describe_callee(n->a, &m, 0);
+            buf_ch(&m, ')');
+            add_line(&m, n->line);
+            int r = throw_type("Cannot read properties of ", m.p, NULL);
+            free(m.p);
+            return r;
+        }
         return get_index(obj, key, out);
     }
     case N_CALL: return eval_call(n, f, out);
@@ -1633,11 +2115,12 @@ static int eval(Ast *n, Frame *f, Value *out) {
         int argc;
         TRY(eval_args(n->list, f, &args, &argc, small, 8));
         int r = construct(fn.u.o, args, argc, fn.u.o, out);
-        if (args != small) free(args);
+        free_args(args, small);
         return r;
     }
     case N_UNARY: {
         if (n->op == 't' && n->a->type == N_IDENT && n->a->op != 'k' && !lookup(f->env, n->a->str, NULL)) {
+            if (missing_on) note_missing(global_obj, n->a->str, "typeof");
             *out = v_str(S_undefined); /* typeof an undeclared name */
             return C_NORMAL;
         }
@@ -1668,9 +2151,25 @@ static int eval(Ast *n, Frame *f, Value *out) {
         double d;
         switch (n->op) {
         case '!': *out = v_bool(!to_boolean(v)); return C_NORMAL;
-        case '-': TRY(to_number(v, &d)); *out = v_num(-d); return C_NORMAL;
+        case '-':
+            if (v.t == V_OBJ) TRY(to_primitive(v, 'n', &v));
+            if (v.t == V_BIG) {
+                *out = v_big(big_negate(v.u.s));
+                return C_NORMAL;
+            }
+            TRY(to_number(v, &d));
+            *out = v_num(-d);
+            return C_NORMAL;
         case '+': TRY(to_number(v, &d)); *out = v_num(d); return C_NORMAL;
-        case '~': TRY(to_number(v, &d)); *out = v_num(~to_int32(d)); return C_NORMAL;
+        case '~':
+            if (v.t == V_OBJ) TRY(to_primitive(v, 'n', &v));
+            if (v.t == V_BIG) {
+                *out = v_big(big_not(v.u.s));
+                return C_NORMAL;
+            }
+            TRY(to_number(v, &d));
+            *out = v_num(~to_int32(d));
+            return C_NORMAL;
         case 't': *out = v_str(type_of(v)); return C_NORMAL;
         case 'v': *out = v_undef(); return C_NORMAL;
         case 'a': /* await: a settled promise gives its value */
@@ -1691,6 +2190,14 @@ static int eval(Ast *n, Frame *f, Value *out) {
     case N_UPDATE: {
         Value base = v_undef(), key = v_undef(), old;
         TRY(read_target(n->a, f, &base, &key, &old));
+        if (old.t == V_OBJ) TRY(to_primitive(old, 'n', &old));
+        if (old.t == V_BIG) {
+            const char *error = NULL;
+            Value nv = v_big(big_arith(n->op == P2('+', '+') ? '+' : '-', old.u.s, big_small(1), &error));
+            TRY(write_target(n->a, f, base, key, nv));
+            *out = (n->flags & F_PREFIX) ? nv : old;
+            return C_NORMAL;
+        }
         double d;
         TRY(to_number(old, &d));
         double nd = n->op == P2('+', '+') ? d + 1 : d - 1;
@@ -1718,11 +2225,7 @@ static int eval(Ast *n, Frame *f, Value *out) {
         TRY(eval(n->a, f, &t));
         return eval(to_boolean(t) ? n->b : n->c, f, out);
     }
-    case N_SEQ: {
-        Value ignored;
-        TRY(eval(n->a, f, &ignored));
-        return eval(n->b, f, out);
-    }
+    case N_SEQ: return eval_seq(n, f, out);
     case N_ASSIGN: {
         Ast *t = n->a;
         if (n->op == '=') {
@@ -1834,6 +2337,7 @@ static int exec(Ast *n, Frame *f, Value *out) { return exec_labeled(n, f, out, N
 
 static int exec_labeled(Ast *n, Frame *f, Value *out, JsStr *label) {
     if (!n) return C_NORMAL;
+    js_exec_line = n->line;
     TRY(check_limits());
     switch (n->type) {
     case N_EXPR: return eval(n->a, f, out);
@@ -1965,7 +2469,16 @@ static int exec_labeled(Ast *n, Frame *f, Value *out, JsStr *label) {
             js_exception = v;
             describe_exception(text, sizeof(text));
             js_exception = saved;
-            printf("[throw] (by the script, line %d) %s\n", n->line, text);
+            printf("[throw] (by the script, line %d, last call at character %d) %s\n", n->line, js_call_pos, text);
+            if (v.t == V_OBJ) { /* what it is, when it says little */
+                Value stack;
+                if (get_value(v, intern_c("stack"), &stack) == C_NORMAL && stack.t == V_STR && stack.u.s->len < 400)
+                    printf("[throw]   stack: %s\n", stack.u.s->s);
+                Prop *cp = NULL;
+                for (JsObj *p = v.u.o; p && !cp; p = p->proto) cp = own_prop(p, S_constructor);
+                Prop *np = cp && cp->v.t == V_OBJ ? own_prop(cp->v.u.o, S_name) : NULL;
+                if (np && np->v.t == V_STR) printf("[throw]   made by %s\n", np->v.u.s->s);
+            }
         }
         js_exception = v;
         return C_THROW;
@@ -2068,9 +2581,8 @@ static void js_report(const char *what);
 static int js_call_toplevel(Value fn, Value this_v, Value *args, int argc, Value *ret) {
     if (!is_callable(fn)) return -1;
     char here;
-    js_stack_base = &here;
-    js_steps = 0;
-    js_abort = 0;
+    js_set_stack_base(&here);
+    js_start_run(1000); /* an event handler or timer: a second at most */
     optional_short = 0;
     Value r;
     int code = call_function(fn.u.o, this_v, args, argc, &r);
@@ -2086,7 +2598,17 @@ static int js_call_toplevel(Value fn, Value this_v, Value *args, int argc, Value
 
 /* Run a script's text in the global scope. */
 static int js_run_script(const char *src, int len, const char *where) {
+    if (js_oom) return -1; /* out of memory: no more scripts on this page */
+    int chunks_before = arena_chunks;
+    u64 parse_t0 = uptime_ms();
     Ast *program = parse_script(src, len);
+    u64 parse_ms = uptime_ms() - parse_t0;
+    if (js_trace_throws) printf("[parse] %d bytes of script -> %d KiB of tree (js heap +%d KiB since collection, whole heap %d KiB; lazy %d made %d small %d parsed)\n", len, (arena_chunks - chunks_before) * 64, (int)(heap_since_gc / 1024), (int)(((char *)sbrk(0) - (char *)0x10040000000ull) / 1024), stat_lazy_made, stat_lazy_small, stat_lazy_parsed);
+    if (js_oom) {
+        strcpy(js_last_error, "the page's scripts used all the memory RDX allows; they were stopped");
+        js_report(js_last_error);
+        return -1;
+    }
     if (!program) {
         strcpy(js_last_error, parse_error);
         js_report(js_last_error);
@@ -2108,16 +2630,19 @@ static int js_run_script(const char *src, int len, const char *where) {
     }
     free(info.vars);
     char here;
-    js_stack_base = &here;
-    js_steps = 0;
-    js_abort = 0;
+    js_set_stack_base(&here);
+    js_start_run(3000); /* a whole script: three seconds at most */
+    js_frame_depth = 0;
     optional_short = 0;
     Value out = v_undef();
     hoist_functions(program->list, &f);
     int code = C_NORMAL;
     for (Ast *s = program->list; s && code == C_NORMAL; s = s->next) code = exec(s, &f, &out);
+    if (getenv("BROWSER_TIMING") && (len > 20000 || uptime_ms() - parse_t0 > 100))
+        printf("[script] %d KiB: parse %d ms, run %d ms, %d steps\n", len / 1024, (int)parse_ms, (int)(uptime_ms() - parse_t0 - parse_ms), (int)js_steps);
     if (code == C_THROW) {
         describe_exception(js_last_error, sizeof(js_last_error));
+        if (js_trace_throws) printf("[script] the error below is from %s\n", where);
         js_report(js_last_error);
         js_abort = 0;
         return -1;

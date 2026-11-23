@@ -15,9 +15,13 @@ use crate::{fs, sched};
 pub const IMAGE_BASE: u64 = USER_BASE + 0x40_0000;
 const IMAGE_MAX: u64 = 64 * 1024 * 1024;
 pub const HEAP_BASE: u64 = USER_BASE + 0x4000_0000;
-pub const HEAP_MAX: u64 = 64 * 1024 * 1024;
-const STACK_TOP: u64 = USER_BASE + 0x8000_0000;
-const STACK_PAGES: u64 = 256; // 1 MiB
+pub const HEAP_MAX: u64 = 500 * 1024 * 1024; // address space (up to the threads' stacks); pages are mapped as the heap grows
+pub const STACK_TOP: u64 = USER_BASE + 0x8000_0000;
+const STACK_PAGES: u64 = 256; // 1 MiB, mapped at the start
+/// How far the main stack may grow: pages below the first 1 MiB are mapped
+/// when first touched (see arch::handle_exception), so deep recursion works
+/// without every program paying for a big stack.
+pub const STACK_MAX: u64 = 8 * 1024 * 1024;
 const ARG_AREA: u64 = 256;
 
 fn u16_at(data: &[u8], off: usize) -> Result<u16, &'static str> {

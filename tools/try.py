@@ -51,7 +51,8 @@ with open(DISK, "wb") as f:
 # arguments (e.g. "-device qemu-xhci -device usb-kbd"), TRY_BOOTLOG=1 also
 # prints the kernel's boot messages.
 proc = subprocess.Popen([
-    qemu, "-machine", os.environ.get("TRY_MACHINE", "q35"), "-m", "256M",
+    qemu, "-machine", os.environ.get("TRY_MACHINE", "q35"), "-m", os.environ.get("TRY_MEM", "256M"),
+    ] + sum([["-accel", a] for a in os.environ.get("RDX_ACCEL", "whpx,tcg").split(",")], []) + [
     "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
     "-drive", f"format=raw,file=fat:rw:{ESP}",
 ] + ([] if os.environ.get("TRY_NODISK") else ["-drive", f"format=raw,file={DISK}"]) + [
