@@ -7,4 +7,4 @@ for i in 1..6 {
     total += roll
 }
 print("total:", total)
-if total >17 { print("fuck you") } else { print("ez bot") }
+if total > 17 { print("lucky!") } else { print("better luck next time") }

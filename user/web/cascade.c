@@ -453,7 +453,7 @@ static void font_face_rule(const char *decls, int len) {
         }
         if (!latin) return;
     }
-    /* the best of the sources: WOFF or TrueType (WOFF2 can't be read yet) */
+    /* the best of the sources: WOFF2, WOFF or TrueType */
     const char *best = NULL;
     int best_len = 0, best_rank = 0;
     for (int i = 0; i + 4 <= src_len;) {
@@ -471,6 +471,7 @@ static void font_face_rule(const char *decls, int len) {
         /* its format(): before the next url( */
         int next = u;
         while (next + 4 <= src_len && strncasecmp(src + next, "url(", 4)) next++;
+        if (next + 4 > src_len) next = src_len; /* (no more sources: to the end) */
         char kind[32] = "";
         for (int f = u; f + 7 <= next; f++)
             if (!strncasecmp(src + f, "format(", 7)) {
@@ -502,7 +503,7 @@ static void font_face_rule(const char *decls, int len) {
                 kind[q] = 0;
             }
         }
-        int rank = !strcmp(kind, "woff") ? 3 : !strcmp(kind, "truetype") || !strcmp(kind, "ttf") ? 2
+        int rank = !strcmp(kind, "woff2") ? 4 : !strcmp(kind, "woff") ? 3 : !strcmp(kind, "truetype") || !strcmp(kind, "ttf") ? 2
                    : !strcmp(kind, "opentype") || !strcmp(kind, "otf") ? 1 : 0;
         if (rank > best_rank) {
             best_rank = rank;
@@ -519,7 +520,8 @@ static void font_face_rule(const char *decls, int len) {
     int used, wn = number100(weight, &used);
     int bold = used ? wn >= 60000 : !strncasecmp(weight, "bold", 4);
     int italic = !strncasecmp(style, "italic", 6) || !strncasecmp(style, "oblique", 7);
-    web_font_declare(family, bold, italic, url);
+    int slot = web_font_declare(family, bold, italic, url);
+    if (getenv("BROWSER_TIMING")) printf("[font] declared %s%s%s as %d\n", family, bold ? " bold" : "", italic ? " italic" : "", slot);
     free(url);
 }
 

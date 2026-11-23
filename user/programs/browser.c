@@ -18,10 +18,12 @@
 #include "gui.h"
 #include "image.h"
 #include "inflate.h"
+#include "brotli.h"
 #include "tls.h"
 
 /* The page code keeps its statics in the realm sections (web/realm.c):
    every frame and worker has its own copy. The networking is shared. */
+#include "web/woff2.c"
 #include "web/font.c"
 #pragma clang section bss=".rlmb$m" data=".rlmd$m"
 #include "web/dom.c"

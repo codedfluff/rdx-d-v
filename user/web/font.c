@@ -16,6 +16,7 @@ typedef struct {
     int ascent, descent, gap;       /* font units (descent is positive) */
     unsigned loca, glyf, hmtx, cmap; /* table offsets; cmap: the chosen subtable */
     int cmap_format;
+    int var_weight;                 /* a variable font: its default weight (0: not variable) */
     unsigned short ascii_glyph[128], ascii_adv[128];
 } Font;
 
@@ -165,9 +166,9 @@ static int web_font_install(int i, unsigned char *data, size_t len) {
     }
     WebFont *w = &web_fonts[i];
     w->state = -1;
-    if (len >= 4 && wf_u32(data) == 0x774F4646) {
+    if (len >= 4 && (wf_u32(data) == 0x774F4646 || wf_u32(data) == 0x774F4632)) {
         size_t n;
-        unsigned char *plain = woff_to_sfnt(data, len, &n);
+        unsigned char *plain = wf_u32(data) == 0x774F4646 ? woff_to_sfnt(data, len, &n) : woff2_to_sfnt(data, len, &n);
         free(data);
         if (!plain) return 0;
         data = plain;
@@ -181,6 +182,14 @@ static int web_font_install(int i, unsigned char *data, size_t len) {
     f->d = data;
     f->len = len;
     if (!font_parse(f)) {
+        free(data);
+        memset(f, 0, sizeof(*f));
+        return 0;
+    }
+    /* a variable font far from the weight asked for would look wrong (no
+       variations are applied): the built-in face is nearer */
+    int want = w->bold ? 700 : 400;
+    if (f->var_weight && (f->var_weight - want > 150 || want - f->var_weight > 150)) {
         free(data);
         memset(f, 0, sizeof(*f));
         return 0;
@@ -250,6 +259,11 @@ static int font_parse(Font *f) {
         else if (tag == 0x6C6F6361) f->loca = off;
         else if (tag == 0x676C7966) f->glyf = off;
         else if (tag == 0x686D7478) f->hmtx = off;
+        else if (tag == 0x66766172) { /* fvar: a variable font; drawn at its default, so note its weight */
+            unsigned axes = off + ft_u16(f, off + 4), count = ft_u16(f, off + 8), size = ft_u16(f, off + 10);
+            for (unsigned k = 0; k < count && k < 16; k++)
+                if (ft_u32(f, axes + k * size) == 0x77676874) f->var_weight = (int)(ft_u32(f, axes + k * size + 8) >> 16);
+        }
     }
     if (!head || !hhea || !maxp || !cmap || !f->loca || !f->glyf || !f->hmtx) return 0;
     f->units = (int)ft_u16(f, head + 18);
