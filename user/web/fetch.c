@@ -637,7 +637,20 @@ static int fetch_request_locked(char *url, const Request *rq, Fetched *f, char *
         /* the request */
         strcpy(request, method);
         strcat(request, " ");
-        strncat_safe(request, path, 2040);
+        { /* bytes outside ASCII (and spaces) %-encoded, as browsers send them */
+            static char sent[2048];
+            int k = 0;
+            for (const unsigned char *q = (const unsigned char *)path; *q && k < 2040; q++) {
+                if (*q >= 0x80 || *q == ' ') {
+                    static const char hex[] = "0123456789ABCDEF";
+                    sent[k++] = '%';
+                    sent[k++] = hex[*q >> 4];
+                    sent[k++] = hex[*q & 15];
+                } else sent[k++] = (char)*q;
+            }
+            sent[k] = 0;
+            strncat_safe(request, sent, 2040);
+        }
         strcat(request, " HTTP/1.1\r\nHost: ");
         strncat_safe(request, host, 255);
         if (port != (https ? 443 : 80)) {

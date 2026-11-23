@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Visual test</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 16px; background: #f4f5f7; color: #1d1d1f; }
+.row { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+.btn { background: #0a66c2; color: #fff; padding: 8px 16px; border-radius: 6px; }
+.pill { background: #e8f0fe; color: #1a56db; padding: 4px 12px; border-radius: 999px; border: 1px solid #a4c2f4; }
+.ghost { border: 2px solid #0a66c2; color: #0a66c2; padding: 6px 14px; border-radius: 6px; }
+.card { background: #fff; border: 1px solid rgba(0,0,0,0.12); border-radius: 12px; padding: 16px; width: 220px; }
+.muted { color: rgba(0,0,0,0.55); }
+.circle { width: 48px; height: 48px; border-radius: 50%; background: #ff7a59; }
+.ring { width: 40px; height: 40px; border-radius: 50%; border: 4px solid #2db35e; }
+.overlay { position: relative; width: 240px; height: 80px; background: #2d6cdf; border-radius: 8px; }
+.overlay .shade { position: absolute; inset: 0; background: rgba(0,0,0,0.4); border-radius: 8px; }
+.overlay span { position: absolute; left: 12px; top: 12px; color: #fff; }
+.faded { opacity: 0.4; }
+.tag { background: rgba(255,193,7,0.3); padding: 2px 6px; border-radius: 4px; }
+.top-only { border-radius: 16px 16px 0 0; background: #6f42c1; color: #fff; padding: 10px; width: 200px; }
+</style></head><body>
+<div class="row"><span class="btn">Sign in</span><span class="pill">New</span><span class="ghost">Learn more</span></div>
+<div class="row">
+  <div class="card"><b>Card title</b><p class="muted">Secondary text in rgba(0,0,0,.55) on a rounded card.</p></div>
+  <div class="circle"></div><div class="ring"></div>
+</div>
+<div class="row"><div class="overlay"><div class="shade"></div><span>Text over a 40% shade</span></div><span class="faded btn">Faded 40%</span></div>
+<p>Inline <span class="tag">highlight</span> with a see-through yellow.</p>
+<div class="top-only">Rounded top corners only</div>
+<p>VISUAL TEST END</p>
+</body></html>

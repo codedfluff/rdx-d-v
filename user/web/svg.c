@@ -472,10 +472,22 @@ typedef struct {
     double stroke_width, opacity, fill_opacity, stroke_opacity;
 } SvgStyle;
 
-/* A presentation property: from style="..." first, then the attribute. */
+/* A presentation property: from style="..." first, then style sheets,
+   then the attribute. */
 static int svg_prop(Node *n, const char *name, char *out, int max) {
     char style[1024];
     if (attr(n, "style", style, sizeof(style)) && style_lookup(style, name, out, max)) return 1;
+    for (int i = 0; i < n->svg_css_len;) {
+        const char *k = n->svg_css + i, *v = k + strlen(k) + 1;
+        if (!strcmp(k, name)) {
+            int len = (int)strlen(v);
+            if (len >= max) len = max - 1;
+            memcpy(out, v, (size_t)len);
+            out[len] = 0;
+            return 1;
+        }
+        i += (int)(v - k) + (int)strlen(v) + 1;
+    }
     return attr(n, name, out, max);
 }
 

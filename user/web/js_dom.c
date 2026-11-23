@@ -148,7 +148,7 @@ static char *page_text(const char *s, int len, int *out_len) {
         for (; j <= n && i + j < len; j++) code = code << 6 | ((unsigned char)s[i + j] & 0x3F);
         i += j;
         char buf[8];
-        int m = ascii_for(code, buf);
+        int m = utf8_for(n ? code : 0xFFFD, buf); /* (kept as UTF-8) */
         for (int q = 0; q < m && k < len + 7; q++) out[k++] = buf[q];
     }
     out[k] = 0;
@@ -1086,6 +1086,7 @@ static const char *display_name(int d) {
     case D_FLEX: return "flex";
     case D_INLINE_FLEX: return "inline-flex";
     case D_GRID: return "grid";
+    case D_INLINE_GRID: return "inline-grid";
     case D_TABLE: return "table";
     case D_TABLE_ROW: return "table-row";
     case D_TABLE_CELL: return "table-cell";
@@ -1096,12 +1097,23 @@ static const char *display_name(int d) {
 static void color_text(unsigned c, char *out) {
     char t[3][8];
     for (int i = 0; i < 3; i++) number_to_text((c >> (16 - 8 * i)) & 255, t[i]);
-    strcpy(out, "rgb(");
+    unsigned alpha = COLOR_ALPHA(c);
+    strcpy(out, alpha < 255 ? "rgba(" : "rgb(");
     strcat(out, t[0]);
     strcat(out, ", ");
     strcat(out, t[1]);
     strcat(out, ", ");
     strcat(out, t[2]);
+    if (alpha < 255) { /* ", 0.5" */
+        char a[16];
+        int hundredths = (int)((alpha * 100 + 127) / 255);
+        strcat(out, ", 0.");
+        a[0] = (char)('0' + hundredths / 10);
+        a[1] = (char)('0' + hundredths % 10);
+        a[2] = 0;
+        if (a[1] == '0') a[1] = 0;
+        strcat(out, a);
+    }
     strcat(out, ")");
 }
 
@@ -1127,7 +1139,18 @@ static int computed_value(Node *n, const char *prop, char *out) {
         strcpy(out, t);
         strcat(out, "px");
     } else if (!strcmp(prop, "font-weight")) strcpy(out, s->bold ? "700" : "400");
-    else if (!strcmp(prop, "opacity")) strcpy(out, "1");
+    else if (!strcmp(prop, "opacity")) {
+        if (s->opacity >= 255) strcpy(out, "1");
+        else {
+            int hundredths = (s->opacity * 100 + 127) / 255;
+            strcpy(out, "0.");
+            out[2] = (char)('0' + hundredths / 10);
+            out[3] = (char)('0' + hundredths % 10);
+            out[4] = 0;
+            if (out[3] == '0') out[3] = 0;
+            if (!hundredths) strcpy(out, "0");
+        }
+    }
     else if (!strcmp(prop, "text-align")) strcpy(out, s->align == A_CENTER ? "center" : s->align == A_RIGHT ? "right" : "left");
     else if (!strcmp(prop, "overflow")) strcpy(out, s->overflow_hidden ? "hidden" : "visible");
     else if (!strncmp(prop, "margin-", 7) || !strncmp(prop, "padding-", 8)) strcpy(out, "0px");

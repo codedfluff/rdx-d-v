@@ -777,6 +777,22 @@ try:
           and "FRAME REPLIED: hi parent 3" in log[log.rindex("browser --dump frametest.html"):]
           and "WORKER SAID 42 function" in log[log.rindex("browser --dump frametest.html"):]
           and "CHILD GOT: hello child" in log[log.rindex("browser --dump frametest.html"):])
+    def boxes_of(text):
+        found = {}
+        for m in re.finditer(r"\[box\] \d+ (\S+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (\S+) (\S+)", text):
+            tag, x, y, w, h, ident, cls = m.groups()
+            found.setdefault(tag + "." + cls, (int(x), int(y), int(w), int(h)))
+        return found
+    run("set BROWSER_BOXES=1", "rdx> ") and run("set BROWSER_WIDTH=800", "rdx> ")
+    grid_ok = run("browser --dump gridtest.html", "GRID TEST END", 20) and wait_for("rdx> ", 10)
+    run("unset BROWSER_BOXES", "rdx> ") and run("unset BROWSER_WIDTH", "rdx> ")
+    b = boxes_of(log[log.rindex("browser --dump gridtest.html"):])
+    box, txt, lab, main = b.get("span.box"), b.get("span.txt"), b.get("label.lab"), b.get("div.m")
+    check("fonts and grid: proportional text, grid lines and areas, max-content (as Chrome lays gridtest.html out)",
+          grid_ok and box and txt and lab and main
+          and txt[0] >= box[0] + 30 and abs(txt[1] - box[1]) <= 6  # the label's text beside its box
+          and 150 <= lab[2] <= 180                                  # max-content: as wide as box + text (Chrome: 164)
+          and main[0] == 170 and main[1] == 206)                    # grid-area: main, after a 150px column
     check("a page reads its address's query (local file, ?query, URLSearchParams)",
           run("browser --dump formresult.html?who=Ada", "You sent: name=Ada, news=no, colour=null", 20) and wait_for("rdx> ", 10))
     check("the garbage collector frees memory and keeps what is still used",

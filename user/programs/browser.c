@@ -22,6 +22,7 @@
 
 /* The page code keeps its statics in the realm sections (web/realm.c):
    every frame and worker has its own copy. The networking is shared. */
+#include "web/font.c"
 #pragma clang section bss=".rlmb$m" data=".rlmd$m"
 #include "web/dom.c"
 #include "web/css.c"
@@ -109,8 +110,9 @@ static int update_page_title(void) {
     page_title[0] = 0;
     Node *title = document ? find_element(document, "title") : NULL;
     if (title) {
-        char text[256];
-        text_content(title, text, sizeof(text));
+        char raw[256], text[256];
+        int raw_len = text_content(title, raw, sizeof(raw));
+        ascii_text(raw, raw_len, text, sizeof(text));
         int k = 0, space = 0;
         for (const char *p = text; *p && k < (int)sizeof(page_title) - 1; p++) {
             if (is_space(*p)) {
@@ -407,7 +409,7 @@ static int load_images_from(int (*each)(void), PrefetchSet *pictures, unsigned p
             if (n->style.display == D_NONE) continue;
             image *img = malloc(sizeof(image));
             int cw = n->w - frame_h(n, 0), ch = n->h - frame_v(n, 0);
-            if (img && svg_render_node(n, cw > 0 ? cw : 0, ch > 0 ? ch : 0, n->style.color, img) == 0) {
+            if (img && svg_render_node(n, cw > 0 ? cw : 0, ch > 0 ? ch : 0, n->style.color & 0xFFFFFF, img) == 0) {
                 n->img = img;
                 svg_natural_size(n, &n->img_w, &n->img_h);
                 n->img_state = 1;
@@ -436,7 +438,7 @@ static int load_images_from(int (*each)(void), PrefetchSet *pictures, unsigned p
             char why[96] = "not a picture RDX can show";
             int nw = 0, nh = 0, cw = n->w - frame_h(n, 0), ch = n->h - frame_v(n, 0);
             if (img && f.len <= MAX_IMAGE_BYTES && looks_like_svg(f.body, f.len, f.type) &&
-                svg_render_text(f.body, (int)f.len, cw > 0 ? cw : 0, ch > 0 ? ch : 0, n->style.color, img, &nw, &nh) == 0) {
+                svg_render_text(f.body, (int)f.len, cw > 0 ? cw : 0, ch > 0 ? ch : 0, n->style.color & 0xFFFFFF, img, &nw, &nh) == 0) {
                 n->img = img; /* drawn at its laid-out size (or its own), sized for layout by what it asks for */
                 n->img_w = nw;
                 n->img_h = nh;
@@ -631,6 +633,8 @@ static int dump(const char *address) {
     realm_dumping = 1;
     if (getenv("BROWSER_CONSOLE")) console_echo = 1;
     if (getenv("BROWSER_TRACE")) js_trace_throws = 1;
+    if (getenv("BROWSER_WIDTH")) layout_viewport_w = atoi(getenv("BROWSER_WIDTH")); /* (to compare with other browsers) */
+    if (getenv("BROWSER_HEIGHT")) layout_viewport_h = atoi(getenv("BROWSER_HEIGHT"));
     load(address, NULL);
     /* Let the page's timers run for a moment, and follow script redirects. */
     for (int hops = 0; hops < 4; hops++) {
@@ -676,6 +680,22 @@ static int dump(const char *address) {
     if (page_title[0]) printf("Title: %s\n", page_title);
     printf("Connection: %s\n\n", page_security[0] ? page_security : "none");
     print_page_text();
+    if (getenv("BROWSER_BOXES") && body_element) { /* every element's box, to compare layouts (tools/layoutdiff.py) */
+        int k = 0;
+        for (Node *n = body_element; n; n = next_in_tree(n, body_element)) {
+            if (n->type != NODE_ELEMENT || n->tag[0] == '#') continue;
+            int shown = 1;
+            for (Node *a = n; a && a != document; a = a->parent)
+                if (a->type == NODE_ELEMENT && a->style.display == D_NONE) shown = 0;
+            char id[40] = "", cls[40] = "";
+            attr(n, "id", id, sizeof(id));
+            attr(n, "class", cls, sizeof(cls));
+            for (char *c = cls; *c; c++)
+                if (*c == ' ') *c = 0;
+            printf("[box] %d %s %d %d %d %d %s %s\n", k++, n->tag, shown ? n->x : 0, shown ? n->y : 0, shown ? n->w : 0,
+                   shown ? n->h : 0, id[0] ? id : "-", cls[0] ? cls : "-");
+        }
+    }
     for (int i = 1; i < MAX_REALMS; i++) { /* and what the frames show */
         if (!realm_list[i].used || realm_list[i].kind != REALM_FRAME) continue;
         printf("\n--- frame %s (%dx%d) ---\n", realm_list[i].url, realm_list[i].width, realm_list[i].height);
@@ -788,21 +808,23 @@ static void print_page_text(void) {
             text = label;
             len = (int)strlen(label);
         } else {
-            text = pool + it->text;
-            len = it->len;
+            static char plain[600];
+            len = ascii_text(pool + it->text, it->len, plain, sizeof(plain));
+            text = plain;
         }
         int col = it->x / 8;
         if (prev_end >= 0) {
             /* Words a space apart (in any font size) are one space apart in
                the text; only wide gaps (table columns) keep their position. */
-            int gap = it->x - prev_end, cell = it->cell ? it->cell : 8;
+            int gap = it->x - prev_end, cell = it->kind == IT_TEXT && it->size ? it->size / 2 : 8;
             int space = gap > 0 ? 1 : 0;
             if (gap <= 2 * cell || col < used + space) col = used + space;
         }
         if (col > 500) col = 500;
         while (used < col && used < 590) line[used++] = ' ';
         for (int q = 0; q < len && used < 590; q++) line[used++] = text[q];
-        prev_end = it->x + (it->kind == IT_TEXT ? it->len * it->cell : it->w);
+        /* (a link's word may be stretched over the space after it: measure the word) */
+        prev_end = it->x + (it->kind == IT_TEXT ? font_width(it->face, it->bold, it->italic, it->size, pool + it->text, it->len) : it->w);
         if (it->y + it->h > prev_bottom || k == 0) prev_bottom = it->y + it->h;
         /* A link's last word gets [number] after it. */
         int link = it->kind == IT_TEXT || it->kind == IT_IMAGE ? it->link : -1;

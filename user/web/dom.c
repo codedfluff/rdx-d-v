@@ -78,7 +78,9 @@ typedef struct Node Node;
    "auto"; they are resolved during layout. */
 typedef struct {
     int value;      /* px, or percent * 100 */
-    char unit;      /* 'p' px, '%' percent, 'a' auto, 'n' none / not set */
+    char unit;      /* 'p' px, '%' percent, 'c' percent + px (calc), 'a' auto, 'n' none / not set,
+                       'x' max-content, 'm' min-content, 'f' fit-content */
+    int px;         /* 'c': the px part */
 } Len;
 
 typedef struct {
@@ -87,7 +89,10 @@ typedef struct {
     int size;                       /* font size in px */
     unsigned char bold, italic, underline, strike, pre, nowrap, align, list_none, upper, hidden;
     unsigned char cursor_pointer;
+    unsigned char face;             /* FACE_SANS, FACE_SERIF or FACE_MONO */
+    unsigned char alpha;            /* opacity, this element's and its ancestors' together (255 opaque) */
     int indent;                     /* text-indent, px */
+    int line_height;                /* 0 normal, > 0 px, < 0 a factor of the font size (* -100) */
     /* not inherited */
     unsigned char display, position, floating, clear, box_sizing, overflow_hidden, clip_rect;
     unsigned char masked; /* a mask-image we cannot apply: its background stays unpainted */
@@ -107,8 +112,16 @@ typedef struct {
     Len basis;
     int order;
     int gap_row, gap_col;
-    int grid_columns;               /* number of columns; 0 none */
-    int grid_min;                   /* repeat(auto-fill, minmax(N, 1fr)): N */
+    /* grid containers: the templates as written (kept until the page goes) */
+    const char *grid_cols, *grid_rows, *grid_areas, *grid_auto_cols, *grid_auto_rows;
+    unsigned char grid_flow_column;
+    /* grid items: lines (0 auto, n a line, -n from the end, GRID_SPAN + n a span) or an area's name */
+    short grid_col[2], grid_row[2];
+    const char *grid_area;
+    unsigned char justify_items, justify_self;
+    unsigned char opacity;          /* its own (255 opaque) */
+    short radius[8];                /* corners (top-left, top-right, bottom-right, bottom-left), across then down:
+                                       px, or -percent */
     int z_index;
 } Style;
 
@@ -127,6 +140,8 @@ struct Node {
     int items_from, items_to;/* its range in the display list */
     int bg_item;             /* its background item, or -1 */
     int min_content, max_content, intrinsic_done;
+    int base_y, base_pass;   /* its last line's baseline (page y), and the layout pass that set it */
+    int trail_margin;        /* its last child's bottom margin, when it collapses through this box's */
     /* <a href> */
     int link;
     /* <img> */
@@ -144,6 +159,9 @@ struct Node {
     unsigned long long ancestors[4]; /* a filter of the keys of all its ancestors */
     char *css_vars;          /* its CSS custom properties: "--name\0value\0" pairs */
     int css_vars_len;
+    char *svg_css;           /* inside <svg>: paint properties from style sheets, "name\0value\0" pairs */
+    int svg_css_len;
+    unsigned char in_svg;
 };
 
 static Node *document;     /* the root (#document) */
@@ -208,6 +226,7 @@ static void free_tree(Node *n) {
     free(n->text);
     free(n->value);
     free(n->css_vars);
+    free(n->svg_css);
     if (n->img) {
         image_free((image *)n->img);
         free(n->img);
@@ -396,7 +415,59 @@ static int ascii_for(unsigned code, char *out) {
     return n;
 }
 
-/* Decode &entities; and UTF-8 in place (the result is never longer). */
+/* A character as UTF-8 (characters that show nothing: none). */
+static int utf8_for(unsigned code, char *out) {
+    if (code == 0x200B || code == 0x200C || code == 0x200D || code == 0xFEFF || code == 0xAD) return 0;
+    if (!code || (code >= 0xD800 && code < 0xE000) || code > 0x10FFFF) code = 0xFFFD;
+    if (code < 0x80) {
+        out[0] = (char)code;
+        return 1;
+    }
+    if (code < 0x800) {
+        out[0] = (char)(0xC0 | code >> 6);
+        out[1] = (char)(0x80 | (code & 0x3F));
+        return 2;
+    }
+    if (code < 0x10000) {
+        out[0] = (char)(0xE0 | code >> 12);
+        out[1] = (char)(0x80 | (code >> 6 & 0x3F));
+        out[2] = (char)(0x80 | (code & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | code >> 18);
+    out[1] = (char)(0x80 | (code >> 12 & 0x3F));
+    out[2] = (char)(0x80 | (code >> 6 & 0x3F));
+    out[3] = (char)(0x80 | (code & 0x3F));
+    return 4;
+}
+
+/* UTF-8 text as plain ASCII (for the text console): into out (max bytes,
+   NUL-terminated); returns the length. */
+static int ascii_text(const char *s, int len, char *out, int max) {
+    int k = 0;
+    for (int i = 0; i < len && k < max - 1;) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            out[k++] = (char)c;
+            i++;
+            continue;
+        }
+        int extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+        unsigned code = c & (0x3F >> extra);
+        int j = 1;
+        for (; j <= extra && i + j < len && ((unsigned char)s[i + j] & 0xC0) == 0x80; j++) code = code << 6 | ((unsigned char)s[i + j] & 0x3F);
+        i += j;
+        char buf[8];
+        int m = ascii_for(extra ? code : 0xFFFD, buf);
+        for (int q = 0; q < m && k < max - 1; q++) out[k++] = buf[q];
+    }
+    out[k] = 0;
+    return k;
+}
+
+/* Decode &entities; in place, keeping text as UTF-8 (the result is never
+   longer; bytes that are not UTF-8 are read as Latin-1 and shown as their
+   nearest ASCII). */
 static int decode_text(char *text, int len) {
     int out = 0;
     for (int i = 0; i < len;) {
@@ -443,7 +514,8 @@ static int decode_text(char *text, int len) {
                 }
             }
             if (known && code) {
-                n = ascii_for(code, buf);
+                n = utf8_for(code, buf);
+                if (out + n > end + 1) n = ascii_for(code, buf);
                 i = end + 1;
             } else {
                 buf[0] = '&';
@@ -456,7 +528,11 @@ static int decode_text(char *text, int len) {
             int k = 1;
             for (; k <= extra && i + k < len && ((unsigned char)text[i + k] & 0xC0) == 0x80; k++)
                 code = code << 6 | ((unsigned char)text[i + k] & 0x3F);
-            n = ascii_for(extra ? code : 0xFFFD, buf);
+            if (extra && k == extra + 1) n = utf8_for(code, buf); /* (k bytes in, never more out) */
+            else {
+                n = ascii_for(c, buf); /* not UTF-8: a Latin-1 byte */
+                k = 1;
+            }
             i += k;
         } else {
             buf[0] = (char)c;

@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Unicode – test</title>
+<style>body { font-family: Arial, sans-serif; font-size: 16px; } .serif { font-family: Georgia, serif; } code { font-size: 14px; }</style>
+</head><body>
+<h1>Café — “quotes” & ‘single’</h1>
+<p>Prices: €10 · £8 · ¥900 · 25°C · © 2026 RDX™ · ½ ¼ ¾ · a×b ÷ c ± d</p>
+<p class="serif">Ærøskøbing, Straße, naïve, façade, São Paulo, Kraków, İstanbul, Ελληνικά, Русский</p>
+<p>Arrows → ← ↑ ↓ ⇒ and bullets • ‣ and dashes – — and ellipsis…</p>
+<p>No&nbsp;break&nbsp;here&nbsp;between&nbsp;these&nbsp;words, and a soft­hyphen and zero​width.</p>
+<p><code>monospace: if (a ≠ b) return “x”;</code></p>
+<p id="js"></p>
+<script>document.getElementById("js").textContent = "From script: naïve café — " + "é".length + " " + document.title;</script>
+</body></html>

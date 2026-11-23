@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html><head><title>Grid test</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 10px; font-size: 14px; }
+.g { display: grid; gap: 6px; margin-bottom: 12px; background: #eef; padding: 4px; }
+.g > div { background: #69c; color: #fff; padding: 4px; }
+.a { grid-template-columns: 100px 1fr 2fr; }
+.b { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+.c { grid-template-columns: auto 1fr auto; align-items: center; }
+.d { grid-template-areas: "head head" "side main" "foot foot"; grid-template-columns: 150px 1fr; }
+.d .h { grid-area: head; } .d .s { grid-area: side; } .d .m { grid-area: main; height: 60px; } .d .f { grid-area: foot; }
+.e { grid-template-columns: repeat(4, 1fr); }
+.e .wide { grid-column: span 2; } .e .full { grid-column: 1 / -1; }
+.f { display: grid; place-items: center; height: 60px; background: #fe9; margin-bottom: 12px; }
+.lab { display: grid; place-items: center; width: max-content; background: #dfd; }
+.lab .box { grid-area: 1/1; width: 24px; height: 24px; border: 2px solid #444; background: #fff; box-sizing: border-box; }
+.lab .txt { grid-column: 2; margin-left: 8px; }
+</style></head><body>
+<div class="g a"><div>100px</div><div>1fr</div><div>2fr</div></div>
+<div class="g b"><div>one</div><div>two</div><div>three</div><div>four</div><div>five</div><div>six</div><div>seven</div></div>
+<div class="g c"><div>auto</div><div>middle 1fr with more text</div><div>end</div></div>
+<div class="g d"><div class="h">header</div><div class="s">side</div><div class="m">main</div><div class="f">footer</div></div>
+<div class="g e"><div class="wide">span 2</div><div>c</div><div>d</div><div class="full">full row</div><div>e</div></div>
+<div class="f"><span>centered</span></div>
+<label class="lab"><span class="box"></span><span class="txt">Verify you are human</span></label>
+<p>GRID TEST END</p>
+</body></html>

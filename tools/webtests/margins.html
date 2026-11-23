@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html><head><title>Margins</title>
+<style>
+body { font-family: Arial, sans-serif; font-size: 16px; margin: 8px; }
+section { background: #eef; }
+.pad { padding: 10px; background: #efe; }
+.bord { border: 1px solid #999; }
+h2 { margin: 20px 0; }
+p { margin: 12px 0; }
+.big { margin-bottom: 40px; }
+.empty { margin: 30px 0; }
+.flow { overflow: hidden; background: #fee; }
+</style></head><body>
+<section><h2>Collapses through the section (top)</h2><p>para</p><p class="big">bottom 40</p></section>
+<p>after section</p>
+<div class="pad"><h2>Inside padding: no collapse</h2><p>para</p></div>
+<div class="bord"><p>border keeps margins in</p></div>
+<div class="empty"></div>
+<p>after an empty block (30 + 12 collapse to 30)</p>
+<div class="flow"><p>overflow hidden: a new formatting context</p></div>
+<div><div><p>nested p, margins collapse through two divs</p></div></div>
+<p>MARGINS END</p>
+</body></html>

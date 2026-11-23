@@ -30,10 +30,214 @@ static int word_is(const char *v, const char *w) {
 }
 
 /* Apply one declaration to a style. */
+/* A value kept for later (grid templates are read when laid out): the
+   same text gives the same copy, which lives as long as the browser. */
+static const char *css_keep(const char *v) {
+    static char **kept;
+    static int kept_count, kept_cap;
+    while (is_space(*v)) v++;
+    int len = (int)strlen(v);
+    const char *bang = strstr(v, "!important");
+    if (bang) len = (int)(bang - v);
+    while (len > 0 && is_space(v[len - 1])) len--;
+    if (!len || (len == 4 && !strncasecmp(v, "none", 4))) return NULL;
+    for (int i = 0; i < kept_count; i++)
+        if (!strncmp(kept[i], v, (size_t)len) && !kept[i][len]) return kept[i];
+    if (kept_count >= 4096 || !grow((void **)&kept, &kept_cap, kept_count + 1, sizeof(char *))) return NULL;
+    char *copy = malloc((size_t)len + 1);
+    if (!copy) return NULL;
+    memcpy(copy, v, (size_t)len);
+    copy[len] = 0;
+    kept[kept_count++] = copy;
+    return copy;
+}
+
+/* A grid line: "3", "-1", "span 2", "auto" (0). */
+static short grid_line(const char *v) {
+    while (is_space(*v)) v++;
+    int span = 0;
+    if (!strncasecmp(v, "span", 4)) {
+        span = 1;
+        v += 4;
+        while (is_space(*v)) v++;
+    }
+    int n = 0, neg = 0;
+    if (*v == '-') {
+        neg = 1;
+        v++;
+    }
+    if (*v < '0' || *v > '9') return span ? GRID_SPAN + 1 : 0;
+    while (*v >= '0' && *v <= '9') n = n * 10 + (*v++ - '0');
+    if (n > 999) n = 999;
+    if (span) return (short)(GRID_SPAN + (n > 0 ? n : 1));
+    return (short)(neg ? -n : n);
+}
+
+/* grid-template (and grid): rows / columns, maybe with area strings. */
+static void grid_template(Style *s, const char *v) {
+    char rows[512], areas[512];
+    const char *slash = NULL;
+    int depth = 0, quote = 0;
+    for (const char *p = v; *p; p++) {
+        if (quote) {
+            if (*p == quote) quote = 0;
+        } else if (*p == '"' || *p == '\'') quote = *p;
+        else if (*p == '(') depth++;
+        else if (*p == ')') depth--;
+        else if (*p == '/' && !depth) {
+            slash = p;
+            break;
+        }
+    }
+    if (strstr(v, "auto-flow")) { /* grid: auto-flow / columns, or rows / auto-flow */
+        s->grid_flow_column = !slash || strstr(slash, "auto-flow") != NULL;
+        if (slash && !strstr(slash, "auto-flow")) s->grid_cols = css_keep(slash + 1);
+        return;
+    }
+    int rl = 0, al = 0;
+    quote = 0;
+    for (const char *p = v; *p && p != slash && rl < 500 && al < 500; p++) {
+        if (quote) {
+            if (*p == quote) {
+                quote = 0;
+                areas[al++] = '"';
+            } else areas[al++] = *p;
+        } else if (*p == '"' || *p == '\'') {
+            quote = *p;
+            areas[al++] = '"';
+        } else rows[rl++] = *p;
+    }
+    rows[rl] = 0;
+    areas[al] = 0;
+    s->grid_rows = css_keep(rows);
+    s->grid_areas = al ? css_keep(areas) : NULL;
+    s->grid_cols = slash ? css_keep(slash + 1) : NULL;
+}
+
+/* A corner's radius: px, or a percentage (stored negative). */
+static short corner_len(const char *v, int font) {
+    int ok;
+    Len l = parse_len(v, font, &ok);
+    if (!ok) return 0;
+    if (l.unit == '%') return (short)(-(l.value / 100 > 100 ? 100 : l.value / 100 < 1 ? 1 : l.value / 100));
+    if (l.unit == 'p') return (short)(l.value < 0 ? 0 : l.value > 30000 ? 30000 : l.value);
+    return 0;
+}
+
+static int align_word(const char *v, int self) {
+    while (is_space(*v)) v++;
+    if (!strncasecmp(v, "safe ", 5) || !strncasecmp(v, "unsafe ", 7)) {
+        while (*v && !is_space(*v)) v++;
+        while (is_space(*v)) v++;
+    }
+    if (!strncasecmp(v, "center", 6)) return AL_CENTER;
+    if (!strncasecmp(v, "flex-end", 8) || !strncasecmp(v, "end", 3) || !strncasecmp(v, "self-end", 8) || !strncasecmp(v, "right", 5))
+        return AL_END;
+    if (!strncasecmp(v, "stretch", 7)) return AL_STRETCH;
+    if (!strncasecmp(v, "normal", 6) || !strncasecmp(v, "auto", 4)) return self ? AL_AUTO : AL_STRETCH;
+    if (!strncasecmp(v, "flex-start", 10) || !strncasecmp(v, "start", 5) || !strncasecmp(v, "self-start", 10) ||
+        !strncasecmp(v, "left", 4) || !strncasecmp(v, "baseline", 8) || !strncasecmp(v, "first", 5) || !strncasecmp(v, "last", 4))
+        return AL_START;
+    return self ? AL_AUTO : AL_STRETCH;
+}
+
+/* Which of our faces stands for a font-family list: the first family we
+   know (or a generic one); a list of only unknown (web) fonts gets sans. */
+static int face_of_family(const char *n) {
+    if (strstr(n, "mono") || strstr(n, "courier") || strstr(n, "consol") || strstr(n, "menlo") || strstr(n, "monaco") ||
+        strstr(n, "code") || !strcmp(n, "fixed") || strstr(n, "typewriter"))
+        return FACE_MONO;
+    if (strstr(n, "sans") || strstr(n, "arial") || strstr(n, "helvetica") || strstr(n, "verdana") || strstr(n, "tahoma") ||
+        strstr(n, "segoe") || strstr(n, "roboto") || strstr(n, "system-ui") || strstr(n, "apple-system") ||
+        strstr(n, "blinkmacsystemfont") || strstr(n, "trebuchet") || strstr(n, "calibri") || strstr(n, "lucida grande"))
+        return FACE_SANS;
+    if (strstr(n, "serif") || strstr(n, "times") || strstr(n, "georgia") || strstr(n, "garamond") || strstr(n, "cambria") ||
+        strstr(n, "palatino") || strstr(n, "baskerville") || strstr(n, "book antiqua") || strstr(n, "didot") ||
+        strstr(n, "constantia") || strstr(n, "charter"))
+        return FACE_SERIF;
+    return -1;
+}
+
+static int face_for_family(const char *v, int current) {
+    while (*v == ' ') v++;
+    if (!strncasecmp(v, "inherit", 7) || !strncasecmp(v, "unset", 5)) return current;
+    if (!strncasecmp(v, "initial", 7)) return FACE_SERIF;
+    char name[64];
+    while (*v) {
+        while (*v == ' ' || *v == ',' || *v == '"' || *v == '\'') v++;
+        int n = 0;
+        while (*v && *v != ',') {
+            if (*v != '"' && *v != '\'' && n < 63) name[n++] = (char)tolower((unsigned char)*v);
+            v++;
+        }
+        while (n && name[n - 1] == ' ') n--;
+        name[n] = 0;
+        if (!n) continue;
+        if (!strcmp(name, "!important")) break;
+        int face = face_of_family(name);
+        if (face >= 0) return face;
+    }
+    return FACE_SANS;
+}
+
+static int font_size_word(const char *v) {
+    static const char *const words[] = {"xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large",
+                                        "smaller", "larger"};
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++)
+        if (!strcasecmp_word(v, words[i])) return 1;
+    return 0;
+}
+
+/* line-height: 0 for normal, px, or a factor (stored * -100), as the
+   Style keeps it. */
+static int parse_line_height(const char *v, int current, int size) {
+    while (is_space(*v)) v++;
+    if (!strncasecmp(v, "normal", 6) || !strncasecmp(v, "initial", 7)) return 0;
+    if (!strncasecmp(v, "inherit", 7) || !strncasecmp(v, "unset", 5)) return current;
+    int used, n = number100(v, &used);
+    if (!used) return current;
+    if (!v[used] || is_space(v[used]) || v[used] == '!') return n > 0 ? -n : current;
+    int ok;
+    Len l = parse_len(v, size, &ok);
+    if (!ok) return current;
+    if (l.unit == '%') return l.value > 0 ? (int)((long long)l.value * size / 10000) : current;
+    if (l.unit == 'p') return l.value > 0 ? l.value : current;
+    return current;
+}
+
+/* SVG paint properties met while styling an element inside <svg>: kept
+   for the SVG drawing (which reads them before the attributes). */
+static int svg_collecting;
+static char svg_props[1024];
+static int svg_props_len;
+
+static void svg_note(const char *name, const char *v) {
+    static const char *const names[] = {"fill", "stroke", "stroke-width", "fill-opacity", "stroke-opacity", "opacity",
+                                        "fill-rule", "stroke-linecap", "stroke-linejoin", "stop-color", "stop-opacity",
+                                        "visibility", "stroke-dasharray", NULL};
+    int known = 0;
+    for (int i = 0; names[i] && !known; i++) known = !strcmp(names[i], name);
+    if (!known) return;
+    /* drop an earlier value for the same name */
+    for (int i = 0; i < svg_props_len;) {
+        int nl = (int)strlen(svg_props + i) + 1, vl = (int)strlen(svg_props + i + nl) + 1;
+        if (!strcmp(svg_props + i, name)) {
+            memmove(svg_props + i, svg_props + i + nl + vl, (size_t)(svg_props_len - i - nl - vl));
+            svg_props_len -= nl + vl;
+        } else i += nl + vl;
+    }
+    int nl = (int)strlen(name) + 1, vl = (int)strlen(v) + 1;
+    if (svg_props_len + nl + vl > (int)sizeof(svg_props)) return;
+    memcpy(svg_props + svg_props_len, name, (size_t)nl);
+    memcpy(svg_props + svg_props_len + nl, v, (size_t)vl);
+    svg_props_len += nl + vl;
+}
+
 static void apply(Style *s, Borders *b, const char *name, const char *v, int parent_size) {
     unsigned color;
     int ok;
     while (is_space(*v)) v++;
+    if (svg_collecting) svg_note(name, v);
     int font = s->size;
     switch (name[0]) {
     case 'a':
@@ -71,7 +275,38 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
                 char p[4][64];
                 int n = split_value(v, p, 4);
                 for (int i = 0; i < 4 && n; i++) border_part(b, i, p[n == 1 ? 0 : n == 2 ? i % 2 : n == 3 ? (i == 3 ? 1 : i) : i], font);
-            } else if (!strcmp(rest, "radius") || !strncmp(rest, "collapse", 8) || !strcmp(rest, "spacing") || !strcmp(rest, "image")) {
+            } else if (!strcmp(rest, "radius")) {
+                /* a b c d [/ e f g h] */
+                const char *slash = strchr(v, '/');
+                char across[128], down[128];
+                int al = slash ? (int)(slash - v) : (int)strlen(v);
+                if (al > 127) al = 127;
+                memcpy(across, v, (size_t)al);
+                across[al] = 0;
+                strncpy(down, slash ? slash + 1 : across, 127);
+                down[127] = 0;
+                for (int axis = 0; axis < 2; axis++) {
+                    char p[4][64];
+                    int n = split_value(axis ? down : across, p, 4);
+                    for (int i = 0; i < 4 && n; i++) {
+                        const char *one = p[n == 1 ? 0 : n == 2 ? i % 2 : n == 3 ? (i == 3 ? 1 : i) : i];
+                        s->radius[i + axis * 4] = corner_len(one, font);
+                    }
+                }
+            } else if (strstr(rest, "-radius")) { /* border-top-left-radius: across [down] */
+                int corner = !strncmp(rest, "top-left", 8) || !strncmp(rest, "start-start", 11) ? 0
+                             : !strncmp(rest, "top-right", 9) || !strncmp(rest, "start-end", 9) ? 1
+                             : !strncmp(rest, "bottom-right", 12) || !strncmp(rest, "end-end", 7) ? 2
+                             : !strncmp(rest, "bottom-left", 11) || !strncmp(rest, "end-start", 9) ? 3 : -1;
+                if (corner >= 0) {
+                    char p[2][64];
+                    int n = split_value(v, p, 2);
+                    if (n) {
+                        s->radius[corner] = corner_len(p[0], font);
+                        s->radius[corner + 4] = corner_len(p[n > 1 ? 1 : 0], font);
+                    }
+                }
+            } else if (!strncmp(rest, "collapse", 8) || !strcmp(rest, "spacing") || !strcmp(rest, "image")) {
                 /* not drawn */
             } else {
                 char side[16];
@@ -118,7 +353,8 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         if (!strcmp(name, "display")) {
             if (word_is(v, "none")) s->display = D_NONE;
             else if (word_is(v, "list-item")) s->display = D_LIST_ITEM;
-            else if (word_is(v, "inline-block") || word_is(v, "inline-table") || word_is(v, "inline-grid")) s->display = D_INLINE_BLOCK;
+            else if (word_is(v, "inline-grid")) s->display = D_INLINE_GRID;
+            else if (word_is(v, "inline-block") || word_is(v, "inline-table")) s->display = D_INLINE_BLOCK;
             else if (word_is(v, "inline-flex")) s->display = D_INLINE_FLEX;
             else if (word_is(v, "inline") || word_is(v, "contents")) s->display = D_INLINE;
             else if (word_is(v, "flex")) s->display = D_FLEX;
@@ -137,11 +373,35 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
             s->bold = used ? n >= 60000 : (word_is(v, "bold") || word_is(v, "bolder"));
         } else if (!strcmp(name, "font-size")) {
             s->size = font_size(v, parent_size);
+        } else if (!strcmp(name, "font-family")) {
+            s->face = (unsigned char)face_for_family(v, s->face);
         } else if (!strcmp(name, "font-style")) {
             s->italic = word_is(v, "italic") || word_is(v, "oblique");
         } else if (!strcmp(name, "font")) {
             char parts[8][64];
             int n = split_value(v, parts, 8);
+            s->line_height = 0;
+            /* [style] [weight] size[/line-height] families: after the size, the rest */
+            for (int i = 0; i < n; i++) {
+                int used;
+                number100(parts[i], &used);
+                if (!(used && parts[i][used]) && !font_size_word(parts[i])) continue;
+                const char *at = strstr(v, parts[i]), *lh = strchr(parts[i], '/');
+                if (!at) break;
+                at += strlen(parts[i]);
+                if (lh) lh++;
+                while (*at == ' ') at++;
+                if ((!lh || !*lh) && *at == '/') {
+                    at++;
+                    while (*at == ' ') at++;
+                    lh = at;
+                    while (*at && *at != ' ') at++;
+                }
+                if (lh && *lh) s->line_height = parse_line_height(lh, 0, font_size(parts[i], parent_size));
+                while (*at == ' ') at++;
+                if (*at) s->face = (unsigned char)face_for_family(at, s->face);
+                break;
+            }
             for (int i = 0; i < n; i++) {
                 int used, num = number100(parts[i], &used);
                 if (!strcasecmp_word(parts[i], "bold") || !strcasecmp_word(parts[i], "bolder")) s->bold = 1;
@@ -186,7 +446,7 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
                 if (used && !parts[0][used]) {
                     s->grow = g;
                     s->shrink = 100;
-                    s->basis = (Len){0, 'p'};
+                    s->basis = (Len){0, 'p', 0};
                     if (n > 1) {
                         int sh = number100(parts[1], &used);
                         if (used && !parts[1][used]) s->shrink = sh;
@@ -210,28 +470,49 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
                 Len c = parse_len(parts[1], font, &ok);
                 if (ok && c.unit == 'p') s->gap_col = c.value;
             }
-        } else if (!strcmp(name, "grid-template-columns") || !strcmp(name, "grid-template")) {
-            const char *rep = strstr(v, "repeat(");
-            if (rep) {
-                rep += 7;
-                while (is_space(*rep)) rep++;
-                if (!strncasecmp(rep, "auto-fill", 9) || !strncasecmp(rep, "auto-fit", 8)) {
-                    const char *mm = strstr(rep, "minmax(");
-                    Len l = parse_len(mm ? mm + 7 : strchr(rep, ',') ? strchr(rep, ',') + 1 : rep, font, &ok);
-                    s->grid_columns = 0;
-                    s->grid_min = ok && l.unit == 'p' && l.value > 0 ? l.value : 200;
-                } else {
-                    s->grid_columns = atoi(rep);
+        } else if (!strcmp(name, "grid-template-columns")) {
+            s->grid_cols = css_keep(v);
+        } else if (!strcmp(name, "grid-template-rows")) {
+            s->grid_rows = css_keep(v);
+        } else if (!strcmp(name, "grid-template-areas")) {
+            s->grid_areas = strchr(v, '"') || strchr(v, '\'') ? css_keep(v) : NULL;
+        } else if (!strcmp(name, "grid-auto-columns")) {
+            s->grid_auto_cols = css_keep(v);
+        } else if (!strcmp(name, "grid-auto-rows")) {
+            s->grid_auto_rows = css_keep(v);
+        } else if (!strcmp(name, "grid-auto-flow")) {
+            s->grid_flow_column = strstr(v, "column") != NULL;
+        } else if (!strcmp(name, "grid-template") || !strcmp(name, "grid")) {
+            grid_template(s, v);
+        } else if (!strcmp(name, "grid-column") || !strcmp(name, "grid-row")) {
+            short *line = name[5] == 'c' ? s->grid_col : s->grid_row;
+            const char *slash = strchr(v, '/');
+            line[0] = grid_line(v);
+            line[1] = slash ? grid_line(slash + 1) : (line[0] >= GRID_SPAN ? 0 : 0);
+        } else if (!strcmp(name, "grid-column-start") || !strcmp(name, "grid-row-start")) {
+            (name[5] == 'c' ? s->grid_col : s->grid_row)[0] = grid_line(v);
+        } else if (!strcmp(name, "grid-column-end") || !strcmp(name, "grid-row-end")) {
+            (name[5] == 'c' ? s->grid_col : s->grid_row)[1] = grid_line(v);
+        } else if (!strcmp(name, "grid-area")) {
+            /* row-start / column-start / row-end / column-end, or an area's name */
+            const char *p = v;
+            while (is_space(*p)) p++;
+            if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_') {
+                if (strncasecmp(p, "span", 4) && strncasecmp(p, "auto", 4)) {
+                    s->grid_area = css_keep(p);
+                    return;
                 }
-            } else {
-                char parts[16][64];
-                int n = split_value(v, parts, 16), count = 0;
-                for (int i = 0; i < n; i++) {
-                    if (parts[i][0] != '[' && parts[i][0] != '/') count++;
-                    if (parts[i][0] == '/') break;
-                }
-                s->grid_columns = count;
             }
+            short got[4] = {0, 0, 0, 0};
+            for (int i = 0; i < 4 && p; i++) {
+                got[i] = grid_line(p);
+                p = strchr(p, '/');
+                if (p) p++;
+            }
+            s->grid_row[0] = got[0];
+            s->grid_col[0] = got[1];
+            s->grid_row[1] = got[2];
+            s->grid_col[1] = got[3];
         } else if (!strcmp(name, "grid-row-gap") || !strcmp(name, "row-gap")) {
             Len l = parse_len(v, font, &ok);
             if (ok && l.unit == 'p') s->gap_row = l.value;
@@ -243,7 +524,23 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
     case 'h':
         if (!strcmp(name, "height")) s->height = parse_len(v, font, &ok);
         return;
+    case 'i':
+        if (!strcmp(name, "inset")) { /* top right bottom left, written as margins are */
+            char parts[4][64];
+            int n = split_value(v, parts, 4);
+            static const int pick[4][4] = {{0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}};
+            for (int i = 0; i < 4 && n > 0; i++) s->offset[i] = parse_len(parts[pick[(n > 4 ? 4 : n) - 1][i]], font, &ok);
+        }
+        return;
     case 'j':
+        if (!strcmp(name, "justify-items")) {
+            s->justify_items = align_word(v, 0);
+            return;
+        }
+        if (!strcmp(name, "justify-self")) {
+            s->justify_self = align_word(v, 1);
+            return;
+        }
         if (!strcmp(name, "justify-content")) {
             s->justify = word_is(v, "center") ? J_CENTER
                          : (word_is(v, "flex-end") || word_is(v, "end") || word_is(v, "right")) ? J_END
@@ -254,6 +551,10 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         }
         return;
     case 'l':
+        if (!strcmp(name, "line-height")) {
+            s->line_height = parse_line_height(v, s->line_height, s->size);
+            return;
+        }
         if (!strcmp(name, "left")) s->offset[3] = parse_len(v, font, &ok);
         else if (!strcmp(name, "list-style") || !strcmp(name, "list-style-type")) s->list_none = strstr(v, "none") != NULL;
         return;
@@ -283,11 +584,41 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         } else if (!strcmp(name, "overflow") || !strcmp(name, "overflow-x") || !strcmp(name, "overflow-y")) {
             s->overflow_hidden = word_is(v, "hidden") || word_is(v, "clip") || word_is(v, "auto") || word_is(v, "scroll");
         } else if (!strcmp(name, "opacity")) {
-            int used;
-            if (number100(v, &used) <= 5 && used) s->hidden = 1;
+            int used, n = number100(v, &used);
+            if (used && v[used] == '%') n /= 100;
+            if (used) s->opacity = (unsigned char)(n <= 0 ? 0 : n >= 100 ? 255 : n * 255 / 100);
+            if (used && n <= 5) s->hidden = 1;
         }
         return;
     case 'p':
+        if (!strcmp(name, "place-items") || !strcmp(name, "place-self")) {
+            int self = name[6] == 's';
+            const char *second = v;
+            while (*second && !is_space(*second)) second++;
+            while (is_space(*second)) second++;
+            int a = align_word(v, self), j = *second && *second != '!' ? align_word(second, self) : a;
+            if (self) {
+                s->align_self = (unsigned char)a;
+                s->justify_self = (unsigned char)j;
+            } else {
+                s->align_items = (unsigned char)a;
+                s->justify_items = (unsigned char)j;
+            }
+            return;
+        }
+        if (!strcmp(name, "place-content")) {
+            const char *second = v;
+            while (*second && !is_space(*second)) second++;
+            while (is_space(*second)) second++;
+            const char *j = *second && *second != '!' ? second : v;
+            s->justify = word_is(j, "center") ? J_CENTER
+                         : (word_is(j, "flex-end") || word_is(j, "end") || word_is(j, "right")) ? J_END
+                         : word_is(j, "space-between") ? J_BETWEEN
+                         : word_is(j, "space-around") ? J_AROUND
+                         : word_is(j, "space-evenly") ? J_EVENLY
+                                                      : J_START;
+            return;
+        }
         if (!strcmp(name, "padding")) set_sides(s->padding, v, font);
         else if (!strncmp(name, "padding-", 8)) {
             Len l = parse_len(v, font, &ok);
@@ -1129,11 +1460,12 @@ static const char DEFAULT_CSS[] =
     "blockquote{margin:1em 40px}"
     "figure{margin:1em 40px}"
     "pre,xmp{white-space:pre;margin:1em 0}"
-    "pre,code,tt,kbd,samp,xmp{color:#8a2c2c}"
+    "pre,code,tt,kbd,samp,xmp,textarea{font-family:monospace;font-size:0.8125em}"
+    "pre code,pre kbd,pre samp,pre tt,code code{font-size:1em}"
     "b,strong,th,dt,legend,summary{font-weight:bold}"
     "i,em,cite,var,dfn{font-style:italic}"
     "u,ins{text-decoration:underline}s,strike,del{text-decoration:line-through}"
-    "a{color:#1a5fd6;text-decoration:underline;cursor:pointer}"
+    "a{color:#0000ee;text-decoration:underline;cursor:pointer}"
     "center{text-align:center}"
     "table{text-align:left}" /* centring around a table centres the table, not its text */
     "small,sub,sup{font-size:smaller}big{font-size:larger}"
@@ -1141,6 +1473,8 @@ static const char DEFAULT_CSS[] =
     "hr{border:1px solid #c5cad6;margin:8px 0}"
     "fieldset{border:2px solid #c0c0c0;margin:0 2px;padding:6px 10px}"
     "input,select,textarea{border:1px solid #767676;background-color:#ffffff;color:#000000;padding:2px 3px}"
+    "input,select,button{font-family:sans-serif;font-size:13.33px;font-weight:normal;font-style:normal}"
+    "textarea{font-size:13px}"
     "button,input[type=submit],input[type=button],input[type=reset]{border:1px solid #767676;"
     "background-color:#e9e9ed;color:#000000;padding:2px 8px;cursor:pointer}"
     "input[type=checkbox],input[type=radio]{border:0;padding:0;background-color:transparent}"
@@ -1167,6 +1501,9 @@ static char *default_css;
         (s)->hidden = (p)->hidden;     \
         (s)->cursor_pointer = (p)->cursor_pointer; \
         (s)->indent = (p)->indent;     \
+        (s)->face = (p)->face;         \
+        (s)->alpha = (p)->alpha;       \
+        (s)->line_height = (p)->line_height; \
     } while (0)
 
 /* Old HTML attributes that mean styles. */
@@ -1226,7 +1563,7 @@ static void presentational(Node *e, Style *s, Borders *b, const Style *parent) {
         for (Node *t = e->parent; t && t != document; t = t->parent) {
             if (!is(t->tag, "table")) continue;
             if (attr(t, "cellpadding", v, sizeof(v))) {
-                for (int i = 0; i < 4; i++) s->padding[i] = (Len){atoi(v), 'p'};
+                for (int i = 0; i < 4; i++) s->padding[i] = (Len){atoi(v), 'p', 0};
             }
             if (attr(t, "border", v, sizeof(v)) && atoi(v) > 0) {
                 for (int i = 0; i < 4; i++) {
@@ -1273,8 +1610,10 @@ static void compute_style(Node *e) {
     Style root;
     if (!p) {
         memset(&root, 0, sizeof(root));
-        root.color = 0x1C2030;
+        root.color = 0x000000;
         root.size = 16;
+        root.face = FACE_SERIF; /* (as browsers: Times New Roman unless a page says otherwise) */
+        root.alpha = 255;
         p = &root;
     }
     memset(s, 0, sizeof(*s));
@@ -1283,9 +1622,11 @@ static void compute_style(Node *e) {
     s->shrink = 100;
     s->basis.unit = 'a';
     s->align_self = AL_AUTO;
+    s->justify_self = AL_AUTO;
+    s->opacity = 255;
     for (int i = 0; i < 4; i++) {
-        s->margin_len[i] = (Len){0, 'p'};
-        s->padding[i] = (Len){0, 'p'};
+        s->margin_len[i] = (Len){0, 'p', 0};
+        s->padding[i] = (Len){0, 'p', 0};
         s->offset[i].unit = 'a';
     }
     s->width.unit = s->height.unit = 'a';
@@ -1372,12 +1713,32 @@ static void compute_style(Node *e) {
             e->css_vars_len = vars_len;
         }
     }
+    e->in_svg = is(e->tag, "svg") || (e->parent && e->parent->in_svg && !is(e->parent->tag, "foreignobject"));
+    svg_collecting = e->in_svg;
+    svg_props_len = 0;
     for (int i = 0; i < first_page; i++) apply_all(s, &b, rules[matched[i]]->decls, 0, p->size);
     presentational(e, s, &b, p);
     for (int i = first_page; i < n; i++) apply_all(s, &b, rules[matched[i]]->decls, 0, p->size);
     if (has_inline) apply_all(s, &b, inline_style, 0, p->size);
     for (int i = first_page; i < n; i++) apply_all(s, &b, rules[matched[i]]->decls, 1, p->size);
     if (has_inline) apply_all(s, &b, inline_style, 1, p->size);
+    svg_collecting = 0;
+    s->alpha = (unsigned char)(p->alpha * s->opacity / 255);
+    if (e->parent && e->parent->type == NODE_ELEMENT) { /* children of flex and grid boxes are blocks (CSS: "blockified") */
+        int pd = e->parent->style.display;
+        if (pd == D_FLEX || pd == D_INLINE_FLEX || pd == D_GRID || pd == D_INLINE_GRID) {
+            if (s->display == D_INLINE || s->display == D_INLINE_BLOCK) s->display = D_BLOCK;
+            else if (s->display == D_INLINE_FLEX) s->display = D_FLEX;
+            else if (s->display == D_INLINE_GRID) s->display = D_GRID;
+        }
+    }
+    free(e->svg_css);
+    e->svg_css = NULL;
+    e->svg_css_len = 0;
+    if (svg_props_len && (e->svg_css = malloc((size_t)svg_props_len)) != NULL) {
+        memcpy(e->svg_css, svg_props, (size_t)svg_props_len);
+        e->svg_css_len = svg_props_len;
+    }
 
     for (int i = 0; i < 4; i++) {
         s->border[i] = b.style[i] == 1 ? (b.width[i] < 0 ? 3 : b.width[i]) : 0;

@@ -3,11 +3,12 @@
    Part of the browser (included by programs/browser.c). */
 
 enum { D_INLINE, D_BLOCK, D_LIST_ITEM, D_NONE, D_INLINE_BLOCK, D_FLEX, D_INLINE_FLEX, D_GRID, D_TABLE, D_TABLE_ROW,
-       D_TABLE_CELL, D_TABLE_GROUP, D_TABLE_CAPTION };
+       D_TABLE_CELL, D_TABLE_GROUP, D_TABLE_CAPTION, D_INLINE_GRID };
 enum { P_STATIC, P_RELATIVE, P_ABSOLUTE, P_FIXED };
 enum { A_LEFT, A_CENTER, A_RIGHT };
 enum { J_START, J_CENTER, J_END, J_BETWEEN, J_AROUND, J_EVENLY };
 enum { AL_STRETCH, AL_START, AL_CENTER, AL_END, AL_AUTO = 255 };
+#define GRID_SPAN 1000
 #define AUTO (-30000)
 static int layout_viewport_w, layout_viewport_h; /* a frame's size (0 in the window: the usual) */
 #define VIEW_W (layout_viewport_w ? layout_viewport_w : 800) /* the page width, for vw units and @media */
@@ -51,9 +52,133 @@ static int number100(const char *s, int *used) {
     return sign * (whole * 100 + frac);
 }
 
+/* calc(), min(), max() and clamp(): worked out as px + percent. */
+typedef struct {
+    double px, pct, num;
+    char kind; /* 'l' a length, 'n' a plain number, 0 not understood */
+} CalcV;
+
+static Len parse_len(const char *v, int font, int *ok);
+static CalcV calc_sum(const char **p, int font, int depth);
+
+static CalcV calc_value(const char **p, int font, int depth) {
+    CalcV r = {0, 0, 0, 0};
+    while (is_space(**p)) (*p)++;
+    const char *s = *p;
+    if (depth > 16) return r;
+    if (*s == '(' || !strncasecmp(s, "calc(", 5) || !strncasecmp(s, "-webkit-calc(", 13)) {
+        *p = strchr(s, '(') + 1;
+        r = calc_sum(p, font, depth + 1);
+        while (is_space(**p)) (*p)++;
+        if (**p == ')') (*p)++;
+        return r;
+    }
+    int fn = !strncasecmp(s, "min(", 4) ? 1 : !strncasecmp(s, "max(", 4) ? 2 : !strncasecmp(s, "clamp(", 6) ? 3 : 0;
+    if (fn) {
+        *p = strchr(s, '(') + 1;
+        CalcV args[8];
+        int n = 0;
+        for (;;) {
+            CalcV a = calc_sum(p, font, depth + 1);
+            if (!a.kind) return r;
+            if (n < 8) args[n++] = a;
+            while (is_space(**p)) (*p)++;
+            if (**p == ',') {
+                (*p)++;
+                continue;
+            }
+            if (**p == ')') (*p)++;
+            break;
+        }
+        /* Compare them as they would be in a page as wide as the window
+           (percentages can only be guessed at here). */
+        double est[8];
+        for (int i = 0; i < n; i++) est[i] = args[i].kind == 'n' ? args[i].num : args[i].px + args[i].pct * VIEW_W / 100;
+        int pick = 0;
+        if (fn == 3 && n == 3) { /* clamp(lo, want, hi) */
+            pick = est[1] < est[0] ? 0 : est[1] > est[2] ? 2 : 1;
+        } else {
+            for (int i = 1; i < n; i++)
+                if (fn == 1 ? est[i] < est[pick] : est[i] > est[pick]) pick = i;
+        }
+        return args[pick];
+    }
+    char tok[48];
+    int k = 0;
+    if (*s == '+' || *s == '-') tok[k++] = *s++;
+    while (*s && (is_alpha(*s) || (*s >= '0' && *s <= '9') || *s == '.' || *s == '%') && k < 47) tok[k++] = *s++;
+    tok[k] = 0;
+    *p = s;
+    if (!k) return r;
+    int used, n100 = number100(tok, &used);
+    if (used && !tok[used]) {
+        r.kind = 'n';
+        r.num = n100 / 100.0;
+        return r;
+    }
+    int ok;
+    Len l = parse_len(tok, font, &ok);
+    if (!ok || (l.unit != 'p' && l.unit != '%')) return r;
+    r.kind = 'l';
+    if (l.unit == '%') r.pct = l.value / 100.0;
+    else r.px = l.value;
+    return r;
+}
+
+static CalcV calc_product(const char **p, int font, int depth) {
+    CalcV v = calc_value(p, font, depth);
+    for (;;) {
+        while (is_space(**p)) (*p)++;
+        char op = **p;
+        if (op != '*' && op != '/') return v;
+        (*p)++;
+        CalcV w = calc_value(p, font, depth);
+        if (!v.kind || !w.kind) return (CalcV){0, 0, 0, 0};
+        if (op == '*') {
+            if (v.kind == 'n' && w.kind == 'n') v.num *= w.num;
+            else if (v.kind == 'n') {
+                w.px *= v.num;
+                w.pct *= v.num;
+                v = w;
+            } else if (w.kind == 'n') {
+                v.px *= w.num;
+                v.pct *= w.num;
+            }
+        } else if (w.kind == 'n' && w.num != 0) {
+            if (v.kind == 'n') v.num /= w.num;
+            else {
+                v.px /= w.num;
+                v.pct /= w.num;
+            }
+        }
+    }
+}
+
+static CalcV calc_sum(const char **p, int font, int depth) {
+    CalcV v = calc_product(p, font, depth);
+    for (;;) {
+        while (is_space(**p)) (*p)++;
+        char op = **p;
+        if (op != '+' && op != '-') return v;
+        (*p)++;
+        CalcV w = calc_product(p, font, depth);
+        if (!v.kind || !w.kind) return (CalcV){0, 0, 0, 0};
+        double sign = op == '-' ? -1 : 1;
+        if (v.kind == 'n' && w.kind == 'n') v.num += sign * w.num;
+        else {
+            if (v.kind == 'n') v = (CalcV){v.num, 0, 0, 'l'}; /* (a bare 0 and the like) */
+            if (w.kind == 'n') w = (CalcV){w.num, 0, 0, 'l'};
+            v.px += sign * w.px;
+            v.pct += sign * w.pct;
+        }
+    }
+}
+
+static int round_half(double d) { return (int)(d < 0 ? d - 0.5 : d + 0.5); }
+
 /* A length: px, or percent, or auto. `font` is the font size for em. */
 static Len parse_len(const char *v, int font, int *ok) {
-    Len l = {0, 'n'};
+    Len l = {0, 'n', 0};
     *ok = 1;
     while (is_space(*v)) v++;
     if (strncasecmp(v, "auto", 4) == 0) {
@@ -61,16 +186,42 @@ static Len parse_len(const char *v, int font, int *ok) {
         return l;
     }
     if (strncasecmp(v, "none", 4) == 0) return l;
+    /* sizes from the content: max-content 'x', min-content 'm', fit-content 'f' */
+    if (strncasecmp(v, "max-content", 11) == 0 || strncasecmp(v, "-webkit-max-content", 19) == 0) {
+        l.unit = 'x';
+        return l;
+    }
+    if (strncasecmp(v, "min-content", 11) == 0 || strncasecmp(v, "-webkit-min-content", 19) == 0) {
+        l.unit = 'm';
+        return l;
+    }
+    if (strncasecmp(v, "fit-content", 11) == 0 || strncasecmp(v, "-webkit-fit-content", 19) == 0 ||
+        strncasecmp(v, "-moz-fit-content", 16) == 0) {
+        l.unit = 'f';
+        return l;
+    }
     if (strncasecmp(v, "calc(", 5) == 0 || strncasecmp(v, "min(", 4) == 0 || strncasecmp(v, "max(", 4) == 0 ||
-        strncasecmp(v, "clamp(", 6) == 0) {
-        /* Take the first plain length inside as a fair guess. */
-        const char *p = strchr(v, '(') + 1;
-        while (*p && !(*p >= '0' && *p <= '9')) p++;
-        if (!*p) {
+        strncasecmp(v, "clamp(", 6) == 0 || strncasecmp(v, "-webkit-calc(", 13) == 0) {
+        const char *p = v;
+        CalcV r = calc_value(&p, font, 0);
+        if (!r.kind) {
             *ok = 0;
             return l;
         }
-        return parse_len(p, font, ok);
+        if (r.kind == 'n') r.px = r.num;
+        int px = round_half(r.px), pct = round_half(r.pct * 100);
+        if (!pct) {
+            l.unit = 'p';
+            l.value = px;
+        } else if (!px) {
+            l.unit = '%';
+            l.value = pct;
+        } else {
+            l.unit = 'c';
+            l.value = pct;
+            l.px = px;
+        }
+        return l;
     }
     int used;
     int n = number100(v, &used);
@@ -151,11 +302,13 @@ static int parse_color(const char *v, unsigned *out) {
         if (n == 3 || n == 4) {
             if (n == 4 && d[3] == 0) return 2;
             *out = (unsigned)(d[0] * 17) << 16 | (unsigned)(d[1] * 17) << 8 | (unsigned)(d[2] * 17);
+            if (n == 4) *out |= (unsigned)(255 - d[3] * 17) << 24;
             return 1;
         }
         if (n == 6 || n == 8) {
             if (n == 8 && d[6] == 0 && d[7] == 0) return 2;
             *out = (unsigned)(d[0] << 20 | d[1] << 16 | d[2] << 12 | d[3] << 8 | d[4] << 4 | d[5]);
+            if (n == 8) *out |= (unsigned)(255 - (d[6] << 4 | d[7])) << 24;
             return 1;
         }
         return 0;
@@ -203,6 +356,8 @@ static int parse_color(const char *v, unsigned *out) {
         }
         for (int i = 0; i < 3; i++) c[i] = c[i] < 0 ? 0 : c[i] > 255 ? 255 : c[i];
         *out = (unsigned)(c[0] << 16 | c[1] << 8 | c[2]);
+        int alpha = c[3] < 0 ? 0 : c[3] > 100 ? 100 : c[3]; /* (percent) */
+        if (alpha < 100) *out |= (unsigned)(255 - (alpha * 255 + 50) / 100) << 24;
         return 1;
     }
     if (strncasecmp(v, "light-dark(", 11) == 0) return parse_color(v + 11, out);
@@ -262,7 +417,9 @@ typedef struct {
     unsigned char color_set[4];
 } Borders;
 
-#define BORDER_INVISIBLE 0x01000000u /* a border colour: transparent */
+/* Colours are 0xTTRRGGBB: TT is how transparent (0 opaque, 255 not seen). */
+#define BORDER_INVISIBLE 0xFF000000u /* a border colour: transparent */
+#define COLOR_ALPHA(c) (255u - ((c) >> 24))
 
 static void border_part(Borders *b, int side, const char *v, int font) {
     char parts[6][64];
