@@ -19,11 +19,13 @@ typedef struct {
     unsigned short ascii_glyph[128], ascii_adv[128];
 } Font;
 
-static Font font_table[FACE_COUNT * 4];
-static const char *const FONT_FILES[FACE_COUNT * 4] = {
+#define FONT_FALLBACK (FACE_COUNT * 4) /* DejaVu Sans: symbols and letters the others lack */
+static Font font_table[FACE_COUNT * 4 + 1];
+static const char *const FONT_FILES[FACE_COUNT * 4 + 1] = {
     "/liberationsans-regular.ttf", "/liberationsans-bold.ttf", "/liberationsans-italic.ttf", "/liberationsans-bolditalic.ttf",
     "/liberationserif-regular.ttf", "/liberationserif-bold.ttf", "/liberationserif-italic.ttf", "/liberationserif-bolditalic.ttf",
-    "/liberationmono-regular.ttf", "/liberationmono-bold.ttf", "/liberationmono-italic.ttf", "/liberationmono-bolditalic.ttf"};
+    "/liberationmono-regular.ttf", "/liberationmono-bold.ttf", "/liberationmono-italic.ttf", "/liberationmono-bolditalic.ttf",
+    "/dejavusans.ttf"};
 
 static unsigned ft_u8(const Font *f, unsigned at) { return at < f->len ? f->d[at] : 0; }
 static unsigned ft_u16(const Font *f, unsigned at) { return at + 2 <= f->len ? (unsigned)f->d[at] << 8 | f->d[at + 1] : 0; }
@@ -113,6 +115,21 @@ static int font_parse(Font *f) {
     return 1;
 }
 
+static Font *font_load(int i) {
+    Font *f = &font_table[i];
+    if (!f->state) {
+        size_t len;
+        f->d = (unsigned char *)read_all(FONT_FILES[i], &len);
+        f->len = len;
+        f->state = f->d && font_parse(f) ? 1 : -1;
+        if (f->state < 0 && f->d) {
+            free(f->d);
+            f->d = NULL;
+        }
+    }
+    return f->state > 0 ? f : NULL;
+}
+
 /* The font for a face and style: loaded the first time; NULL without one. */
 static Font *font_get(int face, int bold, int italic) {
     int i = (face < 0 || face >= FACE_COUNT ? FACE_SANS : face) * 4 + (bold ? 1 : 0) + (italic ? 2 : 0);
@@ -146,15 +163,32 @@ static unsigned font_next_char(const char *s, int len, int *i) {
     return extra ? code : 0xFFFD;
 }
 
-static unsigned font_glyph(const Font *f, unsigned code, unsigned *advance) {
+/* A character's glyph: from f, or else from the fallback font (the font it
+   came from is returned), or else a question mark. */
+static const Font *font_char(const Font *f, unsigned code, unsigned *glyph, unsigned *advance) {
     if ((code >= 0x200B && code <= 0x200F) || code == 0xFEFF || code == 0xAD || code == 0x2060) { /* (nothing to show) */
-        *advance = 0;
-        return 0;
+        *glyph = *advance = 0;
+        return f;
     }
-    unsigned g = code < 128 ? f->ascii_glyph[code] : ft_glyph_index(f, code);
-    if (!g && code >= 128) g = ft_glyph_index(f, '?');
-    *advance = code < 128 ? f->ascii_adv[code] : ft_advance(f, g);
-    return g;
+    if (code < 128) {
+        *glyph = f->ascii_glyph[code];
+        *advance = f->ascii_adv[code];
+        return f;
+    }
+    unsigned g = ft_glyph_index(f, code);
+    if (!g) {
+        const Font *fb = font_load(FONT_FALLBACK);
+        unsigned g2 = fb && fb != f ? ft_glyph_index(fb, code) : 0;
+        if (g2) {
+            *glyph = g2;
+            *advance = ft_advance(fb, g2);
+            return fb;
+        }
+        g = ft_glyph_index(f, '?');
+    }
+    *glyph = g;
+    *advance = ft_advance(f, g);
+    return f;
 }
 
 /* Line metrics in pixels: above the baseline, below it, and the extra gap
@@ -184,13 +218,13 @@ static long long font_width64(int face, int bold, int italic, int size, const ch
         }
         return (long long)n * font_cell(size) * 64;
     }
-    long long units = 0;
+    long long w64 = 0;
     for (int i = 0; i < len;) {
-        unsigned adv, code = font_next_char(s, len, &i);
-        font_glyph(f, code, &adv);
-        units += adv;
+        unsigned adv, g, code = font_next_char(s, len, &i);
+        const Font *used = font_char(f, code, &g, &adv);
+        w64 += (long long)adv * size * 64 / used->units;
     }
-    return units * size * 64 / f->units;
+    return w64;
 }
 
 static int font_width(int face, int bold, int italic, int size, const char *s, int len) {
@@ -583,12 +617,11 @@ static void font_draw(canvas *c, int x, int baseline, const char *s, int len, in
         return;
     }
     if (size > 400) size = 400;
-    int index = (int)(f - font_table);
     if (baseline + size < 0 || baseline - size * 2 > c->height) return;
     long long pen = 0; /* 1/64 px */
     for (int i = 0; i < len;) {
-        unsigned adv, code = font_next_char(s, len, &i);
-        unsigned g = font_glyph(f, code, &adv);
+        unsigned adv, g, code = font_next_char(s, len, &i);
+        const Font *used = font_char(f, code, &g, &adv);
         long long px64 = (long long)x * 64 + pen;
         int whole = (int)(px64 >> 6), phase = (int)((px64 & 63) + 8) / 16;
         if (phase == 4) {
@@ -597,9 +630,9 @@ static void font_draw(canvas *c, int x, int baseline, const char *s, int len, in
         }
         if (whole > c->width) break;
         if (code != ' ' && g && whole > -size * 2) {
-            GlyphSlot *slot = font_render(index, f, g, size, phase);
+            GlyphSlot *slot = font_render((int)(used - font_table), used, g, size, phase);
             if (slot) font_blend(c, whole + slot->left, baseline + slot->top, slot, color);
         }
-        pen += (long long)adv * size * 64 / f->units;
+        pen += (long long)adv * size * 64 / used->units;
     }
 }

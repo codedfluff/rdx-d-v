@@ -538,6 +538,10 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         }
         return;
     case 'c':
+        if (!strcmp(name, "content")) {
+            s->content = css_keep(v);
+            return;
+        }
         if (!strcmp(name, "color")) {
             if (parse_color(v, &color) == 1) s->color = color;
         } else if (!strcmp(name, "clear")) {
@@ -1082,6 +1086,7 @@ typedef struct {
     int need_count;
     unsigned key;      /* fingerprint of the rightmost part, for quick rejection */
     int specificity, origin, order;
+    unsigned char pseudo_el; /* for ::before (1) or ::after (2) */
     const char *decls;
     const char *sel; /* the selector text (for CSS_DEBUG) */
     int sel_len;
@@ -1314,6 +1319,23 @@ static int build_rule(const char *selector, int n, Rule *out) {
     while (n > 0 && is_space(*selector)) selector++, n--;
     while (n > 0 && is_space(selector[n - 1])) n--;
     if (n <= 0) return 0;
+    /* a rule for the box made before or after an element's content */
+    int pseudo_el = 0;
+    static const char *const ends[] = {"::before", "::after", ":before", ":after"};
+    for (int k = 0; k < 4 && !pseudo_el; k++) {
+        int l = (int)strlen(ends[k]);
+        if (n >= l && !strncasecmp(selector + n - l, ends[k], (size_t)l) && (n == l || selector[n - l - 1] != ':' || k < 2)) {
+            pseudo_el = strstr(ends[k], "before") ? 1 : 2;
+            n -= l;
+        }
+    }
+    if (pseudo_el && (n == 0 || is_space(selector[n - 1]) || selector[n - 1] == '>' || selector[n - 1] == '+' || selector[n - 1] == '~')) {
+        static const char any[] = "*"; /* "::before" alone, or "a > ::before" */
+        if (n == 0) {
+            selector = any;
+            n = 1;
+        } else return 0;
+    }
     Compound parts[16];
     int count = 0, spec = 0, i = 0;
     char next_combinator = ' ';
@@ -1372,7 +1394,8 @@ static int build_rule(const char *selector, int n, Rule *out) {
         unsigned key = a->id[0] ? fingerprint('#', a->id) : a->class_count ? fingerprint('.', a->classes[0]) : a->tag[0] ? fingerprint('t', a->tag) : 0;
         if (key) r.need[r.need_count++] = key;
     }
-    r.specificity = spec;
+    r.specificity = spec + (pseudo_el ? 1 : 0);
+    r.pseudo_el = (unsigned char)pseudo_el;
     *out = r;
     return 1;
 }
@@ -1850,14 +1873,21 @@ static void compute_style(Node *e) {
     }
 
     /* Matching rules, in cascade order: built-in before the page's, then by
-       specificity, then by order of appearance. */
+       specificity, then by order of appearance. A generated box (::before,
+       ::after) takes its element's rules for it. */
     static int matched[1024];
     int n = 0;
     unsigned keys[10];
     int key_count = 0;
-    keys[key_count++] = e->tag_key;
-    if (e->id_key) keys[key_count++] = e->id_key;
-    for (int i = 0; i < e->class_count; i++) keys[key_count++] = e->class_keys[i];
+    Node *subject = e;
+    int want = 0;
+    if (e->tag[0] == ':') {
+        subject = e->parent;
+        want = e->tag[2] == 'b' ? 1 : 2;
+    } else e->pseudo_flags = 0;
+    keys[key_count++] = subject->tag_key;
+    if (subject->id_key) keys[key_count++] = subject->id_key;
+    for (int i = 0; i < subject->class_count; i++) keys[key_count++] = subject->class_keys[i];
     /* Only the rules filed under one of this element's keys (or under no
        key) can match it. */
     for (int k = 0; k < key_count; k++) {
@@ -1865,13 +1895,18 @@ static void compute_style(Node *e) {
         for (int q = 0; q < k && !dup; q++) dup = keys[q] == keys[k];
         if (dup) continue;
         for (int i = bucket_head[keys[k] & (BUCKETS - 1)]; i >= 0 && n < 1024; i = rule_next[i]) {
-            if (rules[i]->key == keys[k] && ancestors_possible(rules[i], e) && matches_from(rules[i], rules[i]->part_count - 1, e))
-                matched[n++] = i;
+            if (rules[i]->key == keys[k] && ancestors_possible(rules[i], subject) && matches_from(rules[i], rules[i]->part_count - 1, subject)) {
+                if (rules[i]->pseudo_el == want) matched[n++] = i;
+                else if (!want) e->pseudo_flags |= rules[i]->pseudo_el;
+            }
         }
     }
     for (int i = keyless_head; i >= 0 && n < 1024; i = rule_next[i]) {
         stat_keyless++;
-        if (ancestors_possible(rules[i], e) && matches_from(rules[i], rules[i]->part_count - 1, e)) matched[n++] = i;
+        if (ancestors_possible(rules[i], subject) && matches_from(rules[i], rules[i]->part_count - 1, subject)) {
+            if (rules[i]->pseudo_el == want) matched[n++] = i;
+            else if (!want) e->pseudo_flags |= rules[i]->pseudo_el;
+        }
     }
     for (int i = 1; i < n; i++) {
         int r = matched[i], j = i;
@@ -1981,6 +2016,138 @@ static void node_keys(Node *n) {
     }
 }
 
+/* ---------------------------------------------------------------- ::before and ::after */
+
+/* The boxes made for ::before and ::after. They are put in the tree while
+   styles are worked out and the page is laid out, then taken out again
+   (scripts never see them); the display list keeps pointing at them until
+   the next layout. */
+static Node **generated;
+static int generated_count, generated_cap;
+
+static void generated_clear(void) {
+    for (int i = 0; i < generated_count; i++) free_tree(generated[i]);
+    generated_count = 0;
+}
+
+static void generated_detach(void) {
+    for (int i = 0; i < generated_count; i++) {
+        Node *g = generated[i], *p = g->parent;
+        if (!p) continue;
+        if (g->prev) g->prev->next = g->next;
+        else if (p->first == g) p->first = g->next;
+        if (g->next) g->next->prev = g->prev;
+        else if (p->last == g) p->last = g->prev;
+        g->prev = g->next = NULL; /* (its parent stays: for links and clicks) */
+    }
+}
+
+/* An element as clicks see it: a generated box is its element's. */
+static Node *real_node(Node *n) {
+    while (n && n->parent && (n->type == NODE_TEXT ? n->parent->tag[0] == ':' : n->tag[0] == ':')) n = n->parent;
+    if (n && n->type == NODE_ELEMENT && n->tag[0] == ':') n = n->parent;
+    return n;
+}
+
+static int is_replaced_tag(const char *t) {
+    static const char *const tags[] = {"img", "input", "select", "textarea", "video", "canvas", "iframe", "svg", "object", "embed",
+                                       "progress", "meter", "br", "audio", NULL};
+    for (int i = 0; tags[i]; i++)
+        if (!strcmp(t, tags[i])) return 1;
+    return 0;
+}
+
+static void make_generated(Node *e, int which) {
+    if (is_replaced_tag(e->tag)) return;
+    Node *g = new_node(NODE_ELEMENT, which == 1 ? "::before" : "::after");
+    if (!g || !grow((void **)&generated, &generated_cap, generated_count + 1, sizeof(Node *))) {
+        free(g);
+        return;
+    }
+    generated[generated_count++] = g;
+    g->parent = e;
+    if (which == 1) {
+        g->next = e->first;
+        if (e->first) e->first->prev = g;
+        else e->last = g;
+        e->first = g;
+    } else {
+        g->prev = e->last;
+        if (e->last) e->last->next = g;
+        else e->first = g;
+        e->last = g;
+    }
+}
+
+/* The text of a content value: strings (with \escapes), attr(), quotes. */
+static void generated_text(Node *g) {
+    const char *v = g->style.content;
+    if (!v || word_is(v, "none") || word_is(v, "normal")) {
+        g->style.display = D_NONE;
+        return;
+    }
+    char text[512];
+    int n = 0;
+    for (const char *p = v; *p && n < 500;) {
+        while (is_space(*p)) p++;
+        if (*p == '"' || *p == '\'') {
+            char q = *p++;
+            while (*p && *p != q && n < 500) {
+                if (*p == '\\' && p[1]) {
+                    p++;
+                    if (hex_digit(*p) >= 0) {
+                        unsigned code = 0;
+                        for (int k = 0; k < 6 && hex_digit(*p) >= 0; k++) code = code * 16 + (unsigned)hex_digit(*p++);
+                        if (*p == ' ') p++;
+                        if (code >= 0xE000 && code <= 0xF8FF) continue; /* (an icon font's private letter: no font for it) */
+                        if (code == 0xA) code = '\n';
+                        n += utf8_for(code, text + n);
+                        continue;
+                    }
+                    if (*p == '\n') {
+                        p++;
+                        continue;
+                    }
+                }
+                text[n++] = *p++;
+            }
+            if (*p) p++;
+        } else if (!strncasecmp(p, "attr(", 5)) {
+            char name[64], value[256];
+            int k = 0;
+            p += 5;
+            while (*p && *p != ')' && k < 63) {
+                if (!is_space(*p)) name[k++] = (char)tolower((unsigned char)*p);
+                p++;
+            }
+            name[k] = 0;
+            if (*p) p++;
+            if (attr(g->parent, name, value, sizeof(value)))
+                for (int q = 0; value[q] && n < 500; q++) text[n++] = value[q];
+        } else if (!strncasecmp(p, "open-quote", 10)) {
+            n += utf8_for(0x201C, text + n);
+            p += 10;
+        } else if (!strncasecmp(p, "close-quote", 11)) {
+            n += utf8_for(0x201D, text + n);
+            p += 11;
+        } else { /* counters, url() pictures, no-open-quote...: nothing */
+            int depth = 0;
+            while (*p && (depth || !is_space(*p))) {
+                if (*p == '(') depth++;
+                if (*p == ')') depth--;
+                p++;
+            }
+        }
+    }
+    if (!n) return;
+    Node *t = new_node(NODE_TEXT, NULL);
+    if (!t) return;
+    t->text = copy_of(text, n);
+    t->text_len = t->text ? n : 0;
+    t->parent = g;
+    g->first = g->last = t;
+}
+
 static void compute_styles(void) {
     const char *dbg = getenv("CSS_DEBUG");
     css_debug_tag[0] = 0;
@@ -2025,6 +2192,11 @@ static void compute_styles(void) {
             n->styled = 1;
         } else {
             compute_style(n);
+            if (n->tag[0] == ':') generated_text(n); /* (a box just made: now its text) */
+            else if (n->pseudo_flags && n->style.display != D_NONE) {
+                if (n->pseudo_flags & 1) make_generated(n, 1);
+                if (n->pseudo_flags & 2) make_generated(n, 2);
+            }
         }
     }
 }

@@ -564,7 +564,7 @@ static void gather(Node *n, int cw) {
     if (s->display == D_INLINE && !is_replaced(n)) {
         int left = pad(n, 3, cw) + s->border[3] + margin(n, 3, cw);
         int right = pad(n, 1, cw) + s->border[1] + margin(n, 1, cw);
-        if (left) add_atom((Atom){AT_SPACE, (unsigned char)pending_space, n, 0, 0, left, 0, 0});
+        if (left) add_atom((Atom){AT_SPACE, (unsigned char)pending_space, n, 1, 0, left, 0, 0}); /* (start 1: its left side) */
         if (left) pending_space = 0;
         for (Node *c = n->first; c; c = c->next) {
             if (c->type == NODE_ELEMENT && (c->style.floating || out_of_flow(c))) {
@@ -573,7 +573,7 @@ static void gather(Node *n, int cw) {
             }
             gather(c, cw);
         }
-        if (right) add_atom((Atom){AT_SPACE, 0, n, 0, 0, right, 0, 0});
+        if (right) add_atom((Atom){AT_SPACE, 0, n, 2, 0, right, 0, 0});
         return;
     }
     /* An inline box: laid out now (at 0,0), moved into its line later. */
@@ -606,6 +606,29 @@ static void line_edges(int left, int right, int y, int h, int *l, int *r) {
     }
 }
 
+static int line_item_start; /* the first display item of the line being placed */
+
+/* An inline element's background on this line, from x0 to x1: one box
+   for all of it (its words, the spaces between, its padding). */
+static void inline_bg(Node *e, int x0, int x1, int baseline) {
+    int fa, fd, fg;
+    font_metrics(FONT_OF(&e->style), &fa, &fd, &fg);
+    int y = baseline - fa - pad(e, 0, 0), h = fa + fd + pad(e, 0, 0) + pad(e, 2, 0);
+    for (int i = item_count - 1; i >= line_item_start && i >= 0; i--)
+        if (items[i].kind == IT_RECT && items[i].node == e && items[i].y == y) {
+            if (x1 > items[i].x + items[i].w) items[i].w = x1 - items[i].x;
+            return;
+        }
+    int it = new_item(IT_RECT);
+    if (it < 0) return;
+    items[it].x = x0;
+    items[it].y = y;
+    items[it].w = x1 - x0;
+    items[it].h = h;
+    items[it].color = e->style.background;
+    items[it].node = e;
+}
+
 /* Paint the words of one line: produce items. */
 static void emit_word(Atom *a, int x, int baseline) {
     Node *t = a->node;
@@ -616,15 +639,7 @@ static void emit_word(Atom *a, int x, int baseline) {
     /* Backgrounds of inline elements (a highlighted word, a tag-like link). */
     for (Node *e = t->parent; e && e->type == NODE_ELEMENT && e->style.display == D_INLINE && !is_replaced(e); e = e->parent) {
         if (e->style.has_background) {
-            int it = new_item(IT_RECT);
-            if (it >= 0) {
-                items[it].x = x;
-                items[it].y = top - pad(e, 0, 0);
-                items[it].w = a->w;
-                items[it].h = content + pad(e, 0, 0) + pad(e, 2, 0);
-                items[it].color = e->style.background;
-                items[it].node = e;
-            }
+            inline_bg(e, x, x + a->w, baseline);
             break;
         }
     }
@@ -748,6 +763,7 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
         if (spare > 0 && align == A_CENTER) x += spare / 2;
         else if (spare > 0 && align == A_RIGHT) x += spare;
         int baseline = y + above, line_items = item_count;
+        line_item_start = item_count;
         if (in_flow) {
             parent->base_y = baseline;
             parent->base_pass = layout_pass;
@@ -764,6 +780,10 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
             x += space;
             if (a->kind == AT_WORD) {
                 emit_word(a, x, baseline);
+            } else if (a->kind == AT_SPACE && a->node->type == NODE_ELEMENT && a->node->style.has_background && !a->node->style.hidden) {
+                int m = a->start == 1 ? margin(a->node, 3, 0) : margin(a->node, 1, 0); /* (its padding, not its margin) */
+                if (a->start == 1) inline_bg(a->node, x + m, x + a->w, baseline);
+                else inline_bg(a->node, x, x + a->w - m, baseline);
             } else if (a->kind == AT_BOX) {
                 Node *b = a->node;
                 shift_subtree(b, x + b->m[3] - b->x, baseline - a->asc + b->m[0] - b->y);

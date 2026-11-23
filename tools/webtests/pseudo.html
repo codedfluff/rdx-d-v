@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Pseudo-elements</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 16px; }
+.req::after { content: " *"; color: #c00; }
+.quote::before { content: open-quote; font-size: 24px; color: #888; }
+.quote::after { content: close-quote; font-size: 24px; color: #888; }
+.badge::before { content: attr(data-count) " new"; background: #e33; color: #fff; padding: 1px 6px; border-radius: 9px; margin-right: 6px; font-size: 12px; }
+.clearfix::after { content: ""; display: table; clear: both; }
+.float { float: left; width: 80px; height: 40px; background: #9cf; }
+.box { position: relative; width: 160px; height: 50px; background: #eee; }
+.box::before { content: ""; position: absolute; left: 0; top: 0; width: 6px; height: 100%; background: #2a7; }
+ul.check { list-style: none; padding-left: 0; }
+ul.check li::before { content: "\2713"; color: #2a7; margin-right: 8px; }
+.icon::before { content: "\f101"; }
+</style></head><body>
+<p><label class="req">Name</label></p>
+<p class="quote">Quoted text</p>
+<p class="badge" data-count="3">Messages</p>
+<div class="clearfix" style="background:#ffe"><div class="float"></div></div>
+<p>after the clearfix</p>
+<div class="box">Left bar from ::before</div>
+<ul class="check"><li>Fast</li><li>Small</li></ul>
+<p><span class="icon"></span>icon font letter hidden</p>
+<p>PSEUDO END</p>
+</body></html>

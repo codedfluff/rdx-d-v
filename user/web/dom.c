@@ -138,6 +138,7 @@ typedef struct {
     /* transform: only its translation */
     Len tx, ty;
     unsigned char translated;
+    const char *content;            /* ::before / ::after: the content property as written */
     short radius[8];                /* corners (top-left, top-right, bottom-right, bottom-left), across then down:
                                        px, or -percent */
     int z_index;
@@ -160,6 +161,7 @@ struct Node {
     int min_content, max_content, intrinsic_done;
     int base_y, base_pass;   /* its last line's baseline (page y), and the layout pass that set it */
     int trail_margin;        /* its last child's bottom margin, when it collapses through this box's */
+    unsigned char pseudo_flags; /* style sheets give it a ::before (1) / ::after (2) */
     /* <a href> */
     int link;
     /* <img> */

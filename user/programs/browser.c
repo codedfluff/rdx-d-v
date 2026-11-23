@@ -257,6 +257,7 @@ static void free_page(void) {
     for (int i = 0; i < css_buffer_count; i++) free(css_buffers[i]);
     css_buffer_count = 0;
     free_rules();
+    generated_clear();
     bg_cache_clear();
     scaled_forget(NULL);
     indexed_count = -1;
@@ -418,9 +419,11 @@ static u64 cascade_ms, layout_ms;
 
 static void relayout(void) {
     u64 t0 = uptime_ms();
+    generated_clear(); /* (the last layout's ::before / ::after boxes) */
     compute_styles();
     u64 t1 = uptime_ms();
     layout_page(layout_viewport_w ? layout_viewport_w : PAGE_W);
+    generated_detach();
     cascade_ms = t1 - t0;
     layout_ms = uptime_ms() - t1;
     frames_update();
@@ -1607,7 +1610,7 @@ static int click_page(int x, int vy) {
         if (f->type == NODE_ELEMENT && is(f->tag, "iframe") && frame_click(f, x, vy + scroll)) return 1;
     }
     int i = item_at(x, vy + scroll);
-    Node *target = i >= 0 ? items[i].node : NULL;
+    Node *target = i >= 0 ? real_node(items[i].node) : NULL;
     if (i < 0 || items[i].kind == IT_RECT) { /* not on text: the innermost box there */
         Node *box = node_at(x, vy + scroll);
         if (box) target = box;
