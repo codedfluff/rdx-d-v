@@ -68,6 +68,37 @@ static int scroll; /* (each frame scrolls on its own) */
 
 /* ================================================================ loading a page */
 
+static char *data_url(const char *url, size_t *len, char *type, int type_max);
+
+/* Fonts the page's layout asked for (@font-face): fetched now. Returns how
+   many came (the page is then laid out again). */
+static int load_web_fonts(void) {
+    int got = 0;
+    for (int i = 0; i < web_font_count; i++) {
+        WebFont *w = &web_fonts[i];
+        if (!w->wanted || w->state) continue;
+        w->state = -1;
+        unsigned char *bytes = NULL;
+        size_t len = 0;
+        if (!strncasecmp(w->url, "data:", 5)) {
+            char type[64];
+            bytes = (unsigned char *)data_url(w->url, &len, type, sizeof(type));
+        } else {
+            char url[1024], error[400];
+            Fetched f;
+            resolve_url(base_url, w->url, url, sizeof(url));
+            if (fetch_url(url, NULL, &f, error) == 0) {
+                bytes = (unsigned char *)f.body;
+                len = f.len;
+            } else if (getenv("BROWSER_TIMING")) printf("[font] %s: %s\n", url, error);
+        }
+        int ok = bytes ? web_font_install(i, bytes, len) : 0;
+        got += ok;
+        if (getenv("BROWSER_TIMING")) printf("[font] %s (%s%s): %s\n", w->family, w->bold ? "bold " : "", w->italic ? "italic" : "", ok ? "loaded" : "not usable");
+    }
+    return got;
+}
+
 /* Pictures for CSS backgrounds, by address (many elements share one). */
 static struct {
     char *url;
@@ -222,6 +253,14 @@ static char *css_absolute_urls(const char *css, size_t len, const char *sheet_ur
             size_t j = i + 4;
             while (j < len && is_space(css[j])) j++;
             char quote = j < len && (css[j] == '"' || css[j] == '\'') ? css[j++] : 0;
+            if (j + 5 <= len && !strncasecmp(css + j, "data:", 5)) { /* (already whole, and maybe long: copied as it is) */
+                size_t k = i;
+                while (k < len && (quote ? !(css[k] == quote && k > j) : css[k] != ')')) k++;
+                memcpy(out + n, css + i, k - i);
+                n += k - i;
+                i = k;
+                continue;
+            }
             char rel[1024];
             int k = 0;
             while (j < len && (quote ? css[j] != quote : css[j] != ')') && k < 1023) rel[k++] = css[j++];
@@ -245,6 +284,8 @@ static char *css_absolute_urls(const char *css, size_t len, const char *sheet_ur
     return out;
 }
 
+static void sheet_cache_clear(void);
+
 static void free_page(void) {
     for (int i = 1; i < MAX_REALMS; i++) /* its frames and workers go with it */
         if (realm_list[i].used && realm_list[i].parent == realm_list[realm_now].id) realm_destroy(i);
@@ -259,6 +300,7 @@ static void free_page(void) {
     free_rules();
     generated_clear();
     bg_cache_clear();
+    sheet_cache_clear();
     scaled_forget(NULL);
     indexed_count = -1;
     page_title[0] = 0;
@@ -308,6 +350,43 @@ static int update_page_title(void) {
     return strcmp(was, page_title) != 0;
 }
 
+/* Linked style sheets as fetched (unparsed), so the sheets can be read
+   again when scripts add or change style elements. */
+static struct {
+    char *url, *text;
+    size_t len;
+} sheet_cache[16];
+static int sheet_cache_count;
+static unsigned sheets_seen; /* what the style elements were when the rules were made */
+
+static void sheet_cache_clear(void) {
+    for (int i = 0; i < sheet_cache_count; i++) {
+        free(sheet_cache[i].url);
+        free(sheet_cache[i].text);
+    }
+    sheet_cache_count = 0;
+}
+
+/* A fingerprint of the page's <style> and <link rel=stylesheet> elements
+   and their text (a script setting a style's text makes a new text node). */
+static unsigned sheets_signature(void) {
+    unsigned h = 2166136261u;
+    char rel[64], href[256];
+    for (Node *n = document; n; n = next_in_tree(n, document)) {
+        if (n->type != NODE_ELEMENT) continue;
+        if (is(n->tag, "style")) {
+            h = (h ^ (unsigned)(unsigned long long)n) * 16777619u;
+            for (Node *t = n->first; t; t = t->next)
+                h = (h ^ (unsigned)(unsigned long long)t->text ^ (unsigned)t->text_len) * 16777619u;
+        } else if (is(n->tag, "link") && attr(n, "rel", rel, sizeof(rel)) && strstr(rel, "stylesheet")) {
+            h = (h ^ (unsigned)(unsigned long long)n) * 16777619u;
+            if (attr(n, "href", href, sizeof(href)))
+                for (int i = 0; href[i]; i++) h = (h ^ (unsigned char)href[i]) * 16777619u;
+        }
+    }
+    return h;
+}
+
 static void keep_css(char *text) {
     if (css_buffer_count < 64) css_buffers[css_buffer_count++] = text;
     else free(text);
@@ -341,7 +420,9 @@ static void load_stylesheets(void) {
             media_applies(media, (int)strlen(media)) && attr(n, "href", value, sizeof(value)) && value[0]) {
             char url[1024];
             resolve_url(base_url, value, url, sizeof(url));
-            prefetch_add(sheets, url);
+            int cached = 0;
+            for (int i = 0; i < sheet_cache_count; i++) cached |= !strcmp(sheet_cache[i].url, url);
+            if (!cached) prefetch_add(sheets, url);
         }
     }
     prefetch_go(sheets);
@@ -362,8 +443,27 @@ static void load_stylesheets(void) {
             resolve_url(base_url, value, url, sizeof(url));
             Fetched f;
             fetched++;
-            int taken = prefetch_take(sheets, url, &f);
-            if (taken == 1 || (taken == 0 && fetch_url(url, NULL, &f, error) == 0)) {
+            int cached = -1;
+            for (int i = 0; i < sheet_cache_count; i++)
+                if (!strcmp(sheet_cache[i].url, url)) cached = i;
+            int taken = cached >= 0 ? 0 : prefetch_take(sheets, url, &f);
+            if (cached >= 0) { /* (read again: a copy, as parsing changes it) */
+                f.body = malloc(sheet_cache[cached].len + 1);
+                f.len = sheet_cache[cached].len;
+                if (f.body) {
+                    memcpy(f.body, sheet_cache[cached].text, f.len + 1);
+                    taken = 1;
+                }
+            } else if (taken == 1 || (taken == 0 && fetch_url(url, NULL, &f, error) == 0)) {
+                taken = 1;
+                if (sheet_cache_count < 16 && (sheet_cache[sheet_cache_count].text = malloc(f.len + 1)) != NULL) {
+                    memcpy(sheet_cache[sheet_cache_count].text, f.body, f.len);
+                    sheet_cache[sheet_cache_count].text[f.len] = 0;
+                    sheet_cache[sheet_cache_count].len = f.len;
+                    sheet_cache[sheet_cache_count++].url = copy_of(url, (int)strlen(url));
+                }
+            } else taken = 0;
+            if (taken == 1) {
                 if (f.len > 1024 * 1024) f.len = 1024 * 1024;
                 size_t abs_len;
                 char *abs = css_absolute_urls(f.body, f.len, url, &abs_len);
@@ -382,6 +482,7 @@ static void load_stylesheets(void) {
         }
     }
     prefetch_end(sheets);
+    sheets_seen = sheets_signature();
 }
 
 /* Form controls start out as their attributes say. only_new: just those
@@ -420,6 +521,13 @@ static u64 cascade_ms, layout_ms;
 static void relayout(void) {
     u64 t0 = uptime_ms();
     generated_clear(); /* (the last layout's ::before / ::after boxes) */
+    if (document && sheets_signature() != sheets_seen) { /* scripts added or changed style sheets: read them all again */
+        free_rules();
+        for (int i = 0; i < css_buffer_count; i++) free(css_buffers[i]);
+        css_buffer_count = 0;
+        indexed_count = -1;
+        load_stylesheets();
+    }
     compute_styles();
     u64 t1 = uptime_ms();
     layout_page(layout_viewport_w ? layout_viewport_w : PAGE_W);
@@ -548,6 +656,7 @@ static void load(const char *address, const char *post) {
     strncpy(realm_list[realm_now].url, current_url, sizeof(realm_list[realm_now].url) - 1);
     u64 t3 = uptime_ms();
     relayout();
+    if (load_web_fonts()) relayout(); /* (the page's own fonts, as its layout asked for them) */
     if (getenv("BROWSER_TIMING")) printf("[timing] scripts %llu ms\n", t3 - t2);
     if (getenv("BROWSER_TIMING"))
         printf("[timing] fetch %llu ms, stylesheets %llu ms, cascade %llu ms, layout %llu ms, %d rules, %d nodes, %d items\n",
@@ -931,6 +1040,15 @@ static int dump(const char *address) {
                 if (*c == ' ') *c = 0;
             printf("[box] %d %s %d %d %d %d %s %s\n", k++, n->tag, shown ? n->x : 0, shown ? n->y : 0, shown ? n->w : 0,
                    shown ? n->h : 0, id[0] ? id : "-", cls[0] ? cls : "-");
+        }
+        for (int i = 0; i < generated_count; i++) { /* (::before / ::after: not in the tree now; listed apart) */
+            Node *g = generated[i];
+            char cls[40] = "";
+            attr(g->parent, "class", cls, sizeof(cls));
+            for (char *c = cls; *c; c++)
+                if (*c == ' ') *c = 0;
+            printf("[generated] %s of .%s: %d %d %d %d, %s, %d bytes of text\n", g->tag, cls, g->x, g->y, g->w, g->h,
+                   g->style.display == D_NONE ? "not shown" : "shown", g->first ? g->first->text_len : 0);
         }
     }
     for (int i = 1; i < MAX_REALMS; i++) { /* and what the frames show */

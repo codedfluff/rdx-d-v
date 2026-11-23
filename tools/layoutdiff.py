@@ -118,7 +118,7 @@ def rdx_boxes():
                TRY_EXTRA="-smp 2 -netdev user,id=n0 -device e1000,netdev=n0")
     out = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "try.py"), "sleep 5000", "set BROWSER_BOXES=1", f"set BROWSER_WIDTH={WIDTH}", "set BROWSER_HEIGHT=800",
                           f"set BROWSER_WAIT={int(WAIT * 1000)}", f"browser --dump {RDX_URL}"],
-                         capture_output=True, text=True, env=env, cwd=ROOT).stdout
+                         capture_output=True, encoding="utf-8", errors="replace", env=env, cwd=ROOT).stdout
     boxes = []
     for line in out.splitlines():
         m = re.match(r"\[box\] \d+ (\S+) (-?\d+) (-?\d+) (-?\d+) (-?\d+) (\S+) (\S+)", line.strip())

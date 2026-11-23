@@ -139,6 +139,8 @@ typedef struct {
     Len tx, ty;
     unsigned char translated;
     const char *content;            /* ::before / ::after: the content property as written */
+    unsigned char valign;           /* vertical-align: VA_... */
+    Len valign_len;                 /* VA_LENGTH: px or % of the line height */
     short radius[8];                /* corners (top-left, top-right, bottom-right, bottom-left), across then down:
                                        px, or -percent */
     int z_index;

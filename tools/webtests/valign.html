@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html><head><title>Vertical align</title>
+<style>
+body { font-family: Arial, sans-serif; font-size: 16px; margin: 10px; }
+.ib { display: inline-block; width: 30px; height: 30px; background: #69c; }
+.mid { vertical-align: middle; } .top { vertical-align: top; } .bot { vertical-align: bottom; }
+.tt { vertical-align: text-top; } .tb { vertical-align: text-bottom; } .up { vertical-align: 6px; }
+.big { display: inline-block; width: 20px; height: 60px; background: #c96; }
+table { border-collapse: separate; border-spacing: 2px; }
+td { border: 1px solid #999; width: 80px; }
+.tall { height: 60px; }
+.rel { position: relative; top: 10px; left: 5px; color: #c00; }
+</style></head><body>
+<p>base <span class="ib"></span> mid <span class="ib mid"></span> top <span class="ib top"></span> bot <span class="ib bot"></span> <span class="big"></span></p>
+<p>tt <span class="ib tt"></span> tb <span class="ib tb"></span> up <span class="ib up"></span> H<sub>2</sub>O and x<sup>2</sup></p>
+<table><tr><td class="tall">tall cell</td><td>middle</td><td style="vertical-align:top">top</td><td style="vertical-align:bottom">bottom</td></tr></table>
+<p>Inline <span class="rel">relative</span> text</p>
+<p>VALIGN END</p>
+</body></html>

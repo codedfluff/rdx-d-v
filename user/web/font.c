@@ -20,7 +20,175 @@ typedef struct {
 } Font;
 
 #define FONT_FALLBACK (FACE_COUNT * 4) /* DejaVu Sans: symbols and letters the others lack */
-static Font font_table[FACE_COUNT * 4 + 1];
+#define WEB_FONTS 48
+#define FONT_WEB0 (FACE_COUNT * 4 + 1) /* fonts that pages bring (@font-face), after the built-in ones */
+static Font font_table[FACE_COUNT * 4 + 1 + WEB_FONTS];
+
+/* Fonts pages declare (@font-face): a face value of FACE_WEB and up names
+   one: FACE_WEB + slot * 3 + the built-in face to use until it is loaded. */
+#define FACE_WEB 16
+static int font_parse(Font *f);
+static void wf_copy(char *dst, const char *src, size_t max) { /* (at most max - 1 characters, always ended) */
+    size_t i = 0;
+    for (; src[i] && i + 1 < max; i++) dst[i] = src[i];
+    dst[i] = 0;
+}
+typedef struct {
+    char family[48];        /* lower case */
+    unsigned char bold, italic, wanted;
+    signed char state;      /* 0 not loaded, 1 ready (font_table[FONT_WEB0 + i]), -1 failed */
+    char *url;              /* (malloc'd: a data: address can be long) */
+} WebFont;
+static WebFont web_fonts[WEB_FONTS];
+static int web_font_count;
+
+static int web_font_declare(const char *family, int bold, int italic, const char *url) {
+    for (int i = 0; i < web_font_count; i++)
+        if (!strcmp(web_fonts[i].family, family) && web_fonts[i].bold == bold && web_fonts[i].italic == italic) {
+            if (strcmp(web_fonts[i].url, url) && web_fonts[i].state != 1) { /* (a page's newer choice) */
+                size_t n = strlen(url);
+                char *copy = malloc(n + 1);
+                if (copy) {
+                    memcpy(copy, url, n + 1);
+                    free(web_fonts[i].url);
+                    web_fonts[i].url = copy;
+                    web_fonts[i].state = 0;
+                }
+            }
+            return i;
+        }
+    if (web_font_count >= WEB_FONTS) return -1;
+    WebFont *w = &web_fonts[web_font_count];
+    memset(w, 0, sizeof(*w));
+    wf_copy(w->family, family, sizeof(w->family));
+    size_t n = strlen(url);
+    w->url = malloc(n + 1);
+    if (!w->url) return -1;
+    memcpy(w->url, url, n + 1);
+    w->bold = (unsigned char)bold;
+    w->italic = (unsigned char)italic;
+    return web_font_count++;
+}
+
+/* The slot standing for a family (any of its styles), or -1. */
+static int web_font_family(const char *family) {
+    for (int i = 0; i < web_font_count; i++)
+        if (!strcmp(web_fonts[i].family, family)) return i;
+    return -1;
+}
+
+/* The loaded font of a family nearest the style wanted; NULL if none is
+   loaded yet (those wanted are then noted, for the page to fetch). */
+static Font *web_font_pick(int slot, int bold, int italic) {
+    if (slot < 0 || slot >= web_font_count) return NULL;
+    const char *family = web_fonts[slot].family;
+    int best = -1, best_score = -1;
+    for (int i = 0; i < web_font_count; i++) {
+        if (strcmp(web_fonts[i].family, family)) continue;
+        int score = (web_fonts[i].bold == bold) * 2 + (web_fonts[i].italic == italic) * 3;
+        if (web_fonts[i].state == 0 && score >= 5) web_fonts[i].wanted = 1;
+        if (web_fonts[i].state == 1 && score > best_score) best = i, best_score = score;
+    }
+    if (best < 0) { /* nothing loaded: want the closest one */
+        for (int i = 0; i < web_font_count; i++)
+            if (!strcmp(web_fonts[i].family, family) && web_fonts[i].state == 0) {
+                int score = (web_fonts[i].bold == bold) * 2 + (web_fonts[i].italic == italic) * 3;
+                if (score > best_score) best = i, best_score = score;
+            }
+        if (best >= 0) web_fonts[best].wanted = 1;
+        return NULL;
+    }
+    return &font_table[FONT_WEB0 + best];
+}
+
+static unsigned wf_u32(const unsigned char *p) { return (unsigned)p[0] << 24 | (unsigned)p[1] << 16 | (unsigned)p[2] << 8 | p[3]; }
+static unsigned wf_u16(const unsigned char *p) { return (unsigned)p[0] << 8 | p[1]; }
+static void wf_put32(unsigned char *p, unsigned v) {
+    p[0] = (unsigned char)(v >> 24);
+    p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);
+    p[3] = (unsigned char)v;
+}
+
+/* WOFF (1.0): its tables, each perhaps zlib-compressed, back into a plain
+   font file (malloc'd). */
+static unsigned char *woff_to_sfnt(const unsigned char *d, size_t len, size_t *out_len) {
+    if (len < 44 || wf_u32(d) != 0x774F4646) return NULL; /* wOFF */
+    unsigned tables = wf_u16(d + 12);
+    if (!tables || tables > 200 || 44 + (size_t)tables * 20 > len) return NULL;
+    size_t total = 12 + (size_t)tables * 16;
+    for (unsigned i = 0; i < tables; i++) total += (wf_u32(d + 44 + i * 20 + 12) + 3) & ~3u;
+    if (total > (32u << 20)) return NULL;
+    unsigned char *out = malloc(total);
+    if (!out) return NULL;
+    memset(out, 0, total);
+    wf_put32(out, wf_u32(d + 4)); /* the flavour: 0x00010000 or 'OTTO' */
+    out[4] = (unsigned char)(tables >> 8);
+    out[5] = (unsigned char)tables;
+    size_t at = 12 + (size_t)tables * 16;
+    for (unsigned i = 0; i < tables; i++) {
+        const unsigned char *e = d + 44 + i * 20;
+        unsigned tag = wf_u32(e), offset = wf_u32(e + 4), comp = wf_u32(e + 8), orig = wf_u32(e + 12);
+        if ((size_t)offset + comp > len || at + orig > total) {
+            free(out);
+            return NULL;
+        }
+        if (comp < orig) {
+            unsigned char *plain = NULL;
+            size_t plain_len = 0;
+            if (zlib_decompress(d + offset, comp, &plain, &plain_len, orig) != 0 || plain_len != orig) {
+                free(plain);
+                free(out);
+                return NULL;
+            }
+            memcpy(out + at, plain, orig);
+            free(plain);
+        } else {
+            memcpy(out + at, d + offset, orig);
+        }
+        unsigned char *rec = out + 12 + i * 16;
+        wf_put32(rec, tag);
+        wf_put32(rec + 4, wf_u32(e + 16));
+        wf_put32(rec + 8, (unsigned)at);
+        wf_put32(rec + 12, orig);
+        at += (orig + 3) & ~3u;
+    }
+    *out_len = total;
+    return out;
+}
+
+/* A downloaded font file for slot i: WOFF or plain TrueType. Takes the bytes. */
+static int web_font_install(int i, unsigned char *data, size_t len) {
+    if (i < 0 || i >= web_font_count) {
+        free(data);
+        return 0;
+    }
+    WebFont *w = &web_fonts[i];
+    w->state = -1;
+    if (len >= 4 && wf_u32(data) == 0x774F4646) {
+        size_t n;
+        unsigned char *plain = woff_to_sfnt(data, len, &n);
+        free(data);
+        if (!plain) return 0;
+        data = plain;
+        len = n;
+    } else if (len < 4 || (wf_u32(data) != 0x00010000 && wf_u32(data) != 0x74727565)) { /* (not TrueType outlines: WOFF2, CFF) */
+        free(data);
+        return 0;
+    }
+    Font *f = &font_table[FONT_WEB0 + i];
+    memset(f, 0, sizeof(*f));
+    f->d = data;
+    f->len = len;
+    if (!font_parse(f)) {
+        free(data);
+        memset(f, 0, sizeof(*f));
+        return 0;
+    }
+    f->state = 1;
+    w->state = 1;
+    return 1;
+}
 static const char *const FONT_FILES[FACE_COUNT * 4 + 1] = {
     "/liberationsans-regular.ttf", "/liberationsans-bold.ttf", "/liberationsans-italic.ttf", "/liberationsans-bolditalic.ttf",
     "/liberationserif-regular.ttf", "/liberationserif-bold.ttf", "/liberationserif-italic.ttf", "/liberationserif-bolditalic.ttf",
@@ -132,6 +300,11 @@ static Font *font_load(int i) {
 
 /* The font for a face and style: loaded the first time; NULL without one. */
 static Font *font_get(int face, int bold, int italic) {
+    if (face >= FACE_WEB) { /* a page's font, or until it comes, a built-in one */
+        Font *w = web_font_pick((face - FACE_WEB) / 3, bold, italic);
+        if (w) return w;
+        face = (face - FACE_WEB) % 3;
+    }
     int i = (face < 0 || face >= FACE_COUNT ? FACE_SANS : face) * 4 + (bold ? 1 : 0) + (italic ? 2 : 0);
     Font *f = &font_table[i];
     if (!f->state) {
@@ -176,6 +349,10 @@ static const Font *font_char(const Font *f, unsigned code, unsigned *glyph, unsi
         return f;
     }
     unsigned g = ft_glyph_index(f, code);
+    if (!g && code >= 0xE000 && code <= 0xF8FF) { /* an icon font's letter, without the icon font */
+        *glyph = *advance = 0;
+        return f;
+    }
     if (!g) {
         const Font *fb = font_load(FONT_FALLBACK);
         unsigned g2 = fb && fb != f ? ft_glyph_index(fb, code) : 0;

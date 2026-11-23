@@ -357,6 +357,7 @@ static int face_for_family(const char *v, int current) {
     if (!strncasecmp(v, "inherit", 7) || !strncasecmp(v, "unset", 5)) return current;
     if (!strncasecmp(v, "initial", 7)) return FACE_SERIF;
     char name[64];
+    int web = -1; /* the first family a page brings (@font-face) */
     while (*v) {
         while (*v == ' ' || *v == ',' || *v == '"' || *v == '\'') v++;
         int n = 0;
@@ -368,10 +369,158 @@ static int face_for_family(const char *v, int current) {
         name[n] = 0;
         if (!n) continue;
         if (!strcmp(name, "!important")) break;
+        if (web < 0) {
+            int slot = web_font_family(name);
+            if (slot >= 0) {
+                web = slot;
+                continue;
+            }
+        }
         int face = face_of_family(name);
-        if (face >= 0) return face;
+        if (face >= 0) return web >= 0 ? FACE_WEB + web * 3 + face : face;
     }
-    return FACE_SANS;
+    return web >= 0 ? FACE_WEB + web * 3 + FACE_SANS : FACE_SANS;
+}
+
+/* @font-face { font-family; src; font-weight; font-style; unicode-range }
+   (a src may be a long data: address: worked on where it lies). */
+static void font_face_rule(const char *decls, int len) {
+    char family[64] = "", weight[32] = "", style[32] = "", range[256] = "";
+    const char *src = NULL;
+    int src_len = 0;
+    for (int i = 0; i < len;) {
+        while (i < len && (is_space(decls[i]) || decls[i] == ';')) i++;
+        int colon = i;
+        while (colon < len && decls[colon] != ':' && decls[colon] != ';') colon++;
+        if (colon >= len || decls[colon] != ':') break;
+        char name[32];
+        int n = 0;
+        for (int q = i; q < colon && n < 31; q++)
+            if (!is_space(decls[q])) name[n++] = (char)tolower((unsigned char)decls[q]);
+        name[n] = 0;
+        int v = colon + 1, e = v, depth = 0;
+        char quote = 0;
+        while (e < len && (quote || depth || decls[e] != ';')) {
+            char c = decls[e];
+            if (quote) {
+                if (c == quote) quote = 0;
+            } else if (c == '"' || c == '\'') quote = c;
+            else if (c == '(') depth++;
+            else if (c == ')') depth--;
+            e++;
+        }
+        while (v < e && is_space(decls[v])) v++;
+        int vl = e - v;
+        char small[256];
+        int sl = vl < 255 ? vl : 255;
+        memcpy(small, decls + v, (size_t)sl);
+        small[sl] = 0;
+        if (!strcmp(name, "font-family")) {
+            int k = 0;
+            for (int q = 0; small[q] && k < 63; q++)
+                if (small[q] != '"' && small[q] != '\'') family[k++] = (char)tolower((unsigned char)small[q]);
+            while (k && family[k - 1] == ' ') k--;
+            family[k] = 0;
+        } else if (!strcmp(name, "src")) {
+            src = decls + v;
+            src_len = vl;
+        } else if (!strcmp(name, "font-weight")) strncpy(weight, small, sizeof(weight) - 1);
+        else if (!strcmp(name, "font-style")) strncpy(style, small, sizeof(style) - 1);
+        else if (!strcmp(name, "unicode-range")) strncpy(range, small, sizeof(range) - 1);
+        i = e + 1;
+    }
+    if (!family[0] || !src) return;
+    if (range[0]) { /* split by alphabet: keep the part with the Latin letters */
+        int latin = 0;
+        for (char *r = range; *r && !latin;) {
+            while (*r && (is_space(*r) || *r == ',')) r++;
+            if (strncasecmp(r, "u+", 2)) break;
+            r += 2;
+            unsigned lo = 0, hi;
+            int wild = 0;
+            while (hex_digit(*r) >= 0 || *r == '?') {
+                lo = lo * 16 + (unsigned)(*r == '?' ? 0 : hex_digit(*r));
+                wild = wild * 16 + (*r == '?' ? 15 : 0);
+                r++;
+            }
+            hi = lo + (unsigned)wild;
+            if (*r == '-') {
+                r++;
+                hi = 0;
+                while (hex_digit(*r) >= 0) hi = hi * 16 + (unsigned)hex_digit(*r++);
+            }
+            latin = lo <= 'A' && hi >= 'z';
+        }
+        if (!latin) return;
+    }
+    /* the best of the sources: WOFF or TrueType (WOFF2 can't be read yet) */
+    const char *best = NULL;
+    int best_len = 0, best_rank = 0;
+    for (int i = 0; i + 4 <= src_len;) {
+        if (strncasecmp(src + i, "url(", 4)) {
+            i++;
+            continue;
+        }
+        int u = i + 4;
+        while (u < src_len && is_space(src[u])) u++;
+        char quote = u < src_len && (src[u] == '"' || src[u] == '\'') ? src[u++] : 0;
+        int start = u;
+        while (u < src_len && (quote ? src[u] != quote : src[u] != ')')) u++;
+        int url_len = u - start;
+        const char *url = src + start;
+        /* its format(): before the next url( */
+        int next = u;
+        while (next + 4 <= src_len && strncasecmp(src + next, "url(", 4)) next++;
+        char kind[32] = "";
+        for (int f = u; f + 7 <= next; f++)
+            if (!strncasecmp(src + f, "format(", 7)) {
+                int q = 0;
+                for (f += 7; f < next && src[f] != ')' && q < 31; f++)
+                    if (src[f] != '"' && src[f] != '\'' && !is_space(src[f])) kind[q++] = (char)tolower((unsigned char)src[f]);
+                kind[q] = 0;
+                break;
+            }
+        if (!kind[0]) {
+            if (url_len > 5 && !strncasecmp(url, "data:", 5)) {
+                int woff2 = 0, woff = 0;
+                for (int q = 5; q + 5 <= url_len && q < 60; q++) {
+                    if (!strncasecmp(url + q, "woff2", 5)) woff2 = 1;
+                    else if (!strncasecmp(url + q, "woff", 4)) woff = 1;
+                }
+                strcpy(kind, woff2 ? "woff2" : woff ? "woff" : "truetype");
+            } else { /* (by the file's name) */
+                int dot = -1, stop = url_len;
+                for (int q = 0; q < url_len; q++) {
+                    if (url[q] == '?' || url[q] == '#') {
+                        stop = q;
+                        break;
+                    }
+                    if (url[q] == '.') dot = q;
+                }
+                int q = 0;
+                for (int x = dot + 1; dot >= 0 && x < stop && q < 31; x++) kind[q++] = (char)tolower((unsigned char)url[x]);
+                kind[q] = 0;
+            }
+        }
+        int rank = !strcmp(kind, "woff") ? 3 : !strcmp(kind, "truetype") || !strcmp(kind, "ttf") ? 2
+                   : !strcmp(kind, "opentype") || !strcmp(kind, "otf") ? 1 : 0;
+        if (rank > best_rank) {
+            best_rank = rank;
+            best = url;
+            best_len = url_len;
+        }
+        i = u;
+    }
+    if (!best) return;
+    char *url = malloc((size_t)best_len + 1);
+    if (!url) return;
+    memcpy(url, best, (size_t)best_len);
+    url[best_len] = 0;
+    int used, wn = number100(weight, &used);
+    int bold = used ? wn >= 60000 : !strncasecmp(weight, "bold", 4);
+    int italic = !strncasecmp(style, "italic", 6) || !strncasecmp(style, "oblique", 7);
+    web_font_declare(family, bold, italic, url);
+    free(url);
 }
 
 static int font_size_word(const char *v) {
@@ -587,6 +736,14 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         } else if (!strcmp(name, "font-style")) {
             s->italic = word_is(v, "italic") || word_is(v, "oblique");
         } else if (!strcmp(name, "font")) {
+            if (word_is(v, "inherit") || word_is(v, "unset")) return; /* (as inherited already) */
+            if (word_is(v, "initial")) {
+                s->size = 16;
+                s->bold = s->italic = 0;
+                s->line_height = 0;
+                s->face = FACE_SERIF;
+                return;
+            }
             char parts[8][64];
             int n = split_value(v, parts, 8);
             s->line_height = 0;
@@ -867,6 +1024,19 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         }
         return;
     case 'v':
+        if (!strcmp(name, "vertical-align")) {
+            s->valign = word_is(v, "middle") ? VA_MIDDLE : word_is(v, "top") ? VA_TOP : word_is(v, "bottom") ? VA_BOTTOM
+                        : word_is(v, "text-top") ? VA_TEXT_TOP : word_is(v, "text-bottom") ? VA_TEXT_BOTTOM
+                        : word_is(v, "sub") ? VA_SUB : word_is(v, "super") ? VA_SUPER : word_is(v, "inherit") ? VA_INHERIT : VA_BASELINE;
+            if (s->valign == VA_BASELINE && !word_is(v, "baseline")) {
+                Len l = parse_len(v, font, &ok);
+                if (ok && (l.unit == 'p' || l.unit == '%') && l.value) {
+                    s->valign = VA_LENGTH;
+                    s->valign_len = l;
+                }
+            }
+            return;
+        }
         if (!strcmp(name, "visibility")) s->hidden = word_is(v, "hidden") || word_is(v, "collapse");
         return;
     case 'w':
@@ -1561,41 +1731,147 @@ static int matches_from(const Rule *r, int p, const Node *n) {
 
 /* ================================================================ stylesheets */
 
-static int media_applies(const char *q, int n) {
-    char text[256];
+/* One media feature, "(min-width: 40em)", for a screen VIEW_W x VIEW_H
+   with a mouse, light colours, motion allowed. */
+static int media_feature(const char *f) {
+    while (*f == '(' || is_space(*f)) f++;
+    char name[48];
     int k = 0;
-    for (int i = 0; i < n && k < 255; i++) text[k++] = (char)tolower((unsigned char)q[i]);
+    while (*f && *f != ':' && *f != ')' && *f != '<' && *f != '>' && *f != '=' && !is_space(*f) && k < 47) name[k++] = *f++;
+    name[k] = 0;
+    while (is_space(*f)) f++;
+    int ok;
+    if (*f == ':') {
+        f++;
+        while (is_space(*f)) f++;
+        char value[64];
+        int v = 0;
+        while (*f && *f != ')' && v < 63) value[v++] = *f++;
+        while (v && is_space(value[v - 1])) v--;
+        value[v] = 0;
+        int is_w = !strcmp(name, "width") || !strcmp(name, "min-width") || !strcmp(name, "max-width") ||
+                   !strcmp(name, "device-width") || !strcmp(name, "min-device-width") || !strcmp(name, "max-device-width");
+        int is_h = !strcmp(name, "height") || !strcmp(name, "min-height") || !strcmp(name, "max-height");
+        if (is_w || is_h) {
+            Len l = parse_len(value, 16, &ok);
+            if (!ok || l.unit != 'p') return 1;
+            int have = is_w ? VIEW_W : VIEW_H;
+            if (!strncmp(name, "min-", 4)) return have >= l.value;
+            if (!strncmp(name, "max-", 4)) return have <= l.value;
+            return have == l.value;
+        }
+        if (!strcmp(name, "prefers-color-scheme")) return !strcmp(value, "light");
+        if (!strcmp(name, "prefers-reduced-motion")) return strcmp(value, "reduce") != 0;
+        if (!strcmp(name, "prefers-contrast")) return !strcmp(value, "no-preference");
+        if (!strcmp(name, "orientation")) return !strcmp(value, VIEW_W >= VIEW_H ? "landscape" : "portrait");
+        if (!strcmp(name, "hover") || !strcmp(name, "any-hover")) return !strcmp(value, "hover");
+        if (!strcmp(name, "pointer") || !strcmp(name, "any-pointer")) return !strcmp(value, "fine");
+        if (!strcmp(name, "min-resolution") || !strcmp(name, "min-device-pixel-ratio") || !strcmp(name, "-webkit-min-device-pixel-ratio")) {
+            int used, n = number100(value, &used);
+            return used && (strstr(value, "dpi") ? n <= 9600 : n <= 100); /* (one pixel per pixel) */
+        }
+        if (!strcmp(name, "max-resolution") || !strcmp(name, "max-device-pixel-ratio") || !strcmp(name, "-webkit-max-device-pixel-ratio")) {
+            int used, n = number100(value, &used);
+            return used && (strstr(value, "dpi") ? n >= 9600 : n >= 100);
+        }
+        if (!strcmp(name, "display-mode")) return !strcmp(value, "browser");
+        if (!strcmp(name, "scripting")) return !strcmp(value, "enabled");
+        if (!strcmp(name, "update")) return !strcmp(value, "fast");
+        if (!strcmp(name, "forced-colors") || !strcmp(name, "inverted-colors")) return !strcmp(value, "none");
+        if (!strcmp(name, "min-aspect-ratio") || !strcmp(name, "max-aspect-ratio") || !strcmp(name, "aspect-ratio")) {
+            int used, a = number100(value, &used), bb = 100;
+            const char *slash = strchr(value, '/');
+            if (slash) bb = number100(slash + 1, &used);
+            if (!a || !bb) return 1;
+            long long have = (long long)VIEW_W * bb, want = (long long)VIEW_H * a;
+            return name[1] == 'i' ? have >= want : name[1] == 'a' ? have <= want : have == want;
+        }
+        return 0; /* (a feature not known: it does not hold, as in browsers) */
+    }
+    if (*f == ')' || !*f) { /* (color), (hover), (grid): only those a screen with a mouse has */
+        static const char *const have[] = {"color", "hover", "any-hover", "pointer", "any-pointer", "grid", "width", "height",
+                                           "orientation", "aspect-ratio", "resolution", "prefers-reduced-motion", "update",
+                                           "display-mode", "scripting", NULL};
+        for (int i = 0; have[i]; i++)
+            if (!strcmp(name, have[i])) return strcmp(name, "prefers-reduced-motion") != 0;
+        return 0;
+    }
+    /* ranges: (width < 600px), (width >= 1024px), (400px <= width <= 700px) */
+    const char *q = f;
+    char op[3] = "";
+    int o = 0;
+    while ((*q == '<' || *q == '>' || *q == '=') && o < 2) op[o++] = *q++;
+    op[o] = 0;
+    while (is_space(*q)) q++;
+    Len l = parse_len(q, 16, &ok);
+    int have = strstr(name, "height") ? VIEW_H : VIEW_W;
+    if (!ok || l.unit != 'p') return 1;
+    if (!strcmp(op, "<")) return have < l.value;
+    if (!strcmp(op, "<=")) return have <= l.value;
+    if (!strcmp(op, ">")) return have > l.value;
+    if (!strcmp(op, ">=")) return have >= l.value;
+    if (!strcmp(op, "=")) return have == l.value;
+    return 1;
+}
+
+/* One media query: [not|only] [type] [and (feature)]... */
+static int media_query(const char *q) {
+    while (is_space(*q)) q++;
+    int negate = 0;
+    if (!strncmp(q, "not ", 4)) {
+        negate = 1;
+        q += 4;
+    } else if (!strncmp(q, "only ", 5)) q += 5;
+    while (is_space(*q)) q++;
+    int result = 1;
+    if (*q && *q != '(') { /* the media type */
+        char type[24];
+        int k = 0;
+        while (*q && !is_space(*q) && *q != '(' && k < 23) type[k++] = *q++;
+        type[k] = 0;
+        result = !strcmp(type, "all") || !strcmp(type, "screen");
+    }
+    /* features joined by "and" ("or" between them: any) */
+    int any_or = strstr(q, " or ") != NULL, or_result = 0;
+    for (const char *f = q; (f = strchr(f, '(')) != NULL;) {
+        if (f[1] == '(') { /* ((a) and (b)): take the inner ones as they come */
+            f++;
+            continue;
+        }
+        int r = media_feature(f);
+        if (any_or) or_result |= r;
+        else result = result && r;
+        const char *close = strchr(f, ')');
+        if (!close) break;
+        f = close + 1;
+    }
+    if (any_or) result = result && or_result;
+    return negate ? !result : result;
+}
+
+/* A media query list (a <link media> or @media): does any query hold? */
+static int media_applies(const char *q, int n) {
+    char text[512];
+    int k = 0;
+    for (int i = 0; i < n && k < 511; i++) text[k++] = (char)tolower((unsigned char)q[i]);
     text[k] = 0;
-    if (strstr(text, "print") && !strstr(text, "screen")) return 0;
-    if (strstr(text, "speech")) return 0;
-    if (strstr(text, "prefers-color-scheme") && strstr(text, "dark")) return 0;
-    if (strstr(text, "prefers-reduced-motion") && strstr(text, "reduce")) return 0;
-    if (strstr(text, "orientation") && strstr(text, "portrait")) return 0;
-    if (strstr(text, "hover: none") || strstr(text, "pointer: coarse") || strstr(text, "hover:none") || strstr(text, "pointer:coarse"))
-        return 0; /* (we have a mouse) */
-    if (!strncmp(text, "not ", 4) || strstr(text, " not ")) return 0;
-    /* Width conditions, each checked against our page width. */
-    for (const char *w = text; (w = strstr(w, "width")) != NULL; w += 5) {
-        const char *colon = w + 5;
-        while (*colon == ' ') colon++;
-        int is_max = w >= text + 4 && !strncmp(w - 4, "max-", 4);
-        int is_min = w >= text + 4 && !strncmp(w - 4, "min-", 4);
-        int ok;
-        if (*colon == ':') {
-            Len l = parse_len(colon + 1, 16, &ok);
-            if (!ok || l.unit != 'p') continue;
-            if (is_max && VIEW_W > l.value) return 0;
-            if (is_min && VIEW_W < l.value) return 0;
-        } else if (*colon == '<' || *colon == '>') { /* (width < 600px), (width >= 1024px) */
-            int less = *colon == '<';
-            colon++;
-            if (*colon == '=') colon++;
-            Len l = parse_len(colon, 16, &ok);
-            if (!ok || l.unit != 'p') continue;
-            if (less ? VIEW_W >= l.value : VIEW_W < l.value) return 0;
+    int start = 0, depth = 0, any = 0, saw = 0;
+    for (int i = 0; i <= k; i++) {
+        char c = i < k ? text[i] : ',';
+        if (c == '(') depth++;
+        else if (c == ')') depth--;
+        if (c == ',' && depth <= 0) {
+            text[i] = 0;
+            const char *one = text + start;
+            while (is_space(*one)) one++;
+            if (*one) {
+                saw = 1;
+                any |= media_query(one);
+            }
+            start = i + 1;
         }
     }
-    return 1;
+    return saw ? any : 1;
 }
 
 static int block_end(const char *css, int len, int open) {
@@ -1640,6 +1916,11 @@ static void parse_css(char *css, int len, int origin) {
                 continue;
             }
             int end = block_end(css, len, j);
+            if (!strncasecmp(css + i, "@font-face", 10)) {
+                font_face_rule(css + j + 1, end - j - 1);
+                i = end + 1;
+                continue;
+            }
             int media = !strncasecmp(css + i, "@media", 6);
             if ((media && media_applies(css + i + 6, j - i - 6)) || !strncasecmp(css + i, "@supports", 9) ||
                 !strncasecmp(css + i, "@layer", 6) || !strncasecmp(css + i, "@container", 10)) {
@@ -1698,7 +1979,8 @@ static const char DEFAULT_CSS[] =
     "a{color:#0000ee;text-decoration:underline;cursor:pointer}"
     "center{text-align:center}"
     "table{text-align:left}" /* centring around a table centres the table, not its text */
-    "small,sub,sup{font-size:smaller}big{font-size:larger}"
+    "small,sub,sup{font-size:smaller}big{font-size:larger}sub{vertical-align:sub}sup{vertical-align:super}"
+    "thead,tbody,tfoot,tr{vertical-align:middle}td,th{vertical-align:inherit}"
     "mark{background-color:#ffef8a}"
     "hr{border:1px solid #c5cad6;margin:8px 0}"
     "fieldset{border:2px solid #c0c0c0;margin:0 2px;padding:6px 10px}"
@@ -1966,6 +2248,11 @@ static void compute_style(Node *e) {
     if (has_inline) apply_all(s, &b, inline_style, 1, p->size);
     svg_collecting = 0;
     s->alpha = (unsigned char)(p->alpha * s->opacity / 255);
+    if (s->display == D_INLINE && is(e->tag, "button")) s->display = D_INLINE_BLOCK;
+    if (s->valign == VA_INHERIT) {
+        s->valign = p->valign;
+        s->valign_len = p->valign_len;
+    }
     if (e->parent && e->parent->type == NODE_ELEMENT) { /* children of flex and grid boxes are blocks (CSS: "blockified") */
         int pd = e->parent->style.display;
         if (pd == D_FLEX || pd == D_INLINE_FLEX || pd == D_GRID || pd == D_INLINE_GRID) {
@@ -2099,7 +2386,6 @@ static void generated_text(Node *g) {
                         unsigned code = 0;
                         for (int k = 0; k < 6 && hex_digit(*p) >= 0; k++) code = code * 16 + (unsigned)hex_digit(*p++);
                         if (*p == ' ') p++;
-                        if (code >= 0xE000 && code <= 0xF8FF) continue; /* (an icon font's private letter: no font for it) */
                         if (code == 0xA) code = '\n';
                         n += utf8_for(code, text + n);
                         continue;

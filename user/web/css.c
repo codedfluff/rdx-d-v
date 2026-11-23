@@ -9,6 +9,7 @@ enum { A_LEFT, A_CENTER, A_RIGHT };
 enum { J_START, J_CENTER, J_END, J_BETWEEN, J_AROUND, J_EVENLY };
 enum { AL_STRETCH, AL_START, AL_CENTER, AL_END, AL_AUTO = 255 };
 #define GRID_SPAN 1000
+enum { VA_BASELINE, VA_MIDDLE, VA_TOP, VA_BOTTOM, VA_TEXT_TOP, VA_TEXT_BOTTOM, VA_SUB, VA_SUPER, VA_LENGTH, VA_INHERIT };
 #define AUTO (-30000)
 static int layout_viewport_w, layout_viewport_h; /* a frame's size (0 in the window: the usual) */
 #define VIEW_W (layout_viewport_w ? layout_viewport_w : 800) /* the page width, for vw units and @media */

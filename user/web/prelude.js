@@ -529,6 +529,32 @@
     }
   }
 
+  // ---- SVG geometry objects (feature tests look for these)
+  if (typeof SVGElement === "function") {
+    var svgProto = SVGElement.prototype;
+    var matrix = function () {
+      return { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0,
+        multiply: function () { return matrix(); }, inverse: function () { return matrix(); },
+        translate: function (x, y) { var m = matrix(); m.e = x || 0; m.f = y || 0; return m; },
+        scale: function () { return matrix(); }, rotate: function () { return matrix(); } };
+    };
+    var point = function () {
+      return { x: 0, y: 0, matrixTransform: function (m) { return { x: this.x * m.a + this.y * m.c + m.e, y: this.x * m.b + this.y * m.d + m.f }; } };
+    };
+    svgProto.createSVGRect = function () { return { x: 0, y: 0, width: 0, height: 0 }; };
+    svgProto.createSVGPoint = point;
+    svgProto.createSVGMatrix = matrix;
+    svgProto.createSVGNumber = function () { return { value: 0 }; };
+    svgProto.createSVGLength = function () { return { value: 0, unitType: 1 }; };
+    svgProto.getScreenCTM = function () { var r = this.getBoundingClientRect(), m = matrix(); m.e = r.left; m.f = r.top; return m; };
+    svgProto.getCTM = function () { return matrix(); };
+    svgProto.getBBox = function () { var r = this.getBoundingClientRect(); return { x: 0, y: 0, width: r.width, height: r.height }; };
+    svgProto.getTotalLength = function () { return 0; };
+    svgProto.getPointAtLength = function () { return point(); };
+    if (!("ownerSVGElement" in svgProto))
+      Object.defineProperty(svgProto, "ownerSVGElement", { get: function () { var p = this.parentNode; while (p && p.nodeName && p.nodeName.toLowerCase() !== "svg") p = p.parentNode; return p && p.nodeName ? p : null; }, configurable: true });
+  }
+
   // ---- node type numbers
   if (typeof Node === "function") {
     var types = { ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, ENTITY_REFERENCE_NODE: 5, ENTITY_NODE: 6,

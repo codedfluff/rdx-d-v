@@ -263,6 +263,7 @@ static void replaced_size(Node *n, int cw, int *bw, int *bh) {
     Style *s = &n->style;
     int fw = frame_h(n, cw), fv = frame_v(n, cw);
     int w = resolve(s->width, cw, -1), h = resolve(s->height, 0, -1);
+    if (cw <= 0 && (s->width.unit == '%' || s->width.unit == 'c')) w = -1; /* (measured without a container) */
     if (s->height.unit == '%' || s->height.unit == 'c') {
         int base = height_base(n);
         h = base >= 0 ? resolve(s->height, base, -1) : -1;
@@ -278,7 +279,7 @@ static void replaced_size(Node *n, int cw, int *bw, int *bh) {
     } else if (h < 0) {
         h = nw ? (int)((long long)nh * w / nw) : nh;
     }
-    int maxw = resolve(s->max_width, cw, -1);
+    int maxw = cw <= 0 && s->max_width.unit != 'p' ? -1 : resolve(s->max_width, cw, -1);
     if (maxw >= 0 && s->box_sizing) maxw -= fw;
     if (maxw >= 0 && w > maxw) {
         if (w) h = (int)((long long)h * maxw / w);
@@ -379,9 +380,13 @@ static void intrinsic(Node *n, int *mn, int *mx) {
                 *mn += row && s->flex_wrap ? 0 : cmn;
                 if (row && s->flex_wrap && cmn > *mn) *mn = cmn;
                 items++;
+            } else if (c->type == NODE_ELEMENT && c->style.floating && !column) { /* (floats sit beside the line's content) */
+                run_mx += cmx + margin(c, 1, 0) + margin(c, 3, 0);
+                if (cmn + margin(c, 1, 0) + margin(c, 3, 0) > run_mn) run_mn = cmn + margin(c, 1, 0) + margin(c, 3, 0);
             } else if (is_inline_level(c) && !column) {
-                run_mx += cmx + (c->type == NODE_TEXT && run_mx && c->text_len && is_space(c->text[0]) ? space_w(&c->style) : 0);
-                if (cmn > run_mn) run_mn = cmn;
+                int sides = c->type == NODE_ELEMENT && !is_replaced(c) ? margin(c, 1, 0) + margin(c, 3, 0) : 0; /* (replaced: included) */
+                run_mx += cmx + sides + (c->type == NODE_TEXT && run_mx && c->text_len && is_space(c->text[0]) ? space_w(&c->style) : 0);
+                if (cmn + sides > run_mn) run_mn = cmn + sides;
             } else {
                 if (run_mx > *mx) *mx = run_mx;
                 run_mx = 0;
@@ -629,6 +634,69 @@ static void inline_bg(Node *e, int x0, int x1, int baseline) {
     items[it].node = e;
 }
 
+/* How far above the line's baseline an atom's top is, as vertical-align
+   says (ps: the block's style, for its font). *special: 1 for top, 2 for
+   bottom (placed once the line's height is known). */
+static int atom_up(const Atom *a, const Style *ps, int *special) {
+    *special = 0;
+    if (a->kind != AT_WORD && a->kind != AT_BOX) return a->asc;
+    const Style *s = &a->node->style;
+    int pa, pd, pg;
+    switch (s->valign) {
+    case VA_TOP: *special = 1; return 0;
+    case VA_BOTTOM: *special = 2; return 0;
+    case VA_MIDDLE: return (a->h + ps->size / 2 + 1) / 2; /* (its middle at half an x-height up) */
+    case VA_TEXT_TOP:
+        font_metrics(FONT_OF(ps), &pa, &pd, &pg);
+        return pa;
+    case VA_TEXT_BOTTOM:
+        font_metrics(FONT_OF(ps), &pa, &pd, &pg);
+        return a->h - pd;
+    case VA_SUB: return a->asc - (ps->size / 5 + 1);
+    case VA_SUPER: return a->asc + ps->size / 3 + 1;
+    case VA_LENGTH: return a->asc + resolve(s->valign_len, line_metrics(s, NULL), 0);
+    default: return a->asc;
+    }
+}
+
+/* Relative positioning of the inline elements a word is inside. */
+static void inline_offsets(Node *n, int *dx, int *dy) {
+    *dx = *dy = 0;
+    for (Node *e = n->type == NODE_TEXT ? n->parent : n; e && e->type == NODE_ELEMENT && e->style.display == D_INLINE; e = e->parent) {
+        if (e->style.position != P_RELATIVE) continue;
+        int x = resolve(e->style.offset[3], 0, AUTO), y = resolve(e->style.offset[0], 0, AUTO);
+        if (x == AUTO) x = resolve(e->style.offset[1], 0, AUTO) == AUTO ? 0 : -resolve(e->style.offset[1], 0, 0);
+        if (y == AUTO) y = resolve(e->style.offset[2], 0, AUTO) == AUTO ? 0 : -resolve(e->style.offset[2], 0, 0);
+        *dx += x;
+        *dy += y;
+    }
+}
+
+/* Where a float `w` wide (margins included) goes, at or below y: the first
+   place it fits beside the floats already there, and never above an
+   earlier float. Sets *x to its left edge; returns its top. */
+static int float_place(int left, int right, int y, int w, int side, int *x) {
+    for (int i = 0; i < floats_count_now; i++)
+        if (floats_now[i].y > y) y = floats_now[i].y;
+    for (int tries = 0; tries < 64; tries++) {
+        int fl, fr;
+        line_edges(left, right, y, 1, &fl, &fr);
+        int next = 0x7FFFFFFF;
+        if (fr - fl < w) /* no room here: try below the first float that ends */
+            for (int i = 0; i < floats_count_now; i++) {
+                Float *f = &floats_now[i];
+                if (f->y <= y && f->y + f->h > y && f->y + f->h < next) next = f->y + f->h;
+            }
+        if (fr - fl >= w || next == 0x7FFFFFFF) {
+            *x = side == 1 ? fl : fr - w;
+            return y;
+        }
+        y = next;
+    }
+    *x = side == 1 ? left : right - w;
+    return y;
+}
+
 /* Paint the words of one line: produce items. */
 static void emit_word(Atom *a, int x, int baseline) {
     Node *t = a->node;
@@ -705,6 +773,7 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
         /* Skip spaces at the start of a line. */
         int line_start = i;
         int above, lh = line_metrics(ps, &above), below = lh - above; /* (the strut) */
+        int edge_h = 0; /* the tallest box aligned to the line's top or bottom */
         int l, r;
         line_edges(left, right, y, lh, &l, &r);
         int width = 0, j = i, in_flow = 0;
@@ -725,11 +794,20 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
             if (!fits && j > line_start && may_wrap) break;
             width += space + a->w;
             if (a->kind != AT_SPACE) {
-                if (a->asc > above) above = a->asc;
-                if (a->h - a->asc > below) below = a->h - a->asc;
+                int special, up = atom_up(a, ps, &special);
+                if (special) {
+                    if (a->h > edge_h) edge_h = a->h;
+                } else {
+                    if (up > above) above = up;
+                    if (a->h - up > below) below = a->h - up;
+                }
             }
         }
         lh = above + below;
+        if (edge_h > lh) { /* (a box at the top or bottom taller than the rest) */
+            below += edge_h - lh;
+            lh = edge_h;
+        }
         if (j == line_start) j++; /* always make progress */
         /* Floats met in this line: placed at the line's top. */
         for (int k = line_start; k < j; k++) {
@@ -742,14 +820,12 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
                 continue;
             }
             if (!f->style.floating) continue;
-            int fw = used_width(f, cw, 1);
-            int fl, fr;
-            line_edges(left, right, y, 1, &fl, &fr);
-            int fx = f->style.floating == 1 ? fl + margin(f, 3, cw) : fr - fw - margin(f, 1, cw);
-            layout_box(f, fx, y + margin(f, 0, cw), fw);
+            int fw = used_width(f, cw, 1), ow = fw + margin(f, 1, cw) + margin(f, 3, cw), ox;
+            int fy = float_place(left, right, y, ow, f->style.floating, &ox);
+            int fx = ox + margin(f, 3, cw);
+            layout_box(f, fx, fy + margin(f, 0, cw), fw);
             if (floats_count_now < 64) {
-                floats_now[floats_count_now++] =
-                    (Float){fx - margin(f, 3, cw), y, fw + margin(f, 1, cw) + margin(f, 3, cw), f->h + margin(f, 0, cw) + margin(f, 2, cw), f->style.floating};
+                floats_now[floats_count_now++] = (Float){ox, fy, ow, f->h + margin(f, 0, cw) + margin(f, 2, cw), f->style.floating};
             }
             line_edges(left, right, y, lh, &l, &r);
         }
@@ -778,15 +854,19 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
                 items[item_count - 1].link >= 0 && items[item_count - 1].link == link_of(a->node))
                 items[item_count - 1].w += space;
             x += space;
+            int special, up = a->kind == AT_WORD || a->kind == AT_BOX ? atom_up(a, ps, &special) : (special = 0, a->asc);
+            int atom_top = special == 1 ? y : special == 2 ? y + lh - a->h : baseline - up;
+            int odx = 0, ody = 0;
+            if (a->kind == AT_WORD || a->kind == AT_SPACE) inline_offsets(a->node, &odx, &ody);
             if (a->kind == AT_WORD) {
-                emit_word(a, x, baseline);
+                emit_word(a, x + odx, atom_top + a->asc + ody);
             } else if (a->kind == AT_SPACE && a->node->type == NODE_ELEMENT && a->node->style.has_background && !a->node->style.hidden) {
                 int m = a->start == 1 ? margin(a->node, 3, 0) : margin(a->node, 1, 0); /* (its padding, not its margin) */
-                if (a->start == 1) inline_bg(a->node, x + m, x + a->w, baseline);
-                else inline_bg(a->node, x, x + a->w - m, baseline);
+                if (a->start == 1) inline_bg(a->node, x + m + odx, x + a->w + odx, baseline + ody);
+                else inline_bg(a->node, x + odx, x + a->w - m + odx, baseline + ody);
             } else if (a->kind == AT_BOX) {
                 Node *b = a->node;
-                shift_subtree(b, x + b->m[3] - b->x, baseline - a->asc + b->m[0] - b->y);
+                shift_subtree(b, x + b->m[3] - b->x, atom_top + b->m[0] - b->y);
             }
             x += a->w;
         }
@@ -981,15 +1061,12 @@ static int layout_flow(Node *n, int left, int top, int width) {
             continue;
         }
         if (c->style.floating) {
-            int fw = used_width(c, width, 1);
-            int fl, fr;
-            line_edges(left, right, y + prev_margin, 1, &fl, &fr);
-            int fy = y + prev_margin;
-            int fx = c->style.floating == 1 ? fl + margin(c, 3, width) : fr - fw - margin(c, 1, width);
+            int fw = used_width(c, width, 1), ow = fw + margin(c, 1, width) + margin(c, 3, width), ox;
+            int fy = float_place(left, right, y + (prev_margin > 0 ? prev_margin : 0), ow, c->style.floating, &ox);
+            int fx = ox + margin(c, 3, width);
             layout_box(c, fx, fy + margin(c, 0, width), fw);
             if (floats_count_now < 64) {
-                floats_now[floats_count_now++] = (Float){fx - margin(c, 3, width), fy, fw + margin(c, 1, width) + margin(c, 3, width),
-                                                         c->h + margin(c, 0, width) + margin(c, 2, width), c->style.floating};
+                floats_now[floats_count_now++] = (Float){ox, fy, ow, c->h + margin(c, 0, width) + margin(c, 2, width), c->style.floating};
             }
             continue;
         }
@@ -2151,7 +2228,25 @@ static int layout_table(Node *table, int left, int top, int width) {
         }
         int min_row = resolve(row->style.height, 0, 0);
         if (min_row > row_h) row_h = min_row;
-        for (int k = 0; k < cell_count; k++) stretch_to(cells[k], row_h);
+        for (int k = 0; k < cell_count; k++) {
+            Node *c = cells[k];
+            int spare = row_h - c->h, va = c->style.valign;
+            int dy = va == VA_BOTTOM ? spare : va == VA_TOP || va == VA_BASELINE || va == VA_TEXT_TOP ? 0 : spare / 2;
+            if (dy > 0) { /* its content moves down; its own box stays */
+                int border_item = c->bg_item >= 0 && c->bg_item + 1 < item_count && items[c->bg_item + 1].kind == IT_BORDER &&
+                                  items[c->bg_item + 1].node == c ? c->bg_item + 1 : -1;
+                for (int i = c->items_from; i < c->items_to; i++) {
+                    if (i == c->bg_item || i == border_item || (items[i].kind == IT_BORDER && items[i].node == c)) continue;
+                    items[i].y += dy;
+                    if (items[i].clipped) {
+                        items[i].clip[1] += dy;
+                        items[i].clip[3] += dy;
+                    }
+                }
+                for (Node *d = c->first; d; d = next_in_tree(d, c)) d->y += dy;
+            }
+            stretch_to(c, row_h);
+        }
         row->x = left;
         row->y = y;
         row->w = width;

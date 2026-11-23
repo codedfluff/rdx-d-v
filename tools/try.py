@@ -5,6 +5,8 @@ Usage: python tools/try.py "c-comp sample.c" "sample 5"
 Uses a scratch disk (build/try-disk.img), never your build/disk.img.
 """
 import os
+import sys as _sys
+_sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # (pages may print any character)
 import re
 import shutil
 import socket
