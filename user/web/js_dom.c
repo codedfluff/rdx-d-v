@@ -892,9 +892,15 @@ static void make_rect(JsObj *r, double x, double y, double w, double h) {
     prop_set_raw(r, intern_c("bottom"), v_num(y + h), 0);
 }
 
+static void coro_on_main_stack(void (*fn)(void *), void *arg); /* (js_coro.c) */
+static void relayout_thunk(void *unused) {
+    (void)unused;
+    relayout();
+}
+
 static void ensure_layout(void) {
     if (dom_dirty) {
-        relayout();
+        coro_on_main_stack(relayout_thunk, NULL); /* (layout recurses deeply: never on a coroutine's stack) */
         dom_dirty = 0;
     }
 }
@@ -3515,6 +3521,11 @@ static void gc_value(Value v) {
     else if (v.t == V_OBJ) gc_push(&v.u.o->gc);
 }
 
+static void coro_free(void *p); /* (js_coro.c) */
+static void coro_gc_mark(void *p);
+static int coro_any(void);
+static int gc_index_fresh; /* gc_index lists the heap as it is now (set while collecting) */
+
 static void gc_children(Gc *g) {
     if (g->kind == K_OBJ) {
         JsObj *o = (JsObj *)g;
@@ -3531,6 +3542,7 @@ static void gc_children(Gc *g) {
         if (o->home) gc_push(&o->home->gc);
         if (o->cls != CL_BUFFER) /* (a buffer's list of views is weak) */
             for (int i = 0; i < o->nbound; i++) gc_value(o->bound[i]);
+        if (o->cls == CL_GENERATOR && o->extra) coro_gc_mark(o->extra); /* (its stack too; magic 2: an await's hold on it) */
         if ((o->cls == CL_MAP || o->cls == CL_SET) && o->extra) {
             Value *e = o->extra;
             for (int i = 0; i < 2 * o->extra_len; i++) gc_value(e[i]);
@@ -3552,6 +3564,7 @@ static void gc_free(Gc *g) {
         free(o->bound);
         if (o->cls == CL_REGEXP) regex_free(o->extra);
         else if (o->cls == CL_MAP || o->cls == CL_SET || o->cls == CL_BUFFER) free(o->extra);
+        else if (o->cls == CL_GENERATOR && o->magic != 2) coro_free(o->extra); /* (magic 2: an await's holder, not the owner) */
         if (o->node && o->cls == CL_NODE && o->node->js == o) o->node->js = NULL;
     } else if (g->kind == K_ENV) {
         Env *e = (Env *)g;
@@ -3569,6 +3582,11 @@ static void mark_nodes(Node *root) {
 }
 
 /* Mark from the roots: the global scope, prototypes, timers, the page's nodes. */
+static void coro_gc_roots(int scan_stacks); /* (js_coro.c) */
+static void gc_scan_range(const char *lo, const char *hi);
+static int gc_build_index(void);
+static char *js_stack_top;
+
 static void gc_mark_roots(void) {
     gc_top = 0;
     gc_overflow = 0;
@@ -3579,7 +3597,8 @@ static void gc_mark_roots(void) {
                       RangeErrorProto, SyntaxErrorProto, ReferenceErrorProto, DateProto, RegExpProto, MapProto, SetProto,
                       PromiseProto, NodeProto, EventProto, DocumentProto, StyleProto, ClassListProto, DatasetProto, StorageProto,
                       XhrProto, microtasks, location_obj, local_storage, session_storage, SearchParamsProto, UrlProto,
-                      TypedArrayProto, IteratorProto, SymbolProto, ArrayBufferProto, BigIntProto, DataViewProto, TextEncoderProto, TextDecoderProto};
+                      TypedArrayProto, IteratorProto, SymbolProto, ArrayBufferProto, BigIntProto, DataViewProto, TextEncoderProto, TextDecoderProto,
+                      GeneratorProto, AsyncGeneratorProto};
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
         if (roots[i]) gc_push(&roots[i]->gc);
     }
@@ -3630,12 +3649,17 @@ static void gc_finish(void) {
     }
     heap_live = live;
     heap_since_gc = 0;
+    gc_index_fresh = 0;
 }
 
 /* Collect garbage. Only call when no script is running. */
 static void js_gc(void) {
     if (!global_obj) return;
+    /* stopped generators and async functions hold values on their stacks:
+       scanning them needs the index (no index, no collecting) */
+    if (coro_any() && !gc_build_index()) return;
     gc_mark_roots();
+    coro_gc_roots(1);
     gc_finish();
 }
 
@@ -3644,7 +3668,7 @@ static void js_gc(void) {
    any word there that points into a heap block keeps that block alive
    (conservatively). */
 
-static char *js_stack_top;   /* the top of the stack (set by main) */
+/* (js_stack_top: the top of the main stack, set by main) */
 static int gc_running;
 static Gc **gc_index;        /* every heap block, by address */
 static int gc_index_n, gc_index_cap;
@@ -3681,6 +3705,7 @@ static int gc_build_index(void) {
         gc_sift(gc_index, end, 0);
     }
     gc_index_n = n;
+    gc_index_fresh = 1;
     return 1;
 }
 
@@ -3702,6 +3727,8 @@ static void gc_scan_range(const char *lo, const char *hi) {
     }
 }
 
+static char *current_coro_top(void); /* (js_coro.c) */
+
 __attribute__((noinline)) static void js_gc_during(void) {
     if (gc_running || !js_stack_top || !global_obj) {
         heap_since_gc = 0; /* (not now; ask again after more allocation) */
@@ -3720,7 +3747,8 @@ __attribute__((noinline)) static void js_gc_during(void) {
                      : "memory");
     if (gc_build_index()) {
         gc_mark_roots();
-        gc_scan_range((const char *)regs, js_stack_top);
+        gc_scan_range((const char *)regs, current_coro_top()); /* the stack this runs on */
+        coro_gc_roots(1);
         for (int i = 0; i < gc_extra_n; i++) gc_scan_range(gc_extra_lo[i], gc_extra_hi[i]);
         gc_finish();
         if (getenv("BROWSER_TIMING")) printf("[gc] while a script runs: %d blocks alive\n", (int)heap_live);
@@ -3958,7 +3986,6 @@ static void js_page_start(void) {
     define_method(w, "setInterval", set_timer, 2, 1);
     define_method(w, "requestAnimationFrame", set_timer, 1, 2);
     define_method(w, "setImmediate", set_timer, 1, 0);
-    define_method(w, "requestIdleCallback", set_timer, 1, 0);
     define_method(w, "clearTimeout", clear_timer, 1, 0);
     define_method(w, "clearInterval", clear_timer, 1, 0);
     define_method(w, "cancelAnimationFrame", clear_timer, 1, 0);
@@ -4159,7 +4186,8 @@ static int js_dispatch(Node *target, JsObj *event) {
     if (!js_enabled || !global_obj) return 0;
     char here;
     js_set_stack_base(&here);
-    js_start_run(1000);
+    JsRun run;
+    js_run_begin(&run, 1000);
     int r = dispatch_event(target ? wrap(target) : global_obj, event);
     if (r < 0) {
         describe_exception(js_last_error, sizeof(js_last_error));
@@ -4168,6 +4196,7 @@ static int js_dispatch(Node *target, JsObj *event) {
         js_abort = 0;
         r = 0;
     }
+    js_run_end(&run);
     run_microtasks();
     return r;
 }

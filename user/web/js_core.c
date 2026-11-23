@@ -6,8 +6,8 @@
    functions, classes, let/const, destructuring, spread, template strings,
    exceptions, regular expressions, JSON, promises and timers, and the DOM.
    BigInt is in js_bigint.c.
-   Not supported: generators, real async/await (await only unwraps promises
-   that have already settled), modules, Proxy.
+   Generators and async functions run on stacks of their own (js_coro.c).
+   Not supported: modules, Proxy.
 
    Memory is collected by mark and sweep: between events from the roots
    alone, and while a script runs (when it allocates a lot) also from
@@ -313,7 +313,8 @@ static JsStr *buf_done(Buf *b) {
 
 enum {
     CL_OBJECT, CL_ARRAY, CL_FUNCTION, CL_ERROR, CL_BOOLEAN, CL_NUMBER, CL_STRING, CL_DATE, CL_REGEXP,
-    CL_ARGUMENTS, CL_MAP, CL_SET, CL_PROMISE, CL_BUFFER, CL_NODE, CL_STYLE, CL_CLASSLIST, CL_DATASET, CL_EVENT, CL_STORAGE
+    CL_ARGUMENTS, CL_MAP, CL_SET, CL_PROMISE, CL_BUFFER, CL_NODE, CL_STYLE, CL_CLASSLIST, CL_DATASET, CL_EVENT, CL_STORAGE,
+    CL_GENERATOR /* a generator (extra: its coroutine) */
 };
 
 enum { P_HIDDEN = 1, P_ACCESSOR = 2, P_READONLY = 4 };

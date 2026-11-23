@@ -633,7 +633,7 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         return;
     case 'b':
         if (!strcmp(name, "background-color")) {
-            int got = parse_color(v, &color);
+            int got = word_is(v, "currentcolor") ? (color = s->color, 1) : parse_color(v, &color);
             if (got == 1) {
                 s->background = color;
                 s->has_background = 1;
@@ -963,7 +963,28 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         return;
     case 'm':
         if (!strcmp(name, "mask-image") || !strcmp(name, "mask")) {
-            s->masked = strstr(v, "url(") != NULL || strstr(v, "gradient(") != NULL;
+            /* a picture mask is drawn; a gradient one (a fade) can't be, so the background stays off */
+            s->mask_image = strstr(v, "url(") ? css_keep(v) : NULL;
+            s->masked = !s->mask_image && strstr(v, "gradient(") != NULL;
+            if (!strcmp(name, "mask") && s->mask_image) { /* its position, size and repeat, written as for backgrounds */
+                Style t = *s;
+                background_shorthand(&t, v);
+                s->mask_size = t.bg_size;
+                s->mask_pos = t.bg_pos;
+                s->mask_repeat = t.bg_repeat;
+            }
+            return;
+        }
+        if (!strcmp(name, "mask-size")) {
+            s->mask_size = css_keep(v);
+            return;
+        }
+        if (!strcmp(name, "mask-position")) {
+            s->mask_pos = css_keep(v);
+            return;
+        }
+        if (!strcmp(name, "mask-repeat")) {
+            s->mask_repeat = repeat_word(v);
             return;
         }
         if (!strcmp(name, "margin")) set_sides(s->margin_len, v, font);
@@ -1169,17 +1190,16 @@ static int resolve_vars(const char *in, char *out, int max, int depth) {
         if (*p == ')') p++;
         const char *v = lookup_var(var_scope, lname, nl);
         char sub[512];
-        if (v) {
-            if (!resolve_vars(v, sub, sizeof(sub), depth + 1)) return 0;
-        } else if (fallback) {
+        /* a variable that can't be worked out (missing, or defined by itself) takes the fallback */
+        int got = v && resolve_vars(v, sub, sizeof(sub), depth + 1);
+        if (!got && fallback) {
             char fb[512];
             int n = fl < 511 ? fl : 511;
             memcpy(fb, fallback, (size_t)n);
             fb[n] = 0;
-            if (!resolve_vars(fb, sub, sizeof(sub), depth + 1)) return 0;
-        } else {
-            return 0;
+            got = resolve_vars(fb, sub, sizeof(sub), depth + 1);
         }
+        if (!got) return 0;
         for (const char *q = sub; *q && k < max - 1; q++) out[k++] = *q;
     }
     out[k] = 0;
@@ -1275,9 +1295,9 @@ typedef struct {
 typedef struct {
     char tag[16];
     char id[48];
-    char classes[4][40];
+    char classes[6][64];
     int class_count;
-    unsigned tag_key, id_key, class_keys[4], not_key;
+    unsigned tag_key, id_key, class_keys[6], not_key;
     AttrTest attrs[2];
     int attr_count;
     unsigned short pseudo;
@@ -1466,7 +1486,7 @@ static int parse_compound(const char *s, int n, Compound *c, int *spec) {
                     int spec2 = 0;
                     if (!parse_compound(arg, (int)strlen(arg), &inner, &spec2)) return 0;
                     if (inner.tag[0]) strcpy(c->tag, inner.tag);
-                    if (inner.class_count && c->class_count < 4) strcpy(c->classes[c->class_count++], inner.classes[0]);
+                    if (inner.class_count && c->class_count < 6) strcpy(c->classes[c->class_count++], inner.classes[0]);
                 }
             } else if (!strcmp(pseudo, "nth-child") || !strcmp(pseudo, "nth-last-child")) {
                 c->pseudo |= pseudo[4] == 'l' ? PS_NTH_LAST : PS_NTH;
@@ -1496,20 +1516,22 @@ static int parse_compound(const char *s, int n, Compound *c, int *spec) {
             kind = ch;
             i++;
         }
-        char name[48];
-        int k = 0;
+        char name[64];
+        int k = 0, too_long = 0;
         while (i < n && s[i] != '.' && s[i] != '#' && s[i] != ':' && s[i] != '[') {
             if (s[i] == '\\' && i + 1 < n) i++; /* escaped characters in class names */
-            if (k < 47) name[k++] = kind ? s[i] : (char)tolower((unsigned char)s[i]);
+            if (k < 63) name[k++] = kind ? s[i] : (char)tolower((unsigned char)s[i]);
+            else too_long = 1;
             i++;
         }
         name[k] = 0;
-        if (!k) return 0;
+        if (!k || too_long) return 0;
+        if ((kind == '#' && k > 47) || (!kind && k > 15)) return 0; /* (longer than the fields hold) */
         if (kind == '#') {
             strcpy(c->id, name);
             *spec += 10000;
         } else if (kind == '.') {
-            if (c->class_count == 4 || k > 39) return 0;
+            if (c->class_count == 6 || k > 63) return 0;
             strcpy(c->classes[c->class_count++], name);
             *spec += 100;
         } else {
@@ -1911,6 +1933,94 @@ static int media_applies(const char *q, int n) {
     return saw ? any : 1;
 }
 
+/* @supports conditions: (property: value), not, and, or, selector(). A
+   property is supported if this browser draws it. */
+static int supports_eval(const char **p, const char *end);
+
+static int supports_one(const char **p, const char *end) {
+    const char *s = *p;
+    while (s < end && is_space(*s)) s++;
+    if (end - s >= 4 && !strncasecmp(s, "not", 3) && (is_space(s[3]) || s[3] == '(')) {
+        s += 3;
+        *p = s;
+        return !supports_one(p, end);
+    }
+    int fn = end - s >= 9 && !strncasecmp(s, "selector(", 9);
+    if (fn) s += 8;
+    if (s >= end || *s != '(') {
+        *p = end;
+        return 0;
+    }
+    /* the bracket's inside */
+    const char *in = s + 1, *close = in;
+    int depth = 1;
+    while (close < end && depth) {
+        if (*close == '(') depth++;
+        else if (*close == ')') depth--;
+        if (depth) close++;
+    }
+    *p = close < end ? close + 1 : end;
+    if (fn) return 1;
+    const char *q = in;
+    while (q < close && is_space(*q)) q++;
+    if (q < close && (*q == '(' || !strncasecmp(q, "not", 3))) return supports_eval(&q, close); /* ((a) or (b)) */
+    char prop[48];
+    int n = 0;
+    while (q < close && *q != ':' && n < 47) {
+        if (!is_space(*q)) prop[n++] = (char)tolower((unsigned char)*q);
+        q++;
+    }
+    prop[n] = 0;
+    if (q >= close) return 0;
+    q++;
+    char value[96];
+    int k = 0;
+    while (q < close && k < 95) value[k++] = *q++;
+    value[k] = 0;
+    const char *pr = prop;
+    if (!strncmp(pr, "-webkit-", 8)) pr += 8;
+    static const char *const known[] = {
+        "display", "color", "background", "background-color", "background-image", "background-size", "background-position",
+        "background-repeat", "border", "border-radius", "box-shadow", "opacity", "width", "height", "min-width", "max-width",
+        "min-height", "max-height", "margin", "padding", "position", "top", "left", "right", "bottom", "inset", "z-index",
+        "font-family", "font-size", "font-weight", "font-style", "line-height", "text-align", "vertical-align", "float",
+        "clear", "overflow", "visibility", "flex", "flex-direction", "flex-wrap", "flex-grow", "flex-shrink", "flex-basis",
+        "justify-content", "align-items", "align-self", "gap", "row-gap", "column-gap", "grid-template-columns",
+        "grid-template-rows", "grid-template-areas", "grid-area", "grid-column", "grid-row", "place-items", "place-content",
+        "box-sizing", "transform", "mask-image", "mask", "mask-size", "mask-position", "content", "white-space",
+        "text-transform", "text-decoration", "list-style", "order", "aspect-ratio", NULL};
+    for (int i = 0; known[i]; i++)
+        if (!strcmp(pr, known[i])) {
+            if (!strcmp(pr, "display")) /* only the kinds of box laid out */
+                return !strstr(value, "subgrid") && !strstr(value, "ruby") && !strstr(value, "math");
+            if (!strcmp(pr, "transform")) return strstr(value, "translate") != NULL || strstr(value, "none") != NULL;
+            return 1;
+        }
+    return 0;
+}
+
+static int supports_eval(const char **p, const char *end) {
+    int result = supports_one(p, end);
+    for (;;) {
+        const char *s = *p;
+        while (s < end && is_space(*s)) s++;
+        if (end - s >= 3 && !strncasecmp(s, "and", 3)) {
+            *p = s + 3;
+            int r = supports_one(p, end);
+            result = result && r;
+        } else if (end - s >= 2 && !strncasecmp(s, "or", 2)) {
+            *p = s + 2;
+            int r = supports_one(p, end);
+            result = result || r;
+        } else return result;
+    }
+}
+
+static int supports_applies(const char *q, int n) {
+    const char *p = q;
+    return supports_eval(&p, q + n);
+}
+
 static int block_end(const char *css, int len, int open) {
     int depth = 0;
     char quote = 0;
@@ -1959,7 +2069,8 @@ static void parse_css(char *css, int len, int origin) {
                 continue;
             }
             int media = !strncasecmp(css + i, "@media", 6);
-            if ((media && media_applies(css + i + 6, j - i - 6)) || !strncasecmp(css + i, "@supports", 9) ||
+            int supports = !strncasecmp(css + i, "@supports", 9);
+            if ((media && media_applies(css + i + 6, j - i - 6)) || (supports && supports_applies(css + i + 9, j - i - 9)) ||
                 !strncasecmp(css + i, "@layer", 6) || !strncasecmp(css + i, "@container", 10)) {
                 css[end] = 0;
                 parse_css(css + j + 1, end - j - 1, origin);

@@ -11,7 +11,8 @@ enum {
     N_THROW, N_TRY, N_SWITCH, N_CASE, N_FUNCDECL, N_CLASSDECL, N_EMPTY, N_LABEL,
     /* a function body not parsed yet: num = where its { is in the source,
        op = just past its }, line = its line, cache = the source */
-    N_LAZY
+    N_LAZY,
+    N_YIELD /* yield a (op '*': yield*) */
 };
 
 /* flags */
@@ -140,11 +141,12 @@ static Ast *node(int type) {
 
 static char *parse_stack_base;
 static char *js_stack_base; /* (js_eval.c: where scripts began on the stack) */
+static long long js_stack_room = 6000000; /* (js_eval.c: how deep they may go) */
 
 /* Too deep to go on safely? (deeply nested code would exhaust the stack) */
 static int parse_too_deep(void) {
     char here;
-    if (parse_stack_base && parse_stack_base - &here > 6500000) { /* (of the 8 MiB the main stack may grow to) */
+    if (parse_stack_base && parse_stack_base - &here > js_stack_room + js_stack_room / 12) { /* (6.5 MB of the 8 MiB main stack) */
         syntax_error("the code is nested too deeply");
         return 1;
     }
@@ -642,7 +644,7 @@ static Ast *parse_object_literal(void) {
             parse_property_key(p);
             if (is_p('(')) { /* a method */
                 p->flags |= F_METHOD | flags;
-                p->b = parse_function(1, F_METHOD | (flags & F_ASYNC));
+                p->b = parse_function(1, F_METHOD | (flags & (F_ASYNC | F_GENERATOR)));
                 if (p->b && p->str) p->b->str = p->str;
             } else if (flags & (F_GETTER | F_SETTER)) {
                 syntax_error("expected ( after a getter or setter name");
@@ -1173,11 +1175,18 @@ static int is_assign_op(int p) {
     return 0;
 }
 
+static int parse_in_generator; /* inside a function*'s body: yield is an operator */
+
 static Ast *parse_assign(int no_in) {
     if (parse_failed || parse_too_deep()) return node(N_EMPTY);
-    if (is_word("yield")) {
-        syntax_error("generators (yield) are not supported");
-        return node(N_EMPTY);
+    if (parse_in_generator && is_word("yield")) {
+        next_token();
+        Ast *y = node(N_YIELD);
+        if (!L.tok.newline_before && eat('*')) y->op = '*';
+        if (y->op == '*' || (!L.tok.newline_before && L.tok.type != T_EOF && !is_p(')') && !is_p(']') && !is_p('}') &&
+                             !is_p(',') && !is_p(';') && !is_p(':')))
+            y->a = parse_assign(no_in);
+        return y;
     }
     Ast *left = parse_conditional(no_in);
     if (L.tok.type == T_PUNCT && is_assign_op(L.tok.punct)) {
@@ -1286,8 +1295,11 @@ static int parse_lazy_body(Ast *fn) {
     parse_error[0] = 0;
     arrow_memo_clear();
     lazy_bodies = 1;
+    int was_generator = parse_in_generator;
+    parse_in_generator = (fn->flags & F_GENERATOR) != 0;
     next_token();
     Ast *body = parse_block_body();
+    parse_in_generator = was_generator;
     arrow_memo_clear();
     int ok = !parse_failed;
     if (ok) fn->a = body;
@@ -1305,8 +1317,8 @@ static Ast *parse_function(int is_expr, int flags) {
     if (!(flags & F_METHOD)) {
         next_token(); /* function */
         if (eat('*')) {
-            syntax_error("generators (function*) are not supported");
-            return f;
+            flags |= F_GENERATOR;
+            f->flags = flags;
         }
         if (L.tok.type == T_IDENT && !is_p('(')) {
             f->str = L.tok.str;
@@ -1319,8 +1331,11 @@ static Ast *parse_function(int is_expr, int flags) {
         syntax_error("expected ( for a function's parameters");
         return f;
     }
+    int was = parse_in_generator;
+    parse_in_generator = (flags & F_GENERATOR) != 0;
     f->list = parse_paren_params();
     parse_function_body(f);
+    parse_in_generator = was;
     return f;
 }
 
@@ -1371,7 +1386,7 @@ static Ast *parse_class(int is_expr) {
         parse_property_key(m);
         if (is_p('(')) {
             m->flags |= F_METHOD | flags;
-            m->b = parse_function(1, F_METHOD | (flags & F_ASYNC));
+            m->b = parse_function(1, F_METHOD | (flags & (F_ASYNC | F_GENERATOR)));
             if (m->b) m->b->str = m->str;
             if (m->str && !(m->flags & F_STATIC) && m->str->len == 11 && memcmp(m->str->s, "constructor", 11) == 0)
                 m->flags |= F_CTOR;

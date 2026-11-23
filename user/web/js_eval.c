@@ -16,13 +16,48 @@ static int js_frame_depth;
 static int js_exec_line, js_call_pos; /* the line of the statement running, where the last call was (for messages) */
 static u64 js_deadline;          /* uptime (ms) when the running script must stop; 0: none */
 
-/* Start a run of script code allowed `ms` milliseconds. */
-static void js_start_run(int ms) {
+/* A run of script code (a script, an event handler, a timer, a promise
+   job), allowed `ms` milliseconds. Runs nest: a script can insert a
+   script that runs at once, or fire an event. A nested run has a budget
+   of its own; when it ends, the run it was in carries on with its own
+   (not counting the time the nested one took). */
+typedef struct {
+    u64 deadline, started;
+    long steps;
+    int frame_depth;
+} JsRun;
+static int js_run_depth; /* runs in progress */
+
+static void js_run_begin(JsRun *r, int ms) {
+    r->deadline = js_deadline;
+    r->steps = js_steps;
+    r->frame_depth = js_frame_depth;
+    r->started = uptime_ms();
+    js_run_depth++;
     js_steps = 0;
     js_abort = 0;
-    js_deadline = uptime_ms() + (u64)ms;
+    js_deadline = r->started + (u64)ms;
+}
+
+static void js_run_end(JsRun *r) {
+    if (js_run_depth > 0) js_run_depth--;
+    if (js_run_depth > 0) { /* back in the run this one was in */
+        js_deadline = r->deadline ? r->deadline + (uptime_ms() - r->started) : 0;
+        js_steps = r->steps;
+        js_frame_depth = r->frame_depth;
+    }
 }
 static char *js_stack_base;
+static char *js_stack_floor; /* on a coroutine's stack: built-ins that recurse must stay above this */
+/* (js_stack_room, declared in js_parse.c: how deep scripts may go from js_stack_base; less on a coroutine's stack) */
+
+/* js_coro.c: generators and async functions */
+typedef struct Coro Coro;
+static JsObj *GeneratorProto, *AsyncGeneratorProto;
+static int coro_make_generator(JsObj *fo, Value this_v, Value *args, int argc, Value *ret);
+static int coro_run_async(JsObj *fo, Value this_v, Value *args, int argc, Value *ret);
+static int coro_await(Value v, Value *out);
+static void coro_init(JsObj *global);
 static JsStr *jump_label;       /* the label of a break / continue in flight */
 static int optional_short;      /* an optional chain met null or undefined */
 static JsObj *native_new_target; /* set while a built-in runs as a constructor */
@@ -39,6 +74,8 @@ typedef struct {
     int argc;
     int strict;      /* strict mode: this is not replaced by the global object */
 } Frame;
+
+static int coro_yield(Ast *n, Frame *f, Value *out); /* (js_coro.c) */
 
 /* The global object (window) and the prototypes of the built-in types. */
 static JsObj *global_obj, *ObjectProto, *FunctionProto, *ArrayProto, *StringProto, *NumberProto, *BooleanProto,
@@ -925,14 +962,17 @@ static int run_function_body(JsObj *fo, Value this_v, Value *args, int argc, JsO
 static int run_function(JsObj *fo, Value this_v, Value *args, int argc, JsObj *new_target, Value *ret) {
     if (js_frame_depth < JS_FRAMES) js_frames[js_frame_depth] = fo->fn;
     js_frame_depth++;
-    int r = run_function_body(fo, this_v, args, argc, new_target, ret);
+    int r;
+    if (!new_target && fo->fn && (fo->fn->flags & F_GENERATOR)) r = coro_make_generator(fo, this_v, args, argc, ret);
+    else if (!new_target && fo->fn && (fo->fn->flags & F_ASYNC)) r = coro_run_async(fo, this_v, args, argc, ret);
+    else r = run_function_body(fo, this_v, args, argc, new_target, ret);
     js_frame_depth--;
     return r;
 }
 
 static int run_function_body(JsObj *fo, Value this_v, Value *args, int argc, JsObj *new_target, Value *ret) {
     char here;
-    if (js_stack_base - &here > 6000000) return throw_error(RangeErrorProto, "Maximum call stack size exceeded");
+    if (js_stack_base - &here > js_stack_room) return throw_error(RangeErrorProto, "Maximum call stack size exceeded");
     TRY(check_limits());
     Ast *fn = fo->fn;
     if (fn->a && fn->a->type == N_LAZY && parse_lazy_body(fn) != 0) { /* first call: parse the body now */
@@ -989,7 +1029,7 @@ static int run_function_body(JsObj *fo, Value this_v, Value *args, int argc, JsO
    call each other in a cycle without passing through run_function) */
 static int stack_exhausted(void) {
     char here;
-    return js_stack_base && js_stack_base - &here > 6100000;
+    return js_stack_base && js_stack_base - &here > js_stack_room + 100000;
 }
 
 static int call_function(JsObj *fo, Value this_v, Value *args, int argc, Value *ret) {
@@ -1969,7 +2009,7 @@ __attribute__((noinline)) static int eval_regex(Ast *n, Value *out) {
 
 static int eval(Ast *n, Frame *f, Value *out) {
     char here;
-    if (js_stack_base - &here > 6300000) return throw_error(RangeErrorProto, "Maximum call stack size exceeded (expression too deeply nested)");
+    if (js_stack_base - &here > js_stack_room + 300000) return throw_error(RangeErrorProto, "Maximum call stack size exceeded (expression too deeply nested)");
     switch (n->type) {
     case N_NUM: *out = n->op == 'n' ? v_big(n->str) : v_num(n->num); return C_NORMAL;
     case N_STR: *out = v_str(n->str); return C_NORMAL;
@@ -1981,6 +2021,7 @@ static int eval(Ast *n, Frame *f, Value *out) {
         return read_variable(n->str, f, out);
     case N_THIS: *out = f->this_v; return C_NORMAL;
     case N_NEWTARGET: *out = f->new_target ? v_obj(f->new_target) : v_undef(); return C_NORMAL;
+    case N_YIELD: return coro_yield(n, f, out);
     case N_TEMPLATE: {
         Buf b = {0};
         int i = 0;
@@ -2172,17 +2213,8 @@ static int eval(Ast *n, Frame *f, Value *out) {
             return C_NORMAL;
         case 't': *out = v_str(type_of(v)); return C_NORMAL;
         case 'v': *out = v_undef(); return C_NORMAL;
-        case 'a': /* await: a settled promise gives its value */
-            if (v.t == V_OBJ && v.u.o->cls == CL_PROMISE) {
-                if (v.u.o->magic == 2) {
-                    js_exception = v.u.o->this_val;
-                    return C_THROW;
-                }
-                *out = v.u.o->magic == 1 ? v.u.o->this_val : v_undef();
-            } else {
-                *out = v;
-            }
-            return C_NORMAL;
+        case 'a': /* await: in an async function, waits for the promise to settle */
+            return coro_await(v, out);
         }
         *out = v_undef();
         return C_NORMAL;
@@ -2427,6 +2459,48 @@ static int exec_labeled(Ast *n, Frame *f, Value *out, JsStr *label) {
         Value subject;
         TRY(eval(n->b, f, &subject));
         JsObj *items;
+        if ((n->flags & F_FOR_OF) && subject.t == V_OBJ && (subject.u.o->cls == CL_GENERATOR || subject.u.o->cls == CL_OBJECT)) {
+            /* a generator or a script's own iterator: one step at a time (it may never end) */
+            Value iter_fn, it, next;
+            TRY(get_value(subject, S_iterator, &iter_fn));
+            if (is_callable(iter_fn)) {
+                TRY(call_function(iter_fn.u.o, subject, NULL, 0, &it));
+                if (it.t != V_OBJ) return throw_type("Result of the Symbol.iterator method is not an object", NULL, NULL);
+                TRY(get_value(it, intern_c("next"), &next));
+                if (!is_callable(next)) return throw_type("iterator has no next method", NULL, NULL);
+                for (;;) {
+                    Value step, done, v;
+                    TRY(call_function(next.u.o, it, NULL, 0, &step));
+                    if (step.t != V_OBJ) return throw_type("Iterator result is not an object", NULL, NULL);
+                    TRY(get_value(step, S_done, &done));
+                    if (to_boolean(done)) return C_NORMAL;
+                    TRY(get_value(step, S_value, &v));
+                    Frame lf = *f;
+                    int r;
+                    if (n->a->type == N_VAR) {
+                        if (n->a->op != 'v') lf.env = env_new(f->env);
+                        r = bind_pattern(n->a->list->a, v, &lf, n->a->op);
+                    } else {
+                        r = bind_pattern(n->a, v, &lf, 0);
+                    }
+                    int stop = r != C_NORMAL;
+                    if (!stop) r = loop_continues(exec(n->d, &lf, out), label, &stop);
+                    if (stop) { /* left early: the iterator is told (it.return()) */
+                        Value ret_fn, ignored;
+                        Value saved = js_exception;
+                        JsStr *saved_label = jump_label;
+                        if (get_value(it, intern_c("return"), &ret_fn) == C_NORMAL && is_callable(ret_fn)) {
+                            int cr = call_function(ret_fn.u.o, it, NULL, 0, &ignored);
+                            if (cr == C_THROW && r != C_THROW) return cr;
+                        }
+                        js_exception = saved;
+                        jump_label = saved_label;
+                        return r;
+                    }
+                    TRY(check_limits());
+                }
+            }
+        }
         if (n->flags & F_FOR_OF) {
             TRY(iterate_to_array(subject, &items));
         } else {
@@ -2582,7 +2656,8 @@ static int js_call_toplevel(Value fn, Value this_v, Value *args, int argc, Value
     if (!is_callable(fn)) return -1;
     char here;
     js_set_stack_base(&here);
-    js_start_run(1000); /* an event handler or timer: a second at most */
+    JsRun run;
+    js_run_begin(&run, 1000); /* an event handler or timer: a second at most */
     optional_short = 0;
     Value r;
     int code = call_function(fn.u.o, this_v, args, argc, &r);
@@ -2591,9 +2666,9 @@ static int js_call_toplevel(Value fn, Value this_v, Value *args, int argc, Value
         describe_exception(js_last_error, sizeof(js_last_error));
         js_report(js_last_error);
         js_abort = 0;
-        return -1;
     }
-    return 0;
+    js_run_end(&run);
+    return code == C_THROW ? -1 : 0;
 }
 
 /* Run a script's text in the global scope. */
@@ -2631,7 +2706,8 @@ static int js_run_script(const char *src, int len, const char *where) {
     free(info.vars);
     char here;
     js_set_stack_base(&here);
-    js_start_run(3000); /* a whole script: three seconds at most */
+    JsRun run;
+    js_run_begin(&run, 3000); /* a whole script: three seconds at most */
     js_frame_depth = 0;
     optional_short = 0;
     Value out = v_undef();
@@ -2642,10 +2718,12 @@ static int js_run_script(const char *src, int len, const char *where) {
         printf("[script] %d KiB: parse %d ms, run %d ms, %d steps\n", len / 1024, (int)parse_ms, (int)(uptime_ms() - parse_t0 - parse_ms), (int)js_steps);
     if (code == C_THROW) {
         describe_exception(js_last_error, sizeof(js_last_error));
-        if (js_trace_throws) printf("[script] the error below is from %s\n", where);
+        if (js_trace_throws) printf("[script] the error below is from %s (stopped at line %d, last call at character %d)\n", where, js_exec_line, js_call_pos);
         js_report(js_last_error);
         js_abort = 0;
+        js_run_end(&run);
         return -1;
     }
+    js_run_end(&run);
     return 0;
 }

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html><head><title>generators</title></head>
+<body><pre id="out"></pre>
+<script>
+var lines = [];
+function log(name, got, want) {
+  var ok = JSON.stringify(got) === JSON.stringify(want);
+  lines.push((ok ? 'ok   ' : 'FAIL ') + name + (ok ? '' : ' got ' + JSON.stringify(got) + ' want ' + JSON.stringify(want)));
+}
+function* count(n) { for (var i = 0; i < n; i++) yield i; return 'end'; }
+var g = count(3);
+log('next', [g.next(), g.next(), g.next(), g.next(), g.next()],
+    [{value:0,done:false},{value:1,done:false},{value:2,done:false},{value:'end',done:true},{done:true}]);
+log('for-of', (function(){ var a = []; for (var x of count(4)) a.push(x); return a; })(), [0,1,2,3]);
+log('spread', [...count(3)], [0,1,2]);
+function* echo() { var got = []; while (true) { var v = yield got.length; if (v === 'stop') return got; got.push(v); } }
+var e = echo(); e.next();
+e.next('a'); e.next('b');
+log('send', e.next('stop'), {value:['a','b'],done:true});
+function* inner() { yield 1; yield 2; }
+function* outer() { yield 0; yield* inner(); yield* [3, 4]; }
+log('yield*', [...outer()], [0,1,2,3,4]);
+function* catcher() { try { yield 1; } catch (err) { yield 'caught ' + err; } }
+var c = catcher(); c.next();
+log('throw', c.next.call(c) && 0 || (function(){ var c2 = catcher(); c2.next(); return c2.throw('x').value; })(), 'caught x');
+var r = count(5); r.next();
+log('return', [r.return(9), r.next()], [{value:9,done:true},{done:true}]);
+var cleaned = [];
+function* withFinally() { try { yield 1; yield 2; } finally { cleaned.push('done'); } }
+var wf = withFinally(); wf.next();
+log('return runs finally', [wf.return(5), cleaned], [{value:5,done:true}, ['done']]);
+var fo = []; for (var x of withFinally()) { fo.push(x); break; }
+log('break closes', cleaned.length, 2);
+var firstBig = null; for (var nat of naturals()) { if (nat > 5) { firstBig = nat; break; } }
+log('for-of infinite', firstBig, 6);
+function* naturals() { var i = 0; while (true) yield i++; }
+function* firstThree() { var it = naturals(); yield* { [Symbol.iterator]: function() { return it; } }; }
+var ft = firstThree(); log('yield* lazy', [ft.next().value, ft.next().value, ft.next().value], [0,1,2]);
+function* passes() { var got = yield* echo(); yield 'inner returned ' + got.length; }
+var ps = passes(); ps.next(); ps.next('q');
+log('yield* send/return', ps.next('stop').value, 'inner returned 1');
+function* delegThrow() { yield* catcher(); }
+var dt = delegThrow(); dt.next();
+log('yield* throw', dt.throw('z').value, 'caught z');
+var obj = { *items() { yield 'm'; } };
+log('method', [...obj.items()], ['m']);
+class K { *[Symbol.iterator]() { yield 7; yield 8; } }
+log('class iter', [...new K()], [7,8]);
+log('toString', Object.prototype.toString.call(count(1)), '[object Generator]');
+log('dotAll', [/./.dotAll, /./s.dotAll, /a.b/s.test('a\nb')], [false, true, true]);
+var compat = (function(){try{new Function('try { async function* x() {} } catch {}');return true;}catch(e){return false;}}());
+log('isCompatible fn', compat, true);
+// deep recursion in a generator
+function* deep(n) { if (n > 0) yield* deep(n - 1); else yield 'bottom'; }
+log('nested', [...deep(30)], ['bottom']);
+// lots of generators (GC of stacks)
+var sum = 0;
+for (var k = 0; k < 3000; k++) { var gg = count(3); gg.next(); sum += gg.next().value; }
+log('many', sum, 3000);
+
+async function wait(ms, v) { return new Promise(function(res){ setTimeout(function(){ res(v); }, ms); }); }
+async function seq() {
+  var a = await wait(10, 'a');
+  var b = await wait(10, 'b');
+  var c = await 'c';
+  try { await Promise.reject(new Error('bad')); } catch (err) { c += err.message; }
+  return a + b + c;
+}
+var p = seq();
+log('async returns promise', p instanceof Promise, true);
+var order = [];
+async function early() { order.push(1); await null; order.push(3); }
+early(); order.push(2);
+var arrow = async (x) => (await wait(5, x)) * 2;
+async function* agen() { yield 1; yield await wait(5, 2); }
+p.then(function(v) {
+  log('async/await', v, 'abcbad');
+  log('await order', order, [1,2,3]);
+  return arrow(21);
+}).then(function(v) {
+  log('async arrow', v, 42);
+  var ag = agen(), got = [];
+  return ag.next().then(function(r){ got.push(r.value); return ag.next(); }).then(function(r){ got.push(r.value); return ag.next(); })
+    .then(function(r){ got.push(r.done); log('async gen', got, [1,2,true]); })
+    .then(function(){ var q = agen(); return Promise.all([q.next(), q.next(), q.next()]); })
+    .then(function(rs){ log('async gen queued', rs.map(function(r){ return r.done ? 'done' : r.value; }), [1,2,'done']); });
+}).then(async function() {
+  // layout asked for inside an async function, on a deeply nested page
+  var outer = document.createElement('div'), d = outer;
+  for (var i = 0; i < 300; i++) { var c = document.createElement('div'); c.style.paddingLeft = '1px'; d.appendChild(c); d = c; }
+  d.textContent = 'deep';
+  document.body.appendChild(outer);
+  await null;
+  log('layout in async', d.offsetWidth > 0 && d.getBoundingClientRect().left >= 300, true);
+  outer.remove();
+  // a regular expression that recurses a lot, inside a generator
+  function* re() { yield /^(a|b)*$/.test('ab'.repeat(20000)); }
+  log('regex in generator', typeof re().next().value, 'boolean');
+}).then(function() {
+  document.getElementById('out').textContent = lines.join('\n');
+  console.log('RESULTS\n' + lines.join('\n'));
+}, function(err) {
+  lines.push('FAIL chain ' + err);
+  document.getElementById('out').textContent = lines.join('\n');
+  console.log('RESULTS\n' + lines.join('\n'));
+});
+</script></body></html>

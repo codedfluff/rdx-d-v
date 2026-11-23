@@ -631,13 +631,15 @@ static void worker_start(void) {
 static void dispatch_on(JsObj *target, JsObj *event) {
     char here;
     js_set_stack_base(&here);
-    js_start_run(3000);
+    JsRun run;
+    js_run_begin(&run, 3000);
     if (dispatch_event(target, event) < 0) {
         describe_exception(js_last_error, sizeof(js_last_error));
         js_report(js_last_error);
         js_errors++;
         js_abort = 0;
     }
+    js_run_end(&run);
     run_microtasks();
 }
 

@@ -2084,6 +2084,7 @@ static int regex_exec(Regex *re, const char *s, int len, int start, int *caps) {
     M.caps = caps;
     M.budget = 5000000;
     M.stack_limit = &here - 400000;
+    if (js_stack_floor && M.stack_limit < js_stack_floor) M.stack_limit = js_stack_floor; /* (a coroutine's small stack) */
     for (int i = start; i <= len; i++) {
         for (int g = 0; g <= re->groups; g++) caps[2 * g] = caps[2 * g + 1] = -1;
         if (match_atom(re->root, i, NULL)) {
@@ -2117,6 +2118,9 @@ static JsObj *regexp_new(JsStr *pattern, JsStr *flags, char *error) {
     prop_set_raw(o, intern_c("ignoreCase"), v_bool(re->icase), P_HIDDEN);
     prop_set_raw(o, intern_c("multiline"), v_bool(re->multiline), P_HIDDEN);
     prop_set_raw(o, intern_c("sticky"), v_bool(re->sticky), P_HIDDEN);
+    prop_set_raw(o, intern_c("dotAll"), v_bool(re->dotall), P_HIDDEN);
+    prop_set_raw(o, intern_c("unicode"), v_bool(strchr(flags->s, 'u') != NULL), P_HIDDEN);
+    prop_set_raw(o, intern_c("hasIndices"), v_bool(strchr(flags->s, 'd') != NULL), P_HIDDEN);
     prop_set_raw(o, S_lastIndex, v_num(0), P_HIDDEN);
     return o;
 }
@@ -3669,6 +3673,9 @@ static void make_resolver_pair(JsObj *p, JsObj **res, JsObj **rej) {
 
 /* Run the queued promise jobs (after every script, event and timer). */
 static void run_microtasks(void) {
+    /* only with no script running (a script that ran inside another one
+       leaves them for when the outer one is done, as browsers do) */
+    if (js_run_depth > 0) return;
     for (int guard = 0; microtasks && microtasks->alen && guard < 100000; guard++) {
         Value jv = microtasks->arr[0];
         memmove(microtasks->arr, microtasks->arr + 1, sizeof(Value) * (size_t)(microtasks->alen - 1));
@@ -3678,7 +3685,8 @@ static void run_microtasks(void) {
         Value a = job->arr[1], b = job->arr[2], c = job->arr[3];
         char here;
         js_set_stack_base(&here);
-        js_start_run(500);
+        JsRun run;
+        js_run_begin(&run, 500);
         if (kind == 1) { /* a reaction: handler a, value b, child promise c (state in the reaction) */
             JsObj *child = c.t == V_OBJ ? c.u.o : NULL;
             Value r;
@@ -3716,6 +3724,7 @@ static void run_microtasks(void) {
             if (js_call_toplevel(a, v_undef(), NULL, 0, NULL) != 0) {
             }
         }
+        js_run_end(&run);
     }
 }
 
@@ -5077,5 +5086,6 @@ static void js_init_builtins(void) {
     define_method(con, "count", noop, 0, 0);
     init_typed_arrays();
     init_iterators();
+    coro_init(global_obj);
     init_reflect();
 }

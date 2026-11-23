@@ -132,6 +132,9 @@ typedef struct {
     /* background pictures: the layers as written (url() and gradients), and how they are placed */
     const char *bg_image, *bg_size, *bg_pos;
     unsigned char bg_repeat;        /* 0 repeat, 1 no-repeat, 2 repeat-x, 3 repeat-y */
+    /* mask-image: a picture whose see-through parts hide the background (icons drawn in a colour) */
+    const char *mask_image, *mask_size, *mask_pos;
+    unsigned char mask_repeat;
     /* box-shadow (the first outer one) */
     short shadow[4];                /* x, y, blur, spread */
     unsigned shadow_color;
@@ -173,6 +176,8 @@ struct Node {
     int img_w, img_h;        /* natural size once loaded */
     void *bg_img;            /* its background picture (shared: the page's picture cache owns it) */
     signed char bg_state;    /* 0 not tried, 1 loaded, 2 failed */
+    void *mask_img;          /* its mask-image (shared, like bg_img) */
+    signed char mask_state;
     /* form controls */
     char *value;
     int checked, selected_index;

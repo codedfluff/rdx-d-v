@@ -42,6 +42,7 @@
 #include "web/js_lib.c"
 #include "web/js_prelude.c"
 #include "web/js_dom.c"
+#include "web/js_coro.c"
 #include "web/svg.c"
 #pragma clang section bss="" data=""
 #include "web/realm.c"
@@ -105,6 +106,7 @@ static int load_web_fonts(void) {
 static struct {
     char *url;
     image *img;
+    int nat_w, nat_h; /* its own size (an SVG is drawn bigger, to stay sharp) */
 } bg_cache[96];
 static int bg_cache_count;
 
@@ -181,6 +183,18 @@ static int css_url(const char *v, char *out, int max) {
 }
 
 /* A picture from bytes: SVG drawn at its own size, else PNG / JPEG / GIF. */
+static int picture_nat_w, picture_nat_h; /* the last picture_from's own size */
+
+static void picture_natural(const image *img, int *w, int *h) {
+    *w = img->width;
+    *h = img->height;
+    for (int i = 0; i < bg_cache_count; i++)
+        if (bg_cache[i].img == img && bg_cache[i].nat_w > 0) {
+            *w = bg_cache[i].nat_w;
+            *h = bg_cache[i].nat_h;
+        }
+}
+
 static image *picture_from(const char *body, size_t len, const char *type) {
     image *img = malloc(sizeof(image));
     if (!img || len > MAX_IMAGE_BYTES) {
@@ -191,6 +205,8 @@ static image *picture_from(const char *body, size_t len, const char *type) {
     int nw, nh;
     if (looks_like_svg(body, len, type)) {
         if (svg_render_text(body, (int)len, 0, 0, 0x000000, img, &nw, &nh) == 0) {
+            picture_nat_w = nw;
+            picture_nat_h = nh;
             int big = nw > nh ? nw : nh;
             if (big > 0 && big < 256) { /* a small drawing: again at 256 px, so it stays sharp when enlarged */
                 image sharp;
@@ -202,6 +218,8 @@ static image *picture_from(const char *body, size_t len, const char *type) {
             return img;
         }
     } else if (image_decode((const unsigned char *)body, len, img, why) == 0) {
+        picture_nat_w = img->width;
+        picture_nat_h = img->height;
         return img;
     }
     free(img);
@@ -230,6 +248,8 @@ static image *bg_picture(const char *url, PrefetchSet *pictures) {
         }
     }
     if (bg_cache_count < 96) {
+        bg_cache[bg_cache_count].nat_w = img ? picture_nat_w : 0;
+        bg_cache[bg_cache_count].nat_h = img ? picture_nat_h : 0;
         bg_cache[bg_cache_count].url = copy_of(url, (int)strlen(url));
         bg_cache[bg_cache_count++].img = img;
     } else if (img) { /* (no room to keep it: not used) */
@@ -682,6 +702,7 @@ static int load_images(int (*each)(void)) {
     for (Node *n = document; n; n = next_in_tree(n, document)) {
         wanted += n->type == NODE_ELEMENT && !n->img_state && is(n->tag, "img");
         wanted += n->type == NODE_ELEMENT && !n->bg_state && n->style.bg_image && strstr(n->style.bg_image, "url(") != NULL;
+        wanted += n->type == NODE_ELEMENT && !n->mask_state && n->style.mask_image != NULL;
     }
     PrefetchSet *pictures = wanted > 1 ? prefetch_begin(wanted < MAX_IMAGES ? wanted : MAX_IMAGES) : NULL;
     for (Node *n = document; n && pictures; n = next_in_tree(n, document)) {
@@ -722,6 +743,27 @@ static int load_images_from(int (*each)(void), PrefetchSet *pictures, unsigned p
                 if (img) {
                     n->bg_img = img;
                     n->bg_state = 1;
+                }
+                loaded++;
+                if (each && each()) return 1;
+                if (page != page_epoch) return 1;
+                if (dom != dom_epoch) {
+                    dom = dom_epoch;
+                    n = document;
+                    continue;
+                }
+            }
+        }
+        if (n->type == NODE_ELEMENT && !n->mask_state && n->style.mask_image && n->style.display != D_NONE) {
+            n->mask_state = 2; /* a CSS mask picture */
+            if (css_url(n->style.mask_image, src, sizeof(src))) {
+                if (strncasecmp(src, "data:", 5)) resolve_url(base_url, src, url, sizeof(url));
+                else strncpy(url, src, sizeof(url) - 1);
+                url[sizeof(url) - 1] = 0;
+                image *img = bg_picture(url, pictures);
+                if (img) {
+                    n->mask_img = img;
+                    n->mask_state = 1;
                 }
                 loaded++;
                 if (each && each()) return 1;

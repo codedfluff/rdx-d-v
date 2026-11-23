@@ -645,26 +645,49 @@ static void paint_gradient(canvas *v, int x, int y, int w, int h, const char *g,
 
 /* One length of background-size / -position: px, or a percentage. */
 static int bg_length(const char *t, int of, int *is_pct, int *pct) {
-    int used, n = number100(t, &used);
-    *is_pct = 0;
-    if (!used) return 0;
-    if (t[used] == '%') {
-        *is_pct = 1;
-        *pct = n / 100;
-        return (int)((long long)of * n / 10000);
-    }
     int ok;
-    Len l = parse_len(t, 16, &ok);
-    return ok && l.unit == 'p' ? l.value : 0;
+    Len l = parse_len(t, 16, &ok); /* (calc() included) */
+    *is_pct = 0;
+    if (!ok) return 0;
+    if (l.unit == '%') {
+        *is_pct = 1;
+        *pct = l.value / 100;
+        return (int)((long long)of * l.value / 10000);
+    }
+    if (l.unit == 'c') return (int)((long long)of * l.value / 10000) + l.px;
+    return l.unit == 'p' ? l.value : 0;
 }
 
-static void paint_bg_picture(canvas *v, int x, int y, int w, int h, const Style *s, const image *img) {
-    int iw = img->width, ih = img->height;
+static void picture_natural(const image *img, int *w, int *h); /* (browser.c: drawings are kept bigger than they are) */
+
+/* A colour seen through a mask picture, drawn w x h at (x, y). */
+static void paint_mask_tile(canvas *v, const image *img, int x, int y, int w, int h, unsigned color) {
+    const unsigned *px = scaled_pixels(img, w, h);
+    if (!px) return;
+    unsigned ca = color_alpha(color);
+    int x0 = x < 0 ? -x : 0, y0 = y < 0 ? -y : 0;
+    int x1 = x + w > v->width ? v->width - x : w, y1 = y + h > v->height ? v->height - y : h;
+    for (int dy = y0; dy < y1; dy++) {
+        const unsigned *src = px + (size_t)dy * (size_t)w;
+        unsigned *dst = v->pixels + (size_t)(y + dy) * (size_t)v->stride + x;
+        for (int dx = x0; dx < x1; dx++) {
+            unsigned a = (src[dx] >> 24) * ca / 255;
+            if (a) blend_px(&dst[dx], color, a);
+        }
+    }
+}
+
+/* A picture placed in a w x h box as background-size, -position and
+   -repeat say; as a mask (mask set), the colour is drawn through it. */
+static void paint_placed(canvas *v, int x, int y, int w, int h, const char *size_s, const char *pos_s, int repeat, const image *img,
+                         int mask, unsigned color) {
+    int iw, ih;
+    picture_natural(img, &iw, &ih);
     if (iw <= 0 || ih <= 0 || w <= 0 || h <= 0) return;
     int dw = iw, dh = ih;
-    if (s->bg_size) {
+    if (size_s) {
         char a[48] = "", b[48] = "";
-        const char *p = s->bg_size;
+        const char *p = size_s;
         value_part(&p, a, sizeof(a));
         if (value_part(&p, b, sizeof(b)) <= 0 || !strcmp(b, ",")) strcpy(b, "auto");
         if (!strcasecmp(a, "cover") || !strcasecmp(a, "contain")) {
@@ -689,10 +712,10 @@ static void paint_bg_picture(canvas *v, int x, int y, int w, int h, const Style 
     if (dw <= 0 || dh <= 0) return;
     /* position: "x y", keywords, and "right 10px top 5px" */
     int ox = 0, oy = 0;
-    if (s->bg_pos) {
+    if (pos_s) {
         char t[4][48];
         int n = 0;
-        const char *p = s->bg_pos;
+        const char *p = pos_s;
         while (n < 4 && value_part(&p, t[n], sizeof(t[n])) > 0 && strcmp(t[n], ",")) n++;
         int xset = 0, yset = 0;
         for (int i = 0; i < n; i++) {
@@ -736,19 +759,34 @@ static void paint_bg_picture(canvas *v, int x, int y, int w, int h, const Style 
         if (n == 1 && xset && !yset) oy = (h - dh) / 2; /* one value: the other is centred */
         if (n == 1 && yset && !xset) ox = (w - dw) / 2;
     }
-    int rx = s->bg_repeat == 0 || s->bg_repeat == 2, ry = s->bg_repeat == 0 || s->bg_repeat == 3;
+    int rx = repeat == 0 || repeat == 2, ry = repeat == 0 || repeat == 3;
     int sx = ox, sy = oy;
     if (rx) while (sx > 0) sx -= dw;
     if (ry) while (sy > 0) sy -= dh;
     int tiles = 0;
     for (int ty = sy; ty < h && tiles < 4000; ty += dh) {
         for (int tx = sx; tx < w && tiles < 4000; tx += dw) {
-            paint_image(v, img, x + tx, y + ty, dw, dh);
+            if (mask) paint_mask_tile(v, img, x + tx, y + ty, dw, dh, color);
+            else paint_image(v, img, x + tx, y + ty, dw, dh);
             tiles++;
             if (!rx) break;
         }
         if (!ry) break;
     }
+}
+
+static void paint_bg_picture(canvas *v, int x, int y, int w, int h, const Style *s, const image *img) {
+    paint_placed(v, x, y, w, h, s->bg_size, s->bg_pos, s->bg_repeat, img, 0, 0);
+}
+
+/* An element's background seen through its mask (clipped to its box). */
+static void paint_masked(canvas *v, int x, int y, int w, int h, Node *n, unsigned color) {
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y, x1 = x + w > v->width ? v->width : x + w, y1 = y + h > v->height ? v->height : y + h;
+    if (x1 <= x0 || y1 <= y0 || n->mask_state != 1 || !n->mask_img) return;
+    canvas part = {v->pixels + (size_t)y0 * (size_t)v->stride + (size_t)x0, x1 - x0, y1 - y0, v->stride};
+    const image *m = (const image *)n->mask_img;
+    /* (no size given: the mask's own size, though an SVG's is often just its view box) */
+    paint_placed(&part, x - x0, y - y0, w, h, n->style.mask_size, n->style.mask_pos, n->style.mask_repeat, m, 1, color);
 }
 
 /* An element's background pictures and gradients, the last layer first. */
@@ -920,6 +958,10 @@ static void paint_page(canvas *v, int scroll, int left) {
         case IT_RECT:
             if (it->node && it->node->type == NODE_ELEMENT && it->node->style.has_shadow && it->node->bg_item == i)
                 paint_shadow(v, x, y, it->w, it->h, &it->node->style, round ? &radii : NULL);
+            if (it->node && it->node->type == NODE_ELEMENT && it->node->style.mask_image) { /* (shown only through its mask) */
+                paint_masked(v, x, y, it->w, it->h, it->node, it->color);
+                break;
+            }
             if (round) paint_round(v, x, y, it->w, it->h, &radii, 0, 0, 0, 0, 0, it->color);
             else paint_fill(v, x, y, it->w, it->h, it->color);
             if (it->node && it->node->type == NODE_ELEMENT && it->node->style.bg_image)

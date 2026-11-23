@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html class="big"><head><title>css variables</title>
+<style>
+body { font: 16px sans-serif; margin: 8px; }
+/* as Wikipedia's skin: a variable that refers to itself is invalid; the others still apply */
+html.big, .icon { --font-size-medium: var(--font-size-medium, 1rem); --line-height-medium: 1.6; --line-height-content: 1.625; }
+.body { font-size: var(--font-size-medium); line-height: var(--line-height-content); width: 300px; background: #eef; }
+.medium { line-height: var(--line-height-medium); width: 300px; background: #efe; }
+.fallback { font-size: var(--font-size-medium, 20px); background: #fee; width: 300px; }
+.cycle-a { --a: var(--b); --b: var(--a); padding-left: var(--a, 30px); background: #ffe; width: 300px; }
+</style></head>
+<body>
+<div class="body" id="body">one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen</div>
+<div class="medium" id="medium">one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen</div>
+<div class="fallback" id="fallback">fallback size</div>
+<div class="cycle-a" id="cycle">cycle padding</div>
+</body></html>

@@ -532,6 +532,19 @@ static int inline_baseline(Node *n) {
         return n->y + n->style.border[0] + pad(n, 0, 0) + (inner - a - d) / 2 + a;
     }
     if (n->style.overflow_hidden) return -1;
+    if (n->style.display == D_FLEX || n->style.display == D_INLINE_FLEX) { /* its first item's (or that item's bottom) */
+        for (Node *c = n->first; c; c = c->next) {
+            if (c->type == NODE_TEXT) {
+                int blank = 1;
+                for (int i = 0; i < c->text_len && blank; i++) blank = is_space(c->text[i]);
+                if (blank) continue;
+                return box_baseline(n, 0);
+            }
+            if (c->style.display == D_NONE || out_of_flow(c)) continue;
+            int b = box_baseline(c, 0);
+            return b >= 0 ? b : c->y + c->h + c->m[2];
+        }
+    }
     return box_baseline(n, 0);
 }
 
@@ -783,7 +796,7 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
         int edge_h = 0; /* the tallest box aligned to the line's top or bottom */
         int l, r;
         line_edges(left, right, y, lh, &l, &r);
-        int width = 0, j = i, in_flow = 0;
+        int width = 0, j = i, in_flow = 0, seen = 0;
         for (; j < atom_count; j++) {
             Atom *a = &atoms[j];
             if (a->kind == AT_BREAK) {
@@ -795,7 +808,8 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
             }
             if (a->kind == AT_BOX && a->node->type == NODE_ELEMENT && (a->node->style.floating || out_of_flow(a->node))) continue;
             in_flow = 1;
-            int space = a->space_before && j > line_start && a->kind != AT_SPACE ? space_w(&a->node->style) : 0;
+            int space = a->space_before && seen && a->kind != AT_SPACE ? space_w(&a->node->style) : 0;
+            seen = 1;
             int fits = width + space + a->w <= r - l;
             int may_wrap = !nowrap && !(a->kind == AT_WORD && a->node->style.nowrap);
             if (!fits && j > line_start && may_wrap) break;
@@ -823,7 +837,8 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
             Node *f = a->node;
             if (out_of_flow(f)) {
                 if (grow((void **)&pending, &pending_cap, pending_count + 1, sizeof(Pending)))
-                    pending[pending_count++] = (Pending){f, l, y};
+                    pending[pending_count++] = (Pending){f, l, f->style.display == D_BLOCK || f->style.display == D_FLEX ||
+                                                                  f->style.display == D_GRID || f->style.display == D_TABLE ? y + lh : y};
                 continue;
             }
             if (!f->style.floating) continue;
@@ -851,11 +866,13 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
             parent->base_y = baseline;
             parent->base_pass = layout_pass;
         }
+        int placed = 0;
         for (int k = line_start; k < j; k++) {
             Atom *a = &atoms[k];
             if (a->kind == AT_BREAK) continue;
             if (a->kind == AT_BOX && a->node->type == NODE_ELEMENT && (a->node->style.floating || out_of_flow(a->node))) continue;
-            int space = a->space_before && k > line_start && a->kind != AT_SPACE ? space_w(&a->node->style) : 0;
+            int space = a->space_before && placed && a->kind != AT_SPACE ? space_w(&a->node->style) : 0;
+            placed = 1;
             /* A link spanning words: stretch its underline across the space. */
             if (space && a->kind == AT_WORD && item_count > line_items && items[item_count - 1].kind == IT_TEXT &&
                 items[item_count - 1].link >= 0 && items[item_count - 1].link == link_of(a->node))

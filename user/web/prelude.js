@@ -267,18 +267,66 @@
   File.prototype.constructor = File;
   define(win, "File", File);
 
+  // A document of its own (DOMParser, document.implementation): its
+  // elements are made by the page's document but never put in it.
+  function detachedDocument(title) {
+    var root = document.createElement("html"), head = document.createElement("head"), body = document.createElement("body");
+    root.appendChild(head);
+    root.appendChild(body);
+    if (title !== undefined) {
+      var t = document.createElement("title");
+      t.textContent = String(title);
+      head.appendChild(t);
+    }
+    var make = function (name) { return function () { return document[name].apply(document, arguments); }; };
+    var doc = {
+      nodeType: 9, nodeName: "#document", documentElement: root, head: head, body: body,
+      defaultView: null, location: null, readyState: "complete", compatMode: "CSS1Compat", characterSet: "UTF-8",
+      createElement: make("createElement"), createElementNS: make("createElementNS"), createTextNode: make("createTextNode"),
+      createComment: make("createComment"), createDocumentFragment: make("createDocumentFragment"),
+      createRange: make("createRange"),
+      importNode: function (n, deep) { return document.importNode ? document.importNode(n, deep) : n.cloneNode(!!deep); },
+      adoptNode: function (n) { if (n.parentNode) n.parentNode.removeChild(n); return n; },
+      querySelector: function (s) { return root.querySelector(s); },
+      querySelectorAll: function (s) { return root.querySelectorAll(s); },
+      getElementsByTagName: function (t) { return root.getElementsByTagName(t); },
+      getElementsByClassName: function (c) { return root.getElementsByClassName(c); },
+      getElementById: function (id) {
+        var all = root.getElementsByTagName("*");
+        for (var i = 0; i < all.length; i++) if (all[i].id === String(id)) return all[i];
+        return null;
+      },
+      addEventListener: function () {}, removeEventListener: function () {},
+      hasFocus: function () { return false; }
+    };
+    var titleText = title === undefined ? "" : String(title);
+    Object.defineProperty(doc, "title", {
+      get: function () { return titleText; },
+      set: function (v) { titleText = String(v); }
+    });
+    Object.defineProperty(doc, "childNodes", { get: function () { return [root]; } });
+    Object.defineProperty(doc, "firstChild", { get: function () { return root; } });
+    doc.implementation = documentImplementation;
+    return doc;
+  }
+  var documentImplementation = {
+    createHTMLDocument: function (title) { return detachedDocument(title); },
+    createDocument: function () { return detachedDocument(); },
+    createDocumentType: function (name, publicId, systemId) {
+      return { nodeType: 10, nodeName: String(name), name: String(name), publicId: String(publicId || ""), systemId: String(systemId || "") };
+    },
+    hasFeature: function () { return true; }
+  };
+  if (win.document && !("implementation" in document)) {
+    Object.defineProperty(document, "implementation", { value: documentImplementation, configurable: true, enumerable: true });
+  }
+
   define(win, "DOMParser", function DOMParser() {
     this.parseFromString = function (text) {
-      var root = document.createElement("html"), body = document.createElement("body");
-      root.appendChild(body);
-      body.innerHTML = String(text);
-      return {
-        documentElement: root, body: body, head: null,
-        querySelector: function (s) { return root.querySelector(s); },
-        querySelectorAll: function (s) { return root.querySelectorAll(s); },
-        getElementsByTagName: function (t) { return root.getElementsByTagName(t); },
-        getElementById: function (id) { return root.querySelector("#" + id); }
-      };
+      var doc = detachedDocument(), s = String(text), m = /<title[^>]*>([^<]*)<\/title>/i.exec(s);
+      if (m) doc.title = m[1];
+      doc.body.innerHTML = s.replace(/^[\s\S]*?<body[^>]*>/i, "").replace(/<\/body>[\s\S]*$/i, "");
+      return doc;
     };
   });
 
@@ -305,6 +353,18 @@
     this.name = name;
     this.onmessage = null;
     this.postMessage = this.close = this.addEventListener = this.removeEventListener = function () {};
+  });
+
+  // ---- idle callbacks: soon, with a deadline saying how long they may take
+  define(win, "requestIdleCallback", function requestIdleCallback(callback, options) {
+    var timeout = options && options.timeout;
+    return setTimeout(function () {
+      var start = Date.now();
+      callback({
+        didTimeout: false,
+        timeRemaining: function () { return Math.max(0, 50 - (Date.now() - start)); }
+      });
+    }, timeout && timeout < 1 ? 0 : 1);
   });
 
   // ---- performance: the page's timeline (marks, measures, the navigation)

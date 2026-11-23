@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html><head><title>document.implementation</title></head>
+<body><pre id="out"></pre>
+<script>
+var lines = [];
+function log(name, got, want) {
+  var ok = JSON.stringify(got) === JSON.stringify(want);
+  lines.push((ok ? 'ok   ' : 'FAIL ') + name + (ok ? '' : ' got ' + JSON.stringify(got) + ' want ' + JSON.stringify(want)));
+}
+try {
+  var d = document.implementation.createHTMLDocument('');
+  d.body.innerHTML = '<form></form><form></form>';
+  log('jquery support test', d.body.childNodes.length, 2);
+  var base = d.createElement('base');
+  base.href = 'http://example.com/x/';
+  d.head.appendChild(base);
+  log('head', d.head.childNodes.length, 2);
+  var frag = d.createDocumentFragment();
+  frag.appendChild(d.createElement('p'));
+  log('fragment', frag.childNodes.length, 1);
+  log('not in page', document.getElementsByTagName('form').length, 0);
+  var t = document.implementation.createHTMLDocument('Hello');
+  log('title', t.title, 'Hello');
+  var p = new DOMParser().parseFromString('<html><head><title>T</title></head><body><b id="x">bold</b></body></html>', 'text/html');
+  log('DOMParser', [p.title, p.getElementById('x').textContent, p.querySelector('b').tagName], ['T', 'bold', 'B']);
+} catch (e) {
+  lines.push('FAIL threw ' + e);
+}
+document.getElementById('out').textContent = lines.join('\n');
+console.log('RESULTS\n' + lines.join('\n'));
+</script></body></html>
