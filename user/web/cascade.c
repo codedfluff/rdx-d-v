@@ -114,6 +114,200 @@ static void grid_template(Style *s, const char *v) {
     s->grid_cols = slash ? css_keep(slash + 1) : NULL;
 }
 
+/* ---------------------------------------------------------------- backgrounds, shadows, transforms */
+
+/* The next part of a value: a word, or a function call with its brackets;
+   commas and slashes come back as parts of their own. Returns its length. */
+static int value_part(const char **p, char *out, int max) {
+    const char *s = *p;
+    while (is_space(*s)) s++;
+    int n = 0, depth = 0;
+    if (*s == ',' || *s == '/') {
+        out[0] = *s;
+        out[1] = 0;
+        *p = s + 1;
+        return 1;
+    }
+    while (*s && (depth || (!is_space(*s) && *s != ',' && *s != '/'))) {
+        if (*s == '(') depth++;
+        else if (*s == ')') depth--;
+        if (n < max - 1) out[n++] = *s;
+        s++;
+        if (depth < 0) break;
+    }
+    out[n] = 0;
+    *p = s;
+    return n;
+}
+
+static unsigned char repeat_word(const char *v) {
+    while (is_space(*v)) v++;
+    if (!strncasecmp(v, "no-repeat", 9)) return 1;
+    if (!strncasecmp(v, "repeat-x", 8)) return 2;
+    if (!strncasecmp(v, "repeat-y", 8)) return 3;
+    if (!strncasecmp(v, "repeat no-repeat", 16)) return 2;
+    if (!strncasecmp(v, "no-repeat repeat", 16)) return 3;
+    return 0;
+}
+
+static int position_word(const char *w) {
+    return !strcasecmp(w, "left") || !strcasecmp(w, "right") || !strcasecmp(w, "top") || !strcasecmp(w, "bottom") ||
+           !strcasecmp(w, "center");
+}
+
+/* background: [image] [position [/ size]] [repeat] [color], layers by commas. */
+static void background_shorthand(Style *s, const char *v) {
+    char images[1024] = "", pos[128] = "", size[128] = "", part[512];
+    char layer_pos[128] = "", layer_size[128] = "";
+    int layer = 0, after_slash = 0, have_color = 0, url_layer = -1, layer_has_url = 0;
+    unsigned color = 0;
+    s->bg_repeat = 0;
+    for (const char *p = v; value_part(&p, part, sizeof(part)) > 0;) {
+        if (!strcmp(part, ",")) { /* (the placing that counts is the picture's layer's, else the first's) */
+            if ((layer_has_url && url_layer < 0) || (!layer && !layer_has_url)) {
+                strcpy(pos, layer_pos);
+                strcpy(size, layer_size);
+                if (layer_has_url) url_layer = layer;
+            }
+            layer++;
+            after_slash = layer_has_url = 0;
+            layer_pos[0] = layer_size[0] = 0;
+            continue;
+        }
+        if (!strcmp(part, "/")) {
+            after_slash = 1;
+            continue;
+        }
+        if (strstr(part, "url(") || strstr(part, "gradient(")) {
+            if (strstr(part, "url(")) layer_has_url = 1;
+            if (images[0]) strncat_safe(images, ", ", sizeof(images) - strlen(images) - 1);
+            strncat_safe(images, part, sizeof(images) - strlen(images) - 1);
+            continue;
+        }
+        if (!strncasecmp(part, "repeat", 6) || !strncasecmp(part, "no-repeat", 9) || !strncasecmp(part, "space", 5) ||
+            !strncasecmp(part, "round", 5)) {
+            if (!layer || (url_layer < 0 && !layer_has_url) || layer_has_url) s->bg_repeat = repeat_word(part);
+            continue;
+        }
+        int got = parse_color(part, &color);
+        if (got) {
+            have_color = got;
+            continue;
+        }
+        int used;
+        number100(part, &used);
+        if (after_slash && (used || !strcasecmp(part, "auto") || !strcasecmp(part, "cover") || !strcasecmp(part, "contain"))) {
+            if (layer_size[0]) strncat_safe(layer_size, " ", sizeof(layer_size) - strlen(layer_size) - 1);
+            strncat_safe(layer_size, part, sizeof(layer_size) - strlen(layer_size) - 1);
+        } else if (used || position_word(part)) {
+            if (layer_pos[0]) strncat_safe(layer_pos, " ", sizeof(layer_pos) - strlen(layer_pos) - 1);
+            strncat_safe(layer_pos, part, sizeof(layer_pos) - strlen(layer_pos) - 1);
+        }
+    }
+    if ((layer_has_url && url_layer < 0) || (!layer && !layer_has_url)) {
+        strcpy(pos, layer_pos);
+        strcpy(size, layer_size);
+    }
+    s->bg_image = images[0] ? css_keep(images) : NULL;
+    s->bg_pos = pos[0] ? css_keep(pos) : NULL;
+    s->bg_size = size[0] ? css_keep(size) : NULL;
+    if (have_color == 1) {
+        s->background = color;
+        s->has_background = 1;
+    } else {
+        s->background = BORDER_INVISIBLE;
+        s->has_background = s->bg_image || s->has_shadow;
+    }
+}
+
+/* box-shadow: the first one not drawn inside (x y [blur [spread]] [color]). */
+static void box_shadow(Style *s, const char *v) {
+    char part[256];
+    s->has_shadow = 0;
+    if (word_is(v, "none")) return;
+    int lens[4], count = 0, inset = 0, got_color = 0;
+    unsigned color = s->color;
+    for (const char *p = v;;) {
+        int n = value_part(&p, part, sizeof(part));
+        if (!n || !strcmp(part, ",")) {
+            if (!inset && count >= 2) {
+                for (int i = 0; i < 4; i++) s->shadow[i] = (short)(i < count ? lens[i] : 0);
+                if (s->shadow[2] < 0) s->shadow[2] = 0;
+                s->shadow_color = got_color ? color : (s->color & 0xFFFFFF) | 0x80000000u;
+                s->has_shadow = 1;
+                if (!s->has_background) s->background = BORDER_INVISIBLE;
+                s->has_background = 1;
+                return;
+            }
+            if (!n) return;
+            count = inset = got_color = 0;
+            continue;
+        }
+        if (!strcasecmp(part, "inset")) {
+            inset = 1;
+            continue;
+        }
+        unsigned c;
+        if (parse_color(part, &c)) {
+            color = c;
+            got_color = 1;
+            continue;
+        }
+        int ok;
+        Len l = parse_len(part, s->size, &ok);
+        if (ok && l.unit == 'p' && count < 4) lens[count++] = l.value;
+    }
+}
+
+/* transform: the translation in it (translate, translateX/Y, translate3d,
+   matrix); rotations and scaling are not drawn. */
+static void translation(Style *s, const char *v, int font) {
+    s->translated = 0;
+    s->tx = s->ty = (Len){0, 'p', 0};
+    char part[256];
+    for (const char *p = v; value_part(&p, part, sizeof(part)) > 0;) {
+        const char *open = strchr(part, '(');
+        if (!open) continue;
+        char args[4][64];
+        int n = 0;
+        const char *a = open + 1;
+        while (n < 4 && *a && *a != ')') {
+            while (is_space(*a) || *a == ',') a++;
+            int k = 0, depth = 0;
+            while (*a && (depth || (*a != ',' && *a != ')' && !(is_space(*a) && !depth)))) {
+                if (*a == '(') depth++;
+                if (*a == ')') depth--;
+                if (k < 63) args[n][k++] = *a;
+                a++;
+            }
+            args[n][k] = 0;
+            if (k) n++;
+            while (is_space(*a)) a++;
+            if (*a == ',') a++;
+        }
+        int ok;
+        if (!strncasecmp(part, "translateX(", 11) && n >= 1) s->tx = parse_len(args[0], font, &ok);
+        else if (!strncasecmp(part, "translateY(", 11) && n >= 1) s->ty = parse_len(args[0], font, &ok);
+        else if ((!strncasecmp(part, "translate(", 10) || !strncasecmp(part, "translate3d(", 12)) && n >= 1) {
+            s->tx = parse_len(args[0], font, &ok);
+            if (n >= 2) s->ty = parse_len(args[1], font, &ok);
+        } else if (!strncasecmp(part, "matrix(", 7)) {
+            if (n < 4) continue;
+            /* matrix(a, b, c, d, e, f): e and f move it */
+            const char *e = open + 1;
+            int commas = 0;
+            while (*e && commas < 4) commas += *e++ == ',';
+            int used;
+            int ex = number100(e, &used);
+            while (*e && *e != ',') e++;
+            int ey = *e ? number100(e + 1 + (e[1] == ' '), &used) : 0;
+            s->tx = (Len){ex / 100, 'p', 0};
+            s->ty = (Len){ey / 100, 'p', 0};
+        } else continue;
+        s->translated = 1;
+    }
+}
+
 /* A corner's radius: px, or a percentage (stored negative). */
 static short corner_len(const char *v, int font) {
     int ok;
@@ -255,18 +449,29 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         }
         return;
     case 'b':
-        if (!strcmp(name, "background-color") || !strcmp(name, "background")) {
-            char parts[8][64];
-            int n = split_value(v, parts, 8);
-            for (int i = 0; i < n; i++) {
-                int got = parse_color(parts[i], &color);
-                if (got == 1) {
-                    s->background = color;
-                    s->has_background = 1;
-                    break;
-                }
-                if (got == 2 || !strcasecmp_word(parts[i], "none")) s->has_background = 0;
+        if (!strcmp(name, "background-color")) {
+            int got = parse_color(v, &color);
+            if (got == 1) {
+                s->background = color;
+                s->has_background = 1;
+            } else if (got == 2 || word_is(v, "none")) {
+                s->background = BORDER_INVISIBLE;
+                s->has_background = s->bg_image || s->has_shadow;
             }
+        } else if (!strcmp(name, "background")) {
+            background_shorthand(s, v);
+        } else if (!strcmp(name, "background-image")) {
+            s->bg_image = strstr(v, "url(") || strstr(v, "gradient(") ? css_keep(v) : NULL;
+            if (s->bg_image && !s->has_background) s->background = BORDER_INVISIBLE;
+            s->has_background = s->has_background || s->bg_image || s->has_shadow;
+        } else if (!strcmp(name, "background-size")) {
+            s->bg_size = css_keep(v);
+        } else if (!strcmp(name, "background-position")) {
+            s->bg_pos = css_keep(v);
+        } else if (!strcmp(name, "background-repeat")) {
+            s->bg_repeat = repeat_word(v);
+        } else if (!strcmp(name, "box-shadow")) {
+            box_shadow(s, v);
         } else if (!strcmp(name, "border")) {
             for (int i = 0; i < 4; i++) border_part(b, i, v, font);
         } else if (!strncmp(name, "border-", 7)) {
@@ -649,6 +854,8 @@ static void apply(Style *s, Borders *b, const char *name, const char *v, int par
         } else if (!strcmp(name, "text-indent")) {
             Len l = parse_len(v, font, &ok);
             if (ok) s->indent = l.unit == 'p' ? l.value : l.unit == '%' ? l.value * VIEW_W / 10000 : 0;
+        } else if (!strcmp(name, "transform")) {
+            translation(s, v, font);
         } else if (!strcmp(name, "text-transform")) {
             s->upper = word_is(v, "uppercase");
         } else if (!strcmp(name, "top")) {

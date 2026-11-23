@@ -64,6 +64,14 @@ static size_t web_strcspn(const char *s, const char *reject) {
 #define memchr web_memchr
 #define strcspn web_strcspn
 
+static int web_strcasecmp(const char *a, const char *b) {
+    for (;; a++, b++) {
+        int x = tolower((unsigned char)*a), y = tolower((unsigned char)*b);
+        if (x != y || !x) return x - y;
+    }
+}
+#define strcasecmp web_strcasecmp
+
 static void strncat_safe(char *dst, const char *src, size_t most) {
     size_t at = strlen(dst);
     for (size_t i = 0; src[i] && i < most; i++) dst[at++] = src[i];
@@ -120,6 +128,16 @@ typedef struct {
     const char *grid_area;
     unsigned char justify_items, justify_self;
     unsigned char opacity;          /* its own (255 opaque) */
+    /* background pictures: the layers as written (url() and gradients), and how they are placed */
+    const char *bg_image, *bg_size, *bg_pos;
+    unsigned char bg_repeat;        /* 0 repeat, 1 no-repeat, 2 repeat-x, 3 repeat-y */
+    /* box-shadow (the first outer one) */
+    short shadow[4];                /* x, y, blur, spread */
+    unsigned shadow_color;
+    unsigned char has_shadow;
+    /* transform: only its translation */
+    Len tx, ty;
+    unsigned char translated;
     short radius[8];                /* corners (top-left, top-right, bottom-right, bottom-left), across then down:
                                        px, or -percent */
     int z_index;
@@ -148,6 +166,8 @@ struct Node {
     void *img;               /* an image once loaded */
     int img_state;           /* 0 not tried, 1 loaded, 2 failed */
     int img_w, img_h;        /* natural size once loaded */
+    void *bg_img;            /* its background picture (shared: the page's picture cache owns it) */
+    signed char bg_state;    /* 0 not tried, 1 loaded, 2 failed */
     /* form controls */
     char *value;
     int checked, selected_index;
@@ -215,6 +235,8 @@ static void insert_before(Node *parent, Node *child, Node *before) {
     before->prev = child;
 }
 
+static void scaled_forget(const image *img); /* (paint.c) */
+
 static void free_tree(Node *n) {
     if (!n) return;
     for (Node *c = n->first; c;) {
@@ -228,6 +250,7 @@ static void free_tree(Node *n) {
     free(n->css_vars);
     free(n->svg_css);
     if (n->img) {
+        scaled_forget((image *)n->img);
         image_free((image *)n->img);
         free(n->img);
     }

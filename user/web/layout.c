@@ -2259,6 +2259,11 @@ static void layout_box(Node *n, int x, int y, int width) {
             }
         }
     }
+    /* transform: translate(): drawn moved, by lengths or parts of its own size */
+    if (s->translated) {
+        int dx = resolve(s->tx, n->w, 0), dy = resolve(s->ty, n->h, 0);
+        if (dx || dy) shift_subtree(n, dx, dy);
+    }
     /* Relative positioning: the box moves, the space it took stays. */
     if (s->position == P_RELATIVE) {
         int dx = resolve(s->offset[3], cw, AUTO), dy = resolve(s->offset[0], 0, AUTO);

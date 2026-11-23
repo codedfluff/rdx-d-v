@@ -68,6 +68,183 @@ static int scroll; /* (each frame scrolls on its own) */
 
 /* ================================================================ loading a page */
 
+/* Pictures for CSS backgrounds, by address (many elements share one). */
+static struct {
+    char *url;
+    image *img;
+} bg_cache[96];
+static int bg_cache_count;
+
+static void bg_cache_clear(void) {
+    for (int i = 0; i < bg_cache_count; i++) {
+        if (bg_cache[i].img) {
+            scaled_forget(bg_cache[i].img);
+            image_free(bg_cache[i].img);
+            free(bg_cache[i].img);
+        }
+        free(bg_cache[i].url);
+    }
+    bg_cache_count = 0;
+}
+
+/* data:[type][;base64],payload -> its bytes (malloc'd), or NULL. */
+static char *data_url(const char *url, size_t *len, char *type, int type_max) {
+    const char *comma = strchr(url, ',');
+    if (strncasecmp(url, "data:", 5) || !comma) return NULL;
+    int t = 0, base64 = 0;
+    for (const char *p = url + 5; p < comma; p++) {
+        if (*p == ';') {
+            base64 |= !strncasecmp(p, ";base64", 7);
+            break;
+        }
+        if (t < type_max - 1) type[t++] = *p;
+    }
+    type[t] = 0;
+    for (const char *p = url + 5; p < comma; p++) base64 |= !strncasecmp(p, ";base64", 7);
+    size_t in = strlen(comma + 1);
+    char *out = malloc(in + 1);
+    if (!out) return NULL;
+    size_t n = 0;
+    const char *p = comma + 1;
+    if (base64) {
+        unsigned bits = 0;
+        int have = 0;
+        for (; *p; p++) {
+            int c = *p, v = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26 : c >= '0' && c <= '9' ? c - '0' + 52
+                          : c == '+' || c == '-' ? 62 : c == '/' || c == '_' ? 63 : -1;
+            if (c == '%' && p[1] == '3' && (p[2] == 'D' || p[2] == 'd')) break; /* %3D: = */
+            if (v < 0) continue;
+            bits = bits << 6 | (unsigned)v;
+            have += 6;
+            if (have >= 8) {
+                have -= 8;
+                out[n++] = (char)(bits >> have & 255);
+            }
+        }
+    } else {
+        for (; *p; p++) {
+            if (*p == '%' && hex_digit(p[1]) >= 0 && hex_digit(p[2]) >= 0) {
+                out[n++] = (char)(hex_digit(p[1]) * 16 + hex_digit(p[2]));
+                p += 2;
+            } else out[n++] = *p;
+        }
+    }
+    out[n] = 0;
+    *len = n;
+    return out;
+}
+
+/* The first url(...) in a value, as an address. */
+static int css_url(const char *v, char *out, int max) {
+    const char *u = strstr(v, "url(");
+    if (!u) return 0;
+    u += 4;
+    while (is_space(*u)) u++;
+    char quote = *u == '"' || *u == '\'' ? *u++ : 0;
+    int n = 0;
+    while (*u && (quote ? *u != quote : (*u != ')' && !is_space(*u))) && n < max - 1) out[n++] = *u++;
+    out[n] = 0;
+    return n > 0;
+}
+
+/* A picture from bytes: SVG drawn at its own size, else PNG / JPEG / GIF. */
+static image *picture_from(const char *body, size_t len, const char *type) {
+    image *img = malloc(sizeof(image));
+    if (!img || len > MAX_IMAGE_BYTES) {
+        free(img);
+        return NULL;
+    }
+    char why[96];
+    int nw, nh;
+    if (looks_like_svg(body, len, type)) {
+        if (svg_render_text(body, (int)len, 0, 0, 0x000000, img, &nw, &nh) == 0) {
+            int big = nw > nh ? nw : nh;
+            if (big > 0 && big < 256) { /* a small drawing: again at 256 px, so it stays sharp when enlarged */
+                image sharp;
+                if (svg_render_text(body, (int)len, nw * 256 / big, nh * 256 / big, 0x000000, &sharp, &nw, &nh) == 0) {
+                    image_free(img);
+                    *img = sharp;
+                }
+            }
+            return img;
+        }
+    } else if (image_decode((const unsigned char *)body, len, img, why) == 0) {
+        return img;
+    }
+    free(img);
+    return NULL;
+}
+
+static image *bg_picture(const char *url, PrefetchSet *pictures) {
+    for (int i = 0; i < bg_cache_count; i++)
+        if (!strcmp(bg_cache[i].url, url)) return bg_cache[i].img;
+    image *img = NULL;
+    if (!strncasecmp(url, "data:", 5)) {
+        size_t len;
+        char type[64];
+        char *body = data_url(url, &len, type, sizeof(type));
+        if (body) img = picture_from(body, len, type);
+        free(body);
+    } else {
+        Fetched f;
+        char error[400], address[1024];
+        strncpy(address, url, sizeof(address) - 1);
+        address[sizeof(address) - 1] = 0;
+        int taken = prefetch_take(pictures, address, &f);
+        if (taken == 1 || (taken == 0 && fetch_url(address, NULL, &f, error) == 0)) {
+            img = picture_from(f.body, f.len, f.type);
+            free(f.body);
+        }
+    }
+    if (bg_cache_count < 96) {
+        bg_cache[bg_cache_count].url = copy_of(url, (int)strlen(url));
+        bg_cache[bg_cache_count++].img = img;
+    } else if (img) { /* (no room to keep it: not used) */
+        image_free(img);
+        free(img);
+        img = NULL;
+    }
+    return img;
+}
+
+/* A linked stylesheet's url(...)s made absolute (they are relative to the
+   sheet, not the page). Returns a new buffer, or NULL to keep the old. */
+static char *css_absolute_urls(const char *css, size_t len, const char *sheet_url, size_t *out_len) {
+    int count = 0;
+    for (size_t i = 0; i + 4 <= len; i++) count += !strncasecmp(css + i, "url(", 4);
+    if (!count) return NULL;
+    size_t cap = len + (size_t)count * 1100 + 1;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    size_t n = 0;
+    for (size_t i = 0; i < len;) {
+        if (i + 4 <= len && !strncasecmp(css + i, "url(", 4)) {
+            size_t j = i + 4;
+            while (j < len && is_space(css[j])) j++;
+            char quote = j < len && (css[j] == '"' || css[j] == '\'') ? css[j++] : 0;
+            char rel[1024];
+            int k = 0;
+            while (j < len && (quote ? css[j] != quote : css[j] != ')') && k < 1023) rel[k++] = css[j++];
+            rel[k] = 0;
+            while (k > 0 && is_space(rel[k - 1])) rel[--k] = 0;
+            if (quote && j < len) j++;
+            char abs[1100];
+            if (!k || !strncasecmp(rel, "data:", 5) || rel[0] == '#') strcpy(abs, rel);
+            else resolve_url(sheet_url, rel, abs, sizeof(abs));
+            memcpy(out + n, "url(\"", 5);
+            n += 5;
+            for (int q = 0; abs[q]; q++) out[n++] = abs[q] == '"' ? '\'' : abs[q];
+            out[n++] = '"';
+            i = j; /* (the ")" is copied next) */
+            continue;
+        }
+        out[n++] = css[i++];
+    }
+    out[n] = 0;
+    *out_len = n;
+    return out;
+}
+
 static void free_page(void) {
     for (int i = 1; i < MAX_REALMS; i++) /* its frames and workers go with it */
         if (realm_list[i].used && realm_list[i].parent == realm_list[realm_now].id) realm_destroy(i);
@@ -80,6 +257,8 @@ static void free_page(void) {
     for (int i = 0; i < css_buffer_count; i++) free(css_buffers[i]);
     css_buffer_count = 0;
     free_rules();
+    bg_cache_clear();
+    scaled_forget(NULL);
     indexed_count = -1;
     page_title[0] = 0;
 }
@@ -185,6 +364,13 @@ static void load_stylesheets(void) {
             int taken = prefetch_take(sheets, url, &f);
             if (taken == 1 || (taken == 0 && fetch_url(url, NULL, &f, error) == 0)) {
                 if (f.len > 1024 * 1024) f.len = 1024 * 1024;
+                size_t abs_len;
+                char *abs = css_absolute_urls(f.body, f.len, url, &abs_len);
+                if (abs) {
+                    free(f.body);
+                    f.body = abs;
+                    f.len = abs_len;
+                }
                 parse_css(f.body, (int)f.len, 1);
                 keep_css(f.body);
             }
@@ -379,13 +565,22 @@ static int load_images(int (*each)(void)) {
     static char src[1024], url[1024];
     /* the pictures still to get, fetched several at once */
     int wanted = 0;
-    for (Node *n = document; n; n = next_in_tree(n, document)) wanted += n->type == NODE_ELEMENT && !n->img_state && is(n->tag, "img");
+    for (Node *n = document; n; n = next_in_tree(n, document)) {
+        wanted += n->type == NODE_ELEMENT && !n->img_state && is(n->tag, "img");
+        wanted += n->type == NODE_ELEMENT && !n->bg_state && n->style.bg_image && strstr(n->style.bg_image, "url(") != NULL;
+    }
     PrefetchSet *pictures = wanted > 1 ? prefetch_begin(wanted < MAX_IMAGES ? wanted : MAX_IMAGES) : NULL;
     for (Node *n = document; n && pictures; n = next_in_tree(n, document)) {
         if (n->type != NODE_ELEMENT || n->img_state || !is(n->tag, "img") || n->style.display == D_NONE) continue;
         if ((!attr(n, "src", src, sizeof(src)) || !src[0] || !strncasecmp(src, "data:", 5)) &&
             (!attr(n, "data-src", src, sizeof(src)) || !src[0]))
             continue;
+        resolve_url(base_url, src, url, sizeof(url));
+        prefetch_add(pictures, url);
+    }
+    for (Node *n = document; n && pictures; n = next_in_tree(n, document)) {
+        if (n->type != NODE_ELEMENT || n->bg_state || !n->style.bg_image || n->style.display == D_NONE) continue;
+        if (!css_url(n->style.bg_image, src, sizeof(src)) || !strncasecmp(src, "data:", 5)) continue;
         resolve_url(base_url, src, url, sizeof(url));
         prefetch_add(pictures, url);
     }
@@ -403,6 +598,27 @@ static int load_images_from(int (*each)(void), PrefetchSet *pictures, unsigned p
     int loaded = *loaded_count;
     static char src[1024], url[1024], error[400];
     for (Node *n = document; n && loaded < MAX_IMAGES; n = next_in_tree(n, document)) {
+        if (n->type == NODE_ELEMENT && !n->bg_state && n->style.bg_image && n->style.display != D_NONE && strstr(n->style.bg_image, "url(")) {
+            n->bg_state = 2; /* a CSS background picture */
+            if (css_url(n->style.bg_image, src, sizeof(src))) {
+                if (strncasecmp(src, "data:", 5)) resolve_url(base_url, src, url, sizeof(url));
+                else strncpy(url, src, sizeof(url) - 1);
+                url[sizeof(url) - 1] = 0;
+                image *img = bg_picture(url, pictures);
+                if (img) {
+                    n->bg_img = img;
+                    n->bg_state = 1;
+                }
+                loaded++;
+                if (each && each()) return 1;
+                if (page != page_epoch) return 1;
+                if (dom != dom_epoch) {
+                    dom = dom_epoch;
+                    n = document;
+                    continue;
+                }
+            }
+        }
         if (n->type != NODE_ELEMENT || n->img_state) continue;
         if (is(n->tag, "svg")) { /* a drawing in the page: drawn at the size it was laid out */
             n->img_state = 2;
@@ -420,6 +636,24 @@ static int load_images_from(int (*each)(void), PrefetchSet *pictures, unsigned p
         }
         if (!is(n->tag, "img")) continue;
         if (n->style.display == D_NONE) continue;
+        if (attr(n, "src", src, sizeof(src)) && !strncasecmp(src, "data:", 5) && (!attr(n, "data-src", url, sizeof(url)) || !url[0])) {
+            static char data[65536]; /* a picture written into the page */
+            n->img_state = 2;
+            if (attr(n, "src", data, sizeof(data))) {
+                size_t len;
+                char type[64];
+                char *body = data_url(data, &len, type, sizeof(type));
+                image *img = body ? picture_from(body, len, type) : NULL;
+                free(body);
+                if (img) {
+                    n->img = img;
+                    n->img_w = img->width;
+                    n->img_h = img->height;
+                    n->img_state = 1;
+                }
+            }
+            continue;
+        }
         if ((!attr(n, "src", src, sizeof(src)) || !src[0] || !strncasecmp(src, "data:", 5)) &&
             (!attr(n, "data-src", src, sizeof(src)) || !src[0])) {
             n->img_state = 2;

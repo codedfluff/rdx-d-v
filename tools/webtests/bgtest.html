@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Backgrounds test</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 16px; background: #fafafa; }
+.row { display: flex; gap: 16px; margin-bottom: 16px; align-items: flex-start; }
+.box { width: 140px; height: 90px; border-radius: 10px; color: #fff; padding: 8px; box-sizing: border-box; }
+.lin { background: linear-gradient(135deg, #ff7e5f, #feb47b); }
+.lin2 { background: linear-gradient(to right, #00c6ff 0%, #0072ff 100%); }
+.rad { background: radial-gradient(circle at center, #fff 0%, #4ca1af 70%); color: #123; }
+.stops { background: linear-gradient(#e66465, #9198e5 50%, transparent); color: #000; }
+.photo { width: 200px; height: 120px; background: url(photo.jpg) center / cover no-repeat; border-radius: 8px; }
+.icon { width: 32px; height: 32px; background: url(sprite.png) no-repeat; display: inline-block; }
+.i2 { background-position: -32px 0; } .i3 { background-position: 0 -32px; } .i4 { background-position: -32px -32px; }
+.tile { width: 200px; height: 60px; background-image: url(sprite.png); background-size: 20px 20px; }
+.card { background: #fff; width: 180px; padding: 12px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+.card2 { background: #fff; width: 180px; padding: 12px; box-shadow: 2px 2px 0 #333; }
+.stage { position: relative; height: 100px; background: #dde; }
+.centered { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #333; color: #fff; padding: 6px 10px; border-radius: 4px; }
+.data { width: 40px; height: 40px; background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Ccircle cx='5' cy='5' r='4' fill='%23e33'/%3E%3C/svg%3E") center / contain no-repeat; }
+.overlay { width: 200px; height: 80px; background: linear-gradient(rgba(0,0,0,0.6), rgba(0,0,0,0)), url(photo.jpg) center / cover; color: #fff; padding: 8px; box-sizing: border-box; }
+</style></head><body>
+<div class="row"><div class="box lin">135deg</div><div class="box lin2">to right</div><div class="box rad">radial</div><div class="box stops">stops</div></div>
+<div class="row"><div class="photo"></div><div><span class="icon"></span><span class="icon i2"></span><span class="icon i3"></span><span class="icon i4"></span></div><div class="tile"></div></div>
+<div class="row"><div class="card">Soft shadow card</div><div class="card2">Hard shadow</div><div class="data"></div><div class="overlay">Text over photo</div></div>
+<div class="stage"><div class="centered">Centered with translate</div></div>
+<img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24'%3E%3Crect width='24' height='24' rx='4' fill='%2348c'/%3E%3C/svg%3E" alt="d">
+<p>BG TEST END</p>
+</body></html>

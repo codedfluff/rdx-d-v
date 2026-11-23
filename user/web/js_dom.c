@@ -332,6 +332,7 @@ static void set_attribute(Node *n, const char *name, const char *value) {
     free(v);
     if (is(name, "src") && is(n->tag, "img")) {
         if (n->img) {
+            scaled_forget((image *)n->img);
             image_free((image *)n->img);
             free(n->img);
             n->img = NULL;
