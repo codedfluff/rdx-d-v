@@ -1072,6 +1072,12 @@ static int dump(const char *address) {
     print_page_text();
     if (getenv("BROWSER_BOXES") && body_element) { /* every element's box, to compare layouts (tools/layoutdiff.py) */
         int k = 0;
+        if (body_element->parent && body_element->parent->type == NODE_ELEMENT) { /* (and the classes scripts gave <html>) */
+            static char html_cls[2048];
+            html_cls[0] = 0;
+            attr(body_element->parent, "class", html_cls, sizeof(html_cls));
+            printf("[html] class=%s\n", html_cls);
+        }
         for (Node *n = body_element; n; n = next_in_tree(n, body_element)) {
             if (n->type != NODE_ELEMENT || n->tag[0] == '#') continue;
             int shown = 1;

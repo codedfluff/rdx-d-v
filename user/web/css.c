@@ -254,6 +254,9 @@ static Len parse_len(const char *v, int font, int *ok) {
     } else {
         l.value = n / 100; /* a bare number */
     }
+    /* under a pixel but not nothing (padding-top: 0.05px still stops margins
+       collapsing through): px marks it, as px is only used by 'c' lengths */
+    if (l.unit == 'p' && !l.value && n > 0) l.px = 1;
     return l;
 }
 

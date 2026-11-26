@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html><head><title>header start</title>
+<style>
+body { font: 16px sans-serif; margin: 0; }
+.mw-header { display: flex; flex-wrap: wrap; align-items: center; padding: 8px 24px; gap: 16px; min-height: 3.125rem; box-sizing: border-box; }
+.mw-header .vector-header-start { gap: 20px; }
+.mw-header .vector-header-start, .mw-header .vector-header-end { display: flex; align-items: center; }
+.mw-header .vector-header-end { flex-grow: 1; background: #eee; }
+.vector-dropdown { position: relative; }
+.vector-button-flush-left { margin-left: -12px; }
+.vector-button-flush-right { margin-right: -12px; }
+.cb { position: absolute; top: 0; left: 0; width: 100%; height: 100%; margin: 0; opacity: 0; }
+.lbl { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; min-width: 44px; box-sizing: border-box; overflow: hidden; }
+.lbl span + span { display: block; position: absolute; width: 1px; height: 1px; overflow: hidden; }
+.icon { display: inline-block; width: 20px; height: 20px; background: #222; }
+.content { position: absolute; top: 100%; left: -9999px; height: 0; overflow: hidden; }
+.mw-logo { display: flex; height: 100%; align-items: center; }
+.mw-logo-icon { float: left; margin-right: 10px; display: none; width: 3.125em; height: 3.125em; }
+.mw-logo-container { float: left; }
+.mw-logo-wordmark { display: block; margin: 0 auto; background: #9cf; }
+.mw-logo-tagline { display: block; margin: 5px auto 0; background: #fc9; }
+</style></head>
+<body>
+<header class="mw-header">
+  <div class="vector-header-start" id="start">
+    <nav class="landmark" id="nav">
+<div id="dd" class="vector-dropdown vector-button-flush-left vector-button-flush-right">
+	<input type="checkbox" class="cb">
+	<label class="lbl"><span class="icon"></span>
+
+<span>Main menu</span>
+	</label>
+	<div class="content"><div>menu items</div></div>
+</div>
+    </nav>
+<a href="#" class="mw-logo" id="logo">
+	<img class="mw-logo-icon" src="sprite.png" alt="" height="50" width="50">
+	<span class="mw-logo-container" id="lc">
+		<img class="mw-logo-wordmark" alt="Wikipedia" src="sprite.png" style="width: 8.75em; height: 1.375em;">
+		<img class="mw-logo-tagline" alt="The Free Encyclopedia" src="sprite.png" width="140" height="11" style="width: 8.75em; height: 0.6875em;">
+	</span>
+</a>
+  </div>
+  <div class="vector-header-end" id="end">end</div>
+</header>
+</body></html>

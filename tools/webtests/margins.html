@@ -19,5 +19,7 @@ p { margin: 12px 0; }
 <p>after an empty block (30 + 12 collapse to 30)</p>
 <div class="flow"><p>overflow hidden: a new formatting context</p></div>
 <div><div><p>nested p, margins collapse through two divs</p></div></div>
+<div id="sliver" style="padding-top:0.05px;background:#eef"><p style="margin-top:24px">padding-top 0.05px: the margin stays inside</p></div>
+<div style="padding-top:0.05px;background:#efe"><div id="hoisted"><div style="margin:24px 0"></div><p style="margin:0">an empty first block's margin, counted once</p></div></div>
 <p>MARGINS END</p>
 </body></html>

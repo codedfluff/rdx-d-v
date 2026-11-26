@@ -169,6 +169,12 @@ static void natural_size(Node *n, int *w, int *h) {
         } else if (n->img_state == 2 && attr(n, "alt", v, sizeof(v)) && v[0]) {
             *w = text_w(&n->style, v, (int)strlen(v)) + 4; /* a picture that failed: its description instead */
             *h = line_metrics(&n->style, NULL);
+        } else if (n->img_state != 2) { /* not here yet: its width and height attributes give its shape (as browsers do) */
+            char hv[32];
+            if (attr(n, "width", v, sizeof(v)) && attr(n, "height", hv, sizeof(hv)) && atoi(v) > 0 && atoi(hv) > 0) {
+                *w = atoi(v);
+                *h = atoi(hv);
+            }
         }
         return;
     }
@@ -360,7 +366,7 @@ static void intrinsic(Node *n, int *mn, int *mx) {
     } else {
         Style *s = &n->style;
         int fixed = s->width.unit == 'p' ? s->width.value + (s->box_sizing ? 0 : frame_h(n, 0)) : -1;
-        int run_mx = 0, run_mn = 0;
+        int run_mx = 0, run_mn = 0, ws_pending = 0;
         int row = n->style.display == D_FLEX || n->style.display == D_INLINE_FLEX ? !s->flex_dir : 0;
         int column = (n->style.display == D_FLEX || n->style.display == D_INLINE_FLEX) && s->flex_dir;
         int table_row = n->style.display == D_TABLE_ROW;
@@ -378,11 +384,22 @@ static void intrinsic(Node *n, int *mn, int *mx) {
             if (c->type == NODE_ELEMENT && is(c->tag, "br")) {
                 if (run_mx > *mx) *mx = run_mx;
                 run_mx = 0;
+                ws_pending = 0;
                 continue;
+            }
+            if ((row || column) && c->type == NODE_TEXT && !c->style.pre) { /* (only spaces: not a flex item) */
+                int blank = 1;
+                for (int i = 0; blank && i < c->text_len; i++) blank = is_space(c->text[i]);
+                if (blank) continue;
             }
             int cmn, cmx;
             intrinsic(c, &cmn, &cmx);
             if (row || table_row) {
+                if (row && c->type == NODE_ELEMENT) { /* (a flex item's side margins are part of its size) */
+                    int sides = margin(c, 1, 0) + margin(c, 3, 0);
+                    cmx += sides;
+                    cmn += sides;
+                }
                 *mx += cmx;
                 *mn += row && s->flex_wrap ? 0 : cmn;
                 if (row && s->flex_wrap && cmn > *mn) *mn = cmn;
@@ -391,12 +408,22 @@ static void intrinsic(Node *n, int *mn, int *mx) {
                 run_mx += cmx + margin(c, 1, 0) + margin(c, 3, 0);
                 if (cmn + margin(c, 1, 0) + margin(c, 3, 0) > run_mn) run_mn = cmn + margin(c, 1, 0) + margin(c, 3, 0);
             } else if (is_inline_level(c) && !column) {
+                int blank = c->type == NODE_TEXT && !c->style.pre;
+                for (int i = 0; blank && i < c->text_len; i++) blank = is_space(c->text[i]);
+                if (blank) { /* only spaces: one space, if more follows on the line */
+                    if (run_mx && c->text_len) ws_pending = space_w(&c->style);
+                    continue;
+                }
                 int sides = c->type == NODE_ELEMENT && !is_replaced(c) ? margin(c, 1, 0) + margin(c, 3, 0) : 0; /* (replaced: included) */
-                run_mx += cmx + sides + (c->type == NODE_TEXT && run_mx && c->text_len && is_space(c->text[0]) ? space_w(&c->style) : 0);
+                int lead = c->type == NODE_TEXT && run_mx && c->text_len && is_space(c->text[0]) ? space_w(&c->style) : 0;
+                if (run_mx && ws_pending > lead) lead = ws_pending;
+                ws_pending = 0;
+                run_mx += cmx + sides + lead;
                 if (cmn + sides > run_mn) run_mn = cmn + sides;
             } else {
                 if (run_mx > *mx) *mx = run_mx;
                 run_mx = 0;
+                ws_pending = 0;
                 int extra = c->type == NODE_ELEMENT ? margin(c, 1, 0) + margin(c, 3, 0) : 0;
                 if (cmx + extra > *mx) *mx = cmx + extra;
                 if (cmn + extra > *mn) *mn = cmn + extra;
@@ -419,6 +446,11 @@ static void intrinsic(Node *n, int *mn, int *mx) {
         }
         int maxw = s->max_width.unit == 'p' ? s->max_width.value : -1;
         if (maxw >= 0 && *mx > maxw) *mx = maxw > *mn ? maxw : *mn;
+        if (s->min_width.unit == 'p') { /* (min-width wins over both) */
+            int minw = s->min_width.value + (s->box_sizing ? 0 : frame_h(n, 0));
+            if (*mn < minw) *mn = minw;
+            if (*mx < minw) *mx = minw;
+        }
     }
     if (*mn > *mx) *mx = *mn;
     n->min_content = *mn;
@@ -531,7 +563,9 @@ static int inline_baseline(Node *n) {
         if (is(n->tag, "textarea")) inner = a + d;
         return n->y + n->style.border[0] + pad(n, 0, 0) + (inner - a - d) / 2 + a;
     }
-    if (n->style.overflow_hidden) return -1;
+    /* (overflow hidden puts an inline-block's baseline at its bottom; a flex
+       box's is still its first item's) */
+    if (n->style.overflow_hidden && n->style.display != D_FLEX && n->style.display != D_INLINE_FLEX) return -1;
     if (n->style.display == D_FLEX || n->style.display == D_INLINE_FLEX) { /* its first item's (or that item's bottom) */
         for (Node *c = n->first; c; c = c->next) {
             if (c->type == NODE_TEXT) {
@@ -809,10 +843,10 @@ static int layout_lines(Node *parent, Node *from, Node *to, int left, int right,
             if (a->kind == AT_BOX && a->node->type == NODE_ELEMENT && (a->node->style.floating || out_of_flow(a->node))) continue;
             in_flow = 1;
             int space = a->space_before && seen && a->kind != AT_SPACE ? space_w(&a->node->style) : 0;
-            seen = 1;
             int fits = width + space + a->w <= r - l;
             int may_wrap = !nowrap && !(a->kind == AT_WORD && a->node->style.nowrap);
-            if (!fits && j > line_start && may_wrap) break;
+            if (!fits && seen && may_wrap) break; /* (wraps only after something in the flow: not after a float or positioned box) */
+            seen = 1;
             width += space + a->w;
             if (a->kind != AT_SPACE) {
                 int special, up = atom_up(a, ps, &special);
@@ -1012,8 +1046,11 @@ static int margins_meet(Node *n, int bottom) {
         int pd = n->parent->style.display;
         if (pd == D_FLEX || pd == D_INLINE_FLEX || pd == D_GRID || pd == D_INLINE_GRID) return 0;
     }
-    if (bottom) return !s->border[2] && !pad(n, 2, 0) && (s->height.unit == 'a' || s->height.unit == 'n') && s->min_height.unit != 'p';
-    return !s->border[0] && !pad(n, 0, 0);
+    /* (a sliver of padding, under a pixel, keeps them apart too) */
+    if (bottom)
+        return !s->border[2] && !pad(n, 2, 0) && !(s->padding[2].unit == 'p' && s->padding[2].px) &&
+               (s->height.unit == 'a' || s->height.unit == 'n') && s->min_height.unit != 'p';
+    return !s->border[0] && !pad(n, 0, 0) && !(s->padding[0].unit == 'p' && s->padding[0].px);
 }
 
 /* The first child that is a block in the flow (NULL if text or an inline
@@ -1122,9 +1159,12 @@ static int layout_flow(Node *n, int left, int top, int width) {
         /* its bottom margin, with its last child's if they meet */
         int mb = margin(c, 2, width);
         if (margins_meet(c, 1)) mb = combine_margins(mb, c->trail_margin);
+        int was_hoisted = at_start && hoisted_top;
         at_start = 0;
         if (c->h == 0 && margins_meet(c, 0) && margins_meet(c, 1)) {
-            prev_margin = combine_margins(gap, mb); /* an empty block: its margins collapse through it */
+            /* an empty block: its margins collapse through it (and if it was
+               the first, they went up into ours already: not again) */
+            prev_margin = was_hoisted ? 0 : combine_margins(gap, mb);
             continue;
         }
         y = by + c->h;
@@ -1338,6 +1378,8 @@ static int layout_flex(Node *n, int left, int top, int width) {
         }
         if (!s->flex_wrap) { /* one line: as tall as the container, if that is known */
             int known = definite_height(n);
+            if (known < 0 && s->min_height.unit == 'p') /* (or at least its min-height) */
+                known = s->min_height.value - (s->box_sizing ? frame_v(n, 0) : 0);
             if (known > line_h) line_h = known;
         }
         /* Cross-axis alignment within the line. */

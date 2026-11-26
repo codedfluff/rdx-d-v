@@ -610,12 +610,14 @@ static int font_size64(const char *v, int parent) {
     return font_size(v, (parent + 32) / 64) * 64; /* (calc(), vw and the rest: in whole px) */
 }
 
+static int em_size; /* the element's final font size (worked out first), for em in other properties; 0: not yet */
+
 static void apply(Style *s, Borders *b, const char *name, const char *v, int parent_size) {
     unsigned color;
     int ok;
     while (is_space(*v)) v++;
     if (svg_collecting) svg_note(name, v);
-    int font = s->size;
+    int font = em_size ? em_size : s->size;
     switch (name[0]) {
     case 'a':
         if (!strcmp(name, "align-items")) {
@@ -1156,8 +1158,16 @@ static const char *lookup_var(Node *e, const char *name, int len) {
 
 /* Copy `in` to `out` with every var(...) replaced. 0 if one cannot be
    resolved (then the declaration is ignored, as browsers do). */
+static char var_path[16][96]; /* the variables being worked out, outermost first */
+static int var_path_n;
+static char var_cycle[96];    /* a loop was found through this one (unwinding to it) */
+
 static int resolve_vars(const char *in, char *out, int max, int depth) {
     int k = 0;
+    if (depth == 0) {
+        var_path_n = 0;
+        var_cycle[0] = 0;
+    }
     if (depth > 8) return 0;
     for (const char *p = in; *p;) {
         if (strncmp(p, "var(", 4) != 0) {
@@ -1190,8 +1200,27 @@ static int resolve_vars(const char *in, char *out, int max, int depth) {
         if (*p == ')') p++;
         const char *v = lookup_var(var_scope, lname, nl);
         char sub[512];
-        /* a variable that can't be worked out (missing, or defined by itself) takes the fallback */
-        int got = v && resolve_vars(v, sub, sizeof(sub), depth + 1);
+        /* A variable that refers to itself (directly or through others) is
+           invalid, and so are the others in the loop: no fallback inside the
+           loop counts, only that of the var() the loop was entered by. */
+        int in_loop = 0;
+        for (int i = 0; i < var_path_n; i++)
+            if (!strcmp(var_path[i], lname)) in_loop = 1;
+        if (in_loop) {
+            if (!var_cycle[0]) memcpy(var_cycle, lname, (size_t)nl + 1);
+            return 0;
+        }
+        int got = 0;
+        if (v && var_path_n < 16) {
+            memcpy(var_path[var_path_n++], lname, (size_t)nl + 1);
+            got = resolve_vars(v, sub, sizeof(sub), depth + 1);
+            var_path_n--;
+        }
+        if (var_cycle[0]) {
+            if (strcmp(var_cycle, lname)) return 0; /* (still inside the loop) */
+            var_cycle[0] = 0;                       /* the loop is behind us: this var() may fall back */
+        }
+        /* a variable that can't be worked out (missing, or in a loop) takes the fallback */
         if (!got && fallback) {
             char fb[512];
             int n = fl < 511 ? fl : 511;
@@ -1267,7 +1296,10 @@ static void apply_all(Style *s, Borders *b, const char *decls, int pass, int par
             continue;
         }
         if (!strncmp(name, "-webkit-mask", 12)) memmove(name, name + 8, strlen(name + 8) + 1); /* -webkit-mask-image -> mask-image */
-        if (important != pass || name[0] == '-') continue;
+        if (pass >= 3) { /* passes 3 and 4: only the font size (normal, !important), so em in the rest uses it */
+            if (strcmp(name, "font-size") && strcmp(name, "font")) continue;
+            if (important != pass - 3) continue;
+        } else if (important != pass || name[0] == '-') continue;
         if (strstr(value, "var(")) {
             char resolved[512];
             if (!resolve_vars(value, resolved, sizeof(resolved), 0)) continue;
@@ -1643,7 +1675,7 @@ static void add_rule(const char *selector, int n, const char *decls, int origin)
 }
 
 static int has_class(const Node *n, const char *name) {
-    char classes[256];
+    static char classes[4096];
     if (!attr(n, "class", classes, sizeof(classes))) return 0;
     size_t len = strlen(name);
     for (const char *p = classes; *p;) {
@@ -2309,7 +2341,7 @@ static void compute_style(Node *e) {
        ::after) takes its element's rules for it. */
     static int matched[1024];
     int n = 0;
-    unsigned keys[10];
+    unsigned keys[66];
     int key_count = 0;
     Node *subject = e;
     int want = 0;
@@ -2320,6 +2352,20 @@ static void compute_style(Node *e) {
     keys[key_count++] = subject->tag_key;
     if (subject->id_key) keys[key_count++] = subject->id_key;
     for (int i = 0; i < subject->class_count; i++) keys[key_count++] = subject->class_keys[i];
+    if (subject->class_count == 8) { /* more than 8 classes: rules are filed under any of them */
+        static char text[4096];
+        attr(subject, "class", text, sizeof(text));
+        int seen = 0;
+        for (char *c = text; *c && key_count < 66;) {
+            while (is_space(*c)) c++;
+            char *start = c;
+            while (*c && !is_space(*c)) c++;
+            char save = *c;
+            *c = 0;
+            if (*start && ++seen > 8) keys[key_count++] = fingerprint('.', start);
+            *c = save;
+        }
+    }
     /* Only the rules filed under one of this element's keys (or under no
        key) can match it. */
     for (int k = 0; k < key_count; k++) {
@@ -2391,12 +2437,22 @@ static void compute_style(Node *e) {
     svg_collecting = e->in_svg;
     svg_props_len = 0;
     parent_size64 = p->size64 ? p->size64 : p->size * 64;
+    /* The font size first: a width in em written before font-size in a
+       rule (or in an earlier rule) is in the element's own font size. */
+    em_size = 0;
+    for (int k = 3; k <= 4; k++) {
+        for (int i = 0; i < n; i++)
+            if (strstr(rules[matched[i]]->decls, "font")) apply_all(s, &b, rules[matched[i]]->decls, k, p->size);
+        if (has_inline && strstr(inline_style, "font")) apply_all(s, &b, inline_style, k, p->size);
+    }
+    em_size = s->size; /* (the rules below set font-size again on the way: em still means this) */
     for (int i = 0; i < first_page; i++) apply_all(s, &b, rules[matched[i]]->decls, 0, p->size);
     presentational(e, s, &b, p);
     for (int i = first_page; i < n; i++) apply_all(s, &b, rules[matched[i]]->decls, 0, p->size);
     if (has_inline) apply_all(s, &b, inline_style, 0, p->size);
     for (int i = first_page; i < n; i++) apply_all(s, &b, rules[matched[i]]->decls, 1, p->size);
     if (has_inline) apply_all(s, &b, inline_style, 1, p->size);
+    em_size = 0;
     svg_collecting = 0;
     if (!s->size64 || (s->size64 + 32) / 64 != s->size) s->size64 = s->size * 64; /* (set some other way: whole px) */
     s->alpha = (unsigned char)(p->alpha * s->opacity / 255);
@@ -2606,7 +2662,7 @@ static void compute_styles(void) {
             if (p->id_key) filter_add(n->ancestors, p->id_key);
             for (int i = 0; i < p->class_count; i++) filter_add(n->ancestors, p->class_keys[i]);
             if (p->class_count == 8) { /* perhaps more than 8: add them all */
-                static char text[1024];
+                static char text[4096];
                 attr(p, "class", text, sizeof(text));
                 for (char *c = text; *c;) {
                     while (is_space(*c)) c++;

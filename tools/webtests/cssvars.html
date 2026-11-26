@@ -8,10 +8,14 @@ html.big, .icon { --font-size-medium: var(--font-size-medium, 1rem); --line-heig
 .medium { line-height: var(--line-height-medium); width: 300px; background: #efe; }
 .fallback { font-size: var(--font-size-medium, 20px); background: #fee; width: 300px; }
 .cycle-a { --a: var(--b); --b: var(--a); padding-left: var(--a, 30px); background: #ffe; width: 300px; }
+.em-before { width: 22em; font-size: 88%; padding: 0.2em; background: #eef; }
+.em-table { width: 22em; float: right; border: 1px solid #aaa; padding: 0.2em; font-size: 88%; line-height: 1.4em; }
 </style></head>
 <body>
 <div class="body" id="body">one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen</div>
 <div class="medium" id="medium">one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen</div>
 <div class="fallback" id="fallback">fallback size</div>
 <div class="cycle-a" id="cycle">cycle padding</div>
+<div class="em-before" id="embefore">width in em, then font-size</div>
+<table class="em-table" id="emtable"><tbody><tr><th>Operating systems</th></tr><tr><td>a table in em, then font-size</td></tr></tbody></table>
 </body></html>
